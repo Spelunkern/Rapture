@@ -1,0 +1,27 @@
+# Build output
+target/
+build/
+out/
+
+# IDE/editor cruft
+.vs/
+*.user
+*.suo
+
+# Runtime/log artifacts (recreated automatically on next start)
+logs/*.log
+runtime/sessions/
+runtime/*.bin
+
+# Original Shaiya map data (proprietary game data, not project source --
+# see data/maps/README.txt for where to place your own copies)
+data/maps/*.svmap
+
+# Personal/session-continuity notes, not part of the public project
+NEXT_SESSION.txt
+RAPTURE_PROGRESS_LOG.txt
+RAPTURE_SESSION_GUIDE.txt
+
+# Vendored third-party reference tool (excluded: has its own git history/
+# license, not part of Rapture itself)
+tools/refs/

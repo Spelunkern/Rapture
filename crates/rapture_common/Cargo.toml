@@ -1,0 +1,15 @@
+[package]
+name = "rapture_common"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+cipher = "0.4"
+hmac = "0.12"
+num-bigint = "0.4"
+sha2 = "0.10"
+tiberius = { version = "0.12.3", features = ["tokio", "tokio-util"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
