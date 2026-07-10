@@ -1,6 +1,6 @@
 # Rapture Project
 
-![Rapture](docs/images/rapture.png)
+<img src="docs/images/rapture.png" alt="Rapture" width="320" />
 
 An open source Shaiya emulator targeting the 5.4 client, designed to be a
 community project to replace old server files with a modern, functional,
