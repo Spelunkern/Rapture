@@ -1,5 +1,7 @@
 # Rapture Project
 
+![Rapture](docs/images/rapture.png)
+
 An open source Shaiya emulator targeting the 5.4 client, designed to be a
 community project to replace old server files with a modern, functional,
 and secure alternative.
@@ -83,3 +85,28 @@ processes instead of embedding server logic directly.
 ## License
 
 BSD 3-Clause. See [LICENSE](LICENSE).
+
+## Current Progress
+
+A quick summary of what's implemented so far:
+
+- **Login & world servers**: TCP login flow, character select/creation, map
+  entry, and session handling against the original SQL Server schema.
+- **Spatial visibility**: entity updates (movement, combat, spawns) are
+  filtered by range instead of broadcasting the whole map; chat stays
+  whole-map by design.
+- **Combat & mobs**: auto-attack, targeting, mob spawn/respawn/roam sweeps,
+  NPC patrol sweeps, drop tables.
+- **Trade**: full player-to-player trade (request, offer items/gold, ready/
+  confirm, atomic completion), verified against real client packet captures.
+- **Experience & leveling**: EXP gain and level-ups driven by
+  `PS_GameDefs.ExpDefs`; base HP/MP/SP per level driven by
+  `PS_GameDefs.StatusDefs`. Core stats (STR/DEX/REC/INT/LUC/WIS) do not grow
+  automatically with level, matching the intended design.
+- **GM commands**: item spawning, teleport (map/local), mob/NPC spawn and
+  clear, stat editing, GM visibility toggle, inventory/equipment clearing —
+  see [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full list.
+- **Codebase**: modularized by system (`combat.rs`, `movement.rs`,
+  `sweeps.rs`, `commands.rs`, `trade.rs`, `inventory.rs`, `skills.rs`,
+  `chat.rs`) instead of one large file, to keep future contributions easier
+  to review.
