@@ -10,15 +10,15 @@ day-to-day usage (GM commands, trade, experience/leveling).
   the panel in particular uses Windows-only APIs).
 - **Rust toolchain**, edition 2024 (stable channel, e.g. via
   [rustup](https://rustup.rs)). Tested with Rust 1.96.
-- **Microsoft SQL Server** (not MySQL/MariaDB), reachable at `localhost:1433`
+- **Microsoft SQL Server**, reachable at `localhost:1433`
   by default, with **Windows Integrated Authentication** and TCP/IP enabled.
-- **An existing Shaiya Aries 5.4 database** already restored into SQL Server.
+- **An existing Shaiya database** already restored into SQL Server.
   Rapture does not create or seed this schema — it expects the original
   retail-style databases (`PS_UserData`, `PS_GameData`, `PS_GameDefs`) to
   already exist with their tables and definition data (items, mobs, exp
   tables, etc.) populated. If you don't have a copy of these databases, you
   will need to source one before Rapture is useful.
-- **The Aries 5.4 client** (`Game.exe`), configured to connect to
+- **The 5.4 client** (`Game.exe`), configured to connect to
   `127.0.0.1` (see [Client Setup](#5-client-setup) below).
 
 ## 2. Clone & Build
@@ -75,8 +75,6 @@ SET Admin = 1
 WHERE UserID = 'your_account_name';
 ```
 
-(`AdminLevel > 0` also works, and maps to Aries's `AdminA`..`AdminE` tiers.)
-
 ### Map data
 
 Place original Shaiya `.svmap` files under `data\maps\`, named by map id
@@ -109,7 +107,7 @@ Logs are written to `logs\rapture_login.log` / `logs\rapture_world.log`
 
 ## 5. Client Setup
 
-Point your Aries 5.4 client (`Game.exe`) at `127.0.0.1` — it will connect
+Point your 5.4 client (`Game.exe`) at `127.0.0.1` — it will connect
 to the login server on port `30800` first, then hand off to the world
 server on port `30810` after server/character selection. No client-side
 patch beyond the server IP is expected.

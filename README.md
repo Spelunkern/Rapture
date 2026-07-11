@@ -79,8 +79,8 @@ processes instead of embedding server logic directly.
 
 ## References
 
-- `C:\Shaiya-Aries`: primary reference for the target client packet layouts.
-- `C:\SH.Imgeneus`: secondary architecture/protocol reference.
+- Client/server protocol reference material for the target 5.4 client (not included in this repo).
+- Imgeneus: an open source Shaiya emulator, used as a secondary architecture/protocol reference.
 
 ## License
 
