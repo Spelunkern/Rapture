@@ -144,6 +144,7 @@ pub(crate) fn apply_teleport(
             character.id,
             character.pos_x,
             character.pos_z,
+            VIEWPORT_RADIUS,
         );
         if !others.is_empty() {
             let entered = player.entered_map_packet()?;
@@ -168,6 +169,30 @@ pub(crate) fn apply_teleport(
             }
         }
     }
+
+    // Introduces mobs/NPCs near the destination to the teleported player.
+    // `entity_visibility` was just reset above, so this always computes a
+    // full "everything nearby" delta -- without it, a same-map teleport
+    // (cmove/bmove/asummon, or a portal whose destination is on the same
+    // map) left the player seeing no mobs/NPCs at all until their next
+    // real 0x0501 move triggered handle_character_move's own delta call.
+    // A cross-map teleport is unaffected either way since the client's own
+    // CharacterEnteredMap re-populates visibility from scratch.
+    let entity_packets =
+        build_entity_visibility_delta(character.map_id, character.pos_x, character.pos_z, entity_visibility)?;
+    if !entity_packets.is_empty() {
+        logger.line(format!(
+            "Rapture World entity visibility delta character_id={} packets={} ({label})",
+            character.id,
+            entity_packets.len()
+        ));
+    }
+    if let Some(send) = aes_send.as_mut() {
+        for (packet, entity_label) in entity_packets {
+            send_encrypted(stream, send, use_expanded_send_key, packet, entity_label, logger)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -243,6 +268,7 @@ pub(crate) fn handle_character_move(
         character.id,
         character.pos_x,
         character.pos_z,
+        VIEWPORT_RADIUS,
     );
     if !others.is_empty() {
         let move_packet = build_character_move(Some(character), motion, direction)?;

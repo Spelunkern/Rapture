@@ -101,6 +101,20 @@ impl CharacterStats {
         let max_sp = base_max_sp
             .saturating_add(equipment.max_sp)
             .saturating_add(derived_max_sp);
+        // IMPORTANT INVARIANT: `character.current_hp/mp/sp` (the raw DB
+        // field) is NOT the effective/displayed value -- it's a BASE value
+        // that this function re-adds the equipment/derived bonus to on
+        // every call, then clamps to the (also bonus-inclusive) max. Any
+        // code that changes current HP/MP/SP -- a heal, a cost deduction, a
+        // future player-damage system -- MUST modify the raw field by a
+        // DELTA (raw += or raw -= some amount), never by assigning an
+        // effective/computed value directly to the raw field. Assigning an
+        // already-bonus-inclusive value here would double-count the bonus
+        // on the next recompute. The one intentional exception is a full
+        // heal (level-up, the `cure` GM command): those deliberately set
+        // raw = raw max_hp/mp/sp, relying on this same add-then-clamp to
+        // land exactly at the true effective max, matching a real full-heal
+        // display without needing to know the equipment bonus in advance.
         let current_hp = character
             .map_or(MAX_HP, |character| character.current_hp)
             .saturating_add(equipment.max_hp)
@@ -191,26 +205,33 @@ pub(crate) fn character_name(character: Option<&DbCharacter>) -> &str {
         .unwrap_or("Rapture")
 }
 
+/// Wire format confirmed against a real capture (fresh login, no leading
+/// str/dex/rec/int/wis/luc fields at all -- those are redundant with
+/// 0x0526 CharacterAdditionalStats, which already carries them):
+/// `stat_point:u16, skill_point:u16, hp:u32, mp:u32, sp:u32` -- verified
+/// value-for-value (stat_point=10, skill_point=39, hp=15484, mp=2074,
+/// sp=8995 all matched the real client's displayed values for that
+/// character). Previously this packet led with 6 placeholder stat fields
+/// that don't belong here and hardcoded hp/mp/sp to 0, which shifted every
+/// field after it and was the root cause of the "usable points" display
+/// never matching the DB (including at fresh login, not just after a live
+/// update).
+///
+/// The remainder (exp, money, position, kills/deaths/victories/defeats,
+/// name) is NOT independently confirmed field-by-field -- only the total
+/// packet length (63 bytes for that capture) is confirmed, and this
+/// ordering fits it exactly. Treat this tail as a best-effort placeholder
+/// pending another capture if something in it still displays wrong.
 pub(crate) fn build_character_details(
     character: Option<&DbCharacter>,
     stats: &CharacterStats,
 ) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::CharacterDetails);
-    packet.write_u16(stats.strength.min(u16::MAX as u32) as u16);
-    packet.write_u16(stats.dexterity.min(u16::MAX as u32) as u16);
-    packet.write_u16(stats.reaction.min(u16::MAX as u32) as u16);
-    packet.write_u16(stats.intelligence.min(u16::MAX as u32) as u16);
-    packet.write_u16(stats.wisdom.min(u16::MAX as u32) as u16);
-    packet.write_u16(stats.luck.min(u16::MAX as u32) as u16);
-
     packet.write_u16(character.map_or(0, |character| character.stat_point));
     packet.write_u16(character.map_or(0, |character| character.skill_point));
-    packet.write_i32(0); // max hp is sent by 0x051F/0x050B for this client
-    packet.write_i32(0); // max mp is sent by 0x051F/0x050B for this client
-    packet.write_i32(0); // max sp is sent by 0x051F/0x050B for this client
-    packet.write_u16(0); // angle
-    packet.write_u32(0); // start level exp
-    packet.write_u32(0); // end level exp
+    packet.write_u32(stats.current_hp);
+    packet.write_u32(stats.current_mp);
+    packet.write_u32(stats.current_sp);
     packet.write_u32(character.map_or(0, |character| character.exp)); // current exp
     packet.write_u32(character.map_or(0, |character| character.money)); // gold
     packet.write_f32(character.map_or(SPAWN_X, |character| character.pos_x));
@@ -220,7 +241,7 @@ pub(crate) fn build_character_details(
     packet.write_u32(character.map_or(0, |character| character.deaths));
     packet.write_u32(character.map_or(0, |character| character.victories));
     packet.write_u32(character.map_or(0, |character| character.defeats));
-    packet.write_fixed_string("", 25)?;
+    packet.write_fixed_string("", 11)?;
 
     packet.into_bytes()
 }
@@ -274,10 +295,31 @@ pub(crate) fn build_max_energy(
     packet.into_bytes()
 }
 
-pub(crate) fn build_character_entered_map(character: Option<&DbCharacter>) -> Result<Vec<u8>> {
+/// This byte doubles as the client's spawn-glow control, not just an admin
+/// marker (per a GitHub issue report on the public repo): 0 = the character
+/// was already on the map (introducing it to a newly arriving viewer), 1 =
+/// the character is loading into the map for the first time (its own fresh
+/// entry), 2 = admin, regardless of visibility status. Previously hardcoded
+/// to 2 unconditionally, which misapplied the admin case to every player.
+const ENTERED_MAP_ALREADY_PRESENT: u8 = 0;
+const ENTERED_MAP_FIRST_LOAD: u8 = 1;
+const ENTERED_MAP_ADMIN: u8 = 2;
+
+pub(crate) fn build_character_entered_map(
+    character: Option<&DbCharacter>,
+    is_admin: bool,
+    first_load: bool,
+) -> Result<Vec<u8>> {
+    let spawn_marker = if is_admin {
+        ENTERED_MAP_ADMIN
+    } else if first_load {
+        ENTERED_MAP_FIRST_LOAD
+    } else {
+        ENTERED_MAP_ALREADY_PRESENT
+    };
     let mut packet = PacketWriter::new(Opcode::CharacterEnteredMap);
     packet.write_u32(character.map_or(CHARACTER_ID, |character| character.id));
-    packet.write_u8(2); // admin marker used by Imgeneus; enables client-side GM commands
+    packet.write_u8(spawn_marker);
     packet.write_u16(0);
     packet.write_f32(character.map_or(SPAWN_X, |character| character.pos_x));
     packet.write_f32(character.map_or(SPAWN_Y, |character| character.pos_y));
@@ -401,7 +443,15 @@ pub(crate) fn build_character_equipment(
     packet.into_bytes()
 }
 
-/// `motion` is the shape struct's own motion byte, applied at spawn time.
+/// `motion` here is the shape struct's own PERSISTENT motion byte -- unlike
+/// the live, one-shot MotionType values sent over 0x0506 CharacterMotion
+/// (jump, sit-down, stand-up, etc.), this field only recognizes two states:
+/// Standing = 0, Sitting = 1. Any other MotionType value (e.g.
+/// MOTION_SIT_DOWN = 10, MOTION_JUMP = 8) is NOT meaningful here and must be
+/// treated as Standing -- passing a raw MotionType through unclamped is how
+/// characters end up randomly appearing seated. Clamped defensively below
+/// rather than trusted from callers.
+///
 /// Earlier revisions of this project passed MOTION_SIT_DOWN here to show an
 /// already-seated character as sitting to a newly arriving viewer -- that
 /// turned out to be backwards. A character already sitting when a new
@@ -418,10 +468,11 @@ pub(crate) fn build_character_shape(
     items: &[DbCharacterItem],
     motion: u8,
 ) -> Result<Vec<u8>> {
+    let persistent_motion = if motion == 1 { 1 } else { 0 };
     let mut packet = PacketWriter::new(Opcode::CharacterShape);
     packet.write_u32(character.map_or(CHARACTER_ID, |character| character.id));
     packet.write_u8(0); // alive
-    packet.write_u8(motion);
+    packet.write_u8(persistent_motion);
     packet.write_u8(selected_faction);
 
     if let Some(character) = character {
@@ -581,8 +632,8 @@ pub(crate) fn build_character_list_slot(
     }
 
     packet.write_fixed_string(&character.name, 19)?;
-    packet.write_u8(0);
-    packet.write_u8(0);
+    packet.write_u8(0); // pending_deletion -- not implemented, always "not pending"
+    packet.write_u8(0); // pending_rename -- not implemented, always "not pending"
 
     for _ in 0..6 {
         packet.write_u8(0);

@@ -15,7 +15,7 @@ use crate::character::{
 };
 use crate::protocol::*;
 use crate::session::*;
-use crate::world_entities::{VISIBILITY_RANGE, distance_xz, lock_or_recover};
+use crate::world_entities::{distance_xz, lock_or_recover};
 
 /// Minimum time between two chat messages from the same connection. Aries
 /// defines no wire-level spam/cooldown mechanism (confirmed against the
@@ -213,7 +213,10 @@ impl ConnectedPlayer {
     /// (0x0201 before 0x0303), this method lets us do the same for others.
     pub(crate) fn entered_map_packet(&self) -> Result<Vec<u8>> {
         let state = lock_or_recover(&self.state);
-        build_character_entered_map(Some(&state.character))
+        // This character was already on the map before the viewer arrived,
+        // not loading in for the first time -- see build_character_entered_map's
+        // doc comment for why that distinction (and the is_admin case) matters.
+        build_character_entered_map(Some(&state.character), self.is_admin, false)
     }
 
     /// Builds a 0x0240 CharacterOverlay packet setting this player's name
@@ -437,17 +440,19 @@ pub(crate) fn all_players() -> Vec<Arc<ConnectedPlayer>> {
         .collect()
 }
 
-/// Players on `map_id` within `VISIBILITY_RANGE` of `(x, z)`, matching
-/// Aries's real spatial-cell (CZone::SendView) view range instead of
-/// notifying every player on the map regardless of distance. Used for
-/// combat, item, and mob/NPC broadcasts that aren't tied to excluding a
-/// specific character.
-pub(crate) fn players_on_map_near(map_id: u16, x: f32, z: f32) -> Vec<Arc<ConnectedPlayer>> {
+/// Players on `map_id` within `radius` of `(x, z)`, matching the real
+/// server's spatial visibility model instead of notifying every player on
+/// the map regardless of distance. Callers pass the radius for their event
+/// type -- `world_entities::VIEWPORT_RADIUS` for general appearance/
+/// movement/item events, `world_entities::COMBAT_RADIUS` for combat
+/// broadcasts (see those constants' doc comments; confirmed against a
+/// GitHub issue report on the public repo).
+pub(crate) fn players_on_map_near(map_id: u16, x: f32, z: f32, radius: f32) -> Vec<Arc<ConnectedPlayer>> {
     lock_or_recover(&map_bucket(map_id))
         .values()
         .filter(|player| {
             let (player_x, player_z) = player.position_xz();
-            distance_xz(player_x, player_z, x, z) <= VISIBILITY_RANGE
+            distance_xz(player_x, player_z, x, z) <= radius
         })
         .cloned()
         .collect()
@@ -461,13 +466,14 @@ pub(crate) fn players_on_map_excluding_near(
     character_id: u32,
     x: f32,
     z: f32,
+    radius: f32,
 ) -> Vec<Arc<ConnectedPlayer>> {
     lock_or_recover(&map_bucket(map_id))
         .values()
         .filter(|player| player.character_id != character_id)
         .filter(|player| {
             let (player_x, player_z) = player.position_xz();
-            distance_xz(player_x, player_z, x, z) <= VISIBILITY_RANGE
+            distance_xz(player_x, player_z, x, z) <= radius
         })
         .cloned()
         .collect()
@@ -552,36 +558,30 @@ pub(crate) fn handle_public_chat(
 
     // The admin channels double as this project's GM command line (no
     // dedicated opcode per command yet -- see RAPTURE_SESSION_GUIDE.txt).
-    // Anything sent here that isn't a recognized command (typo, a command
-    // not implemented yet, or -- historically -- a real command whose
-    // parser had a bug, like /cmove before the leading-slash fix) must
-    // never fall through to a public broadcast: that would leak GM
-    // activity/text to every player on the server. Reply privately
-    // instead.
+    // The client already strips any leading `/` before this message ever
+    // reaches us, so there's no wire-level way to tell "typed a command"
+    // from "just chatting" -- by the time we see it, both look identical.
+    // Anything here that isn't a recognized command is therefore treated as
+    // plain chat and broadcast on the equivalent public channel (mapping
+    // ChatNormalAdmin -> ChatNormal, ChatWorldAdmin -> ChatWorld), rather
+    // than rejected -- a prior version replied "Unknown command." privately
+    // for everything unrecognized, which made it impossible for a GM to
+    // hold an ordinary conversation over the admin channel.
     if is_admin_channel {
         logger.line(format!(
-            "Rapture World unrecognized admin command from character_id={}: '{message}'",
+            "Rapture World admin channel message from character_id={} not a recognized command, broadcasting as chat: '{message}'",
             character.id
         ));
-        if let Some(send) = aes_send.as_mut() {
-            send_encrypted(
-                stream,
-                send,
-                use_expanded_send_key,
-                build_chat_normal(character.id, "Unknown command.")?,
-                "0x1101 unknown command",
-                logger,
-            )?;
-        }
-        return Ok(());
     }
     *last_chat_at = Some(Instant::now());
 
-    // is_admin_channel already returned above, so only the genuine public
-    // channels reach here.
-    let outgoing = if decrypted_opcode == Opcode::ChatNormal as u16 {
+    let outgoing = if decrypted_opcode == Opcode::ChatNormal as u16
+        || decrypted_opcode == Opcode::ChatNormalAdmin as u16
+    {
         build_chat_by_id(Opcode::ChatNormal, character.id, message)?
-    } else if decrypted_opcode == Opcode::ChatWorld as u16 {
+    } else if decrypted_opcode == Opcode::ChatWorld as u16
+        || decrypted_opcode == Opcode::ChatWorldAdmin as u16
+    {
         build_chat_by_name(Opcode::ChatWorld, &character.name, message)?
     } else {
         // ChatMap (0x1111 / GameChatZoneOutgoing) shares the senderName-
@@ -589,7 +589,9 @@ pub(crate) fn handle_public_chat(
         build_chat_by_name(Opcode::ChatMap, &character.name, message)?
     };
 
-    let recipients = if decrypted_opcode == Opcode::ChatWorld as u16 {
+    let recipients = if decrypted_opcode == Opcode::ChatWorld as u16
+        || decrypted_opcode == Opcode::ChatWorldAdmin as u16
+    {
         all_players()
     } else {
         // ChatNormal and ChatMap: same-map delivery. True proximity

@@ -19,14 +19,19 @@ mod commands;
 mod drops;
 mod experience;
 mod inventory;
+mod itemmall;
 mod map_items;
 mod movement;
 mod protocol;
 mod session;
+mod shop;
+mod skillcast;
 mod skills;
 mod svmap;
+mod statpoints;
 mod sweeps;
 mod trade;
+mod warehouse;
 mod world_entities;
 mod world_state;
 
@@ -37,14 +42,19 @@ use commands::*;
 use drops::*;
 use experience::*;
 use inventory::*;
+use itemmall::*;
 use map_items::*;
 use movement::*;
 use protocol::*;
 use session::*;
+use shop::*;
+use skillcast::*;
 use skills::*;
 use svmap::*;
+use statpoints::*;
 use sweeps::*;
 use trade::*;
+use warehouse::*;
 use world_entities::*;
 use world_state::*;
 
@@ -168,11 +178,34 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
     let mut active_characters: Vec<(DbCharacter, Vec<DbCharacterItem>)> = Vec::new();
     let mut active_skills: Vec<DbCharacterSkill> = Vec::new();
     let mut active_quick_slots: Vec<DbQuickSlot> = Vec::new();
+    // Account-wide warehouse contents (shared across every character on the
+    // account), loaded on character select alongside the rest of the
+    // session state -- see warehouse.rs.
+    let mut active_stored_items: Vec<DbCharacterItem> = Vec::new();
+    // Item Mall / cash shop point balance (Users_Master.Point), also
+    // account-wide -- loaded alongside active_stored_items.
+    let mut active_account_points: u32 = 0;
     // Consumable cooldowns (keyed by PS_GameDefs.dbo.Items.ReqIg), scoped to
     // the currently active character's online session: cleared whenever a
     // character is selected or created, so relogging or switching character
     // always starts with cooldowns reset, matching the desired behavior.
     let mut item_cooldowns: HashMap<u8, Instant> = HashMap::new();
+    // Skill cooldowns (ResetTime), keyed by SkillID -- same reset-on-relog
+    // scoping as item_cooldowns above.
+    let mut skill_cooldowns: HashMap<u16, Instant> = HashMap::new();
+    // Active periodic heal-over-time effects on this connection's own
+    // character (self-only, see skillcast.rs) -- same reset-on-relog
+    // scoping as the cooldown maps above; ticked every loop iteration by
+    // `process_active_heals`.
+    let mut active_heals: Vec<ActiveHeal> = Vec::new();
+    // Active stat buffs on this connection's own character (self-only,
+    // see skillcast.rs) -- same reset-on-relog scoping as the cooldown
+    // maps above; expired by `process_active_buffs` every loop iteration.
+    let mut active_buffs: Vec<ActiveBuff> = Vec::new();
+    // A skill cast currently in progress (`ReadyTime` > 0), if any --
+    // resolved by `process_pending_cast` once its delay elapses, and
+    // cancelled by movement (see the `CharacterMove` handling below).
+    let mut pending_cast: Option<PendingCast> = None;
     let mut entity_visibility = EntityVisibility::default();
     let mut position_dirty = false;
     let mut last_position_save = Instant::now();
@@ -297,6 +330,54 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
             }
         }
 
+        // Periodic heal-over-time ticks (see skillcast.rs) -- checked every
+        // loop wakeup, same reasoning as the pending-teleport/trade-refresh
+        // checks above, so a 3-second cadence is kept even while the client
+        // is actively sending other packets, not just during an idle
+        // read-timeout wakeup.
+        process_active_heals(
+            &mut active_heals,
+            &mut active_character,
+            &connected_player,
+            &active_items,
+            &mut db_conn,
+            &mut stream,
+            &mut aes_send,
+            use_expanded_send_key,
+            logger,
+        )?;
+
+        // Active stat buff expiry -- same per-iteration cadence reasoning
+        // as the heal ticks above.
+        process_active_buffs(
+            &mut active_buffs,
+            &mut active_character,
+            &active_items,
+            &mut db_conn,
+            &mut stream,
+            &mut aes_send,
+            use_expanded_send_key,
+            logger,
+        )?;
+
+        // A delayed skill cast (`ReadyTime` > 0) whose time has come --
+        // same per-iteration cadence reasoning as the heal ticks above.
+        process_pending_cast(
+            &mut pending_cast,
+            &mut active_character,
+            &connected_player,
+            &active_items,
+            &active_skills,
+            &mut skill_cooldowns,
+            &mut active_heals,
+            &mut active_buffs,
+            &mut db_conn,
+            &mut stream,
+            &mut aes_send,
+            use_expanded_send_key,
+            logger,
+        )?;
+
         let Some(read) = read else {
             if let Some(auto_attack) = active_auto_attack {
                 if !process_auto_attack_swing(
@@ -332,6 +413,9 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         character.id, character.map_id, character.pos_x, character.pos_y, character.pos_z
                     ));
                 }
+            }
+            if let Some(character) = active_character.as_ref() {
+                persist_active_buffs(&mut db_conn, character.id, &active_buffs)?;
             }
             logger.line("Rapture World client disconnected");
             return Ok(());
@@ -613,6 +697,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     active_skills.clear();
                     active_quick_slots.clear();
                     item_cooldowns.clear();
+                    skill_cooldowns.clear();
                     logger.line(format!(
                         "Rapture World loaded {} character items",
                         active_items.len()
@@ -668,10 +753,46 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     } else {
                         Vec::new()
                     };
+                    // Rebuild the in-memory cooldown map from whatever's
+                    // still remaining in the DB, so a skill cast in an
+                    // earlier session still gates casting after a relog
+                    // instead of coming back fully ready.
+                    skill_cooldowns.clear();
+                    for skill in &active_skills {
+                        if skill.delay > 0 {
+                            skill_cooldowns.insert(
+                                skill.skill_id,
+                                Instant::now() + Duration::from_secs(skill.delay as u64),
+                            );
+                        }
+                    }
+                    // Restores buffs left running from an earlier session --
+                    // frozen while offline (unlike skill cooldowns), so this
+                    // just resumes each one's remaining seconds from where
+                    // it was snapshotted at the last logout/disconnect.
+                    active_buffs = if active_character.is_some() {
+                        restore_active_buffs(&mut db_conn, character_id, logger)?
+                    } else {
+                        Vec::new()
+                    };
                     active_quick_slots = if active_character.is_some() {
                         db::get_character_quick_slots(&mut db_conn, character_id)?
                     } else {
                         Vec::new()
+                    };
+                    active_stored_items = match active_character.as_ref() {
+                        Some(character) => db::get_stored_items(&mut db_conn, character.account_id)?,
+                        None => Vec::new(),
+                    };
+                    logger.line(format!(
+                        "Rapture World loaded {} warehouse items",
+                        active_stored_items.len()
+                    ));
+                    active_account_points = match active_character.as_ref() {
+                        Some(character) => db::get_account_by_id(&mut db_conn, character.account_id)?
+                            .map(|account| account.point)
+                            .unwrap_or(0),
+                        None => 0,
                     };
                     item_cooldowns.clear();
                     logger.line(format!(
@@ -686,7 +807,10 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         "Rapture World loaded {} quick slots",
                         active_quick_slots.len()
                     ));
-                    let equipment_stats = db::get_equipment_stats(&mut db_conn, &active_items)?;
+                    let equipment_stats = equipment_stats_with_buffs(
+                        db::get_equipment_stats(&mut db_conn, &active_items)?,
+                        &active_buffs,
+                    );
                     let character_stats =
                         CharacterStats::from_character(active_character.as_ref(), equipment_stats);
                     logger.line(format!(
@@ -727,6 +851,9 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             &active_items,
                             &active_skills,
                             &active_quick_slots,
+                            &active_stored_items,
+                            active_account_points,
+                            &active_buffs,
                             logger,
                         )?;
                     }
@@ -1261,6 +1388,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                                 charname,
                                 attribute,
                                 amount,
+                                &mut active_account_points,
                                 logger,
                             )?,
                             Err(error) => error.to_string(),
@@ -1453,6 +1581,49 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         continue;
                     }
 
+                    if let Some(command) = parse_cure_command(&message) {
+                        if !require_gm_command(
+                            is_admin,
+                            account_id,
+                            &active_character,
+                            &mut stream,
+                            &mut aes_send,
+                            use_expanded_send_key,
+                            logger,
+                        )? {
+                            continue;
+                        }
+                        let character = active_character.as_ref().unwrap().clone();
+
+                        let response = match command {
+                            Ok(charname) => execute_cure(
+                                &character,
+                                &mut active_character,
+                                &connected_player,
+                                &active_items,
+                                &mut db_conn,
+                                &mut stream,
+                                &mut aes_send,
+                                use_expanded_send_key,
+                                charname,
+                                logger,
+                            )?,
+                            Err(error) => error.to_string(),
+                        };
+
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                build_chat_normal(character.id, &response)?,
+                                "0x1101 cure command result",
+                                logger,
+                            )?;
+                        }
+                        continue;
+                    }
+
                     let Some(character) = active_character.as_ref() else {
                         logger.line("Rapture World rejected chat without active character");
                         continue;
@@ -1602,6 +1773,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                                 character.id,
                                 character.pos_x,
                                 character.pos_z,
+                                VIEWPORT_RADIUS,
                             ) {
                                 other.send_packet(
                                     &packets.map_add_item,
@@ -1688,6 +1860,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                                 character.id,
                                 character.pos_x,
                                 character.pos_z,
+                                VIEWPORT_RADIUS,
                             );
                             if let Some(map_remove_item) = packets.map_remove_item {
                                 send_encrypted(
@@ -1735,18 +1908,86 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         continue;
                     };
                     let character = character.clone();
-                    handle_item_bag_to_bag_request(
+                    let involves_warehouse = decrypted_payload.len() >= 6
+                        && (decrypted_payload[2] == WAREHOUSE_BAG
+                            || decrypted_payload[4] == WAREHOUSE_BAG);
+
+                    if involves_warehouse {
+                        let src_bag = decrypted_payload[2];
+                        let src_slot = decrypted_payload[3];
+                        let dest_bag = decrypted_payload[4];
+                        let dest_slot = decrypted_payload[5];
+                        let packet = handle_warehouse_move(
+                            &mut db_conn,
+                            character.id,
+                            character.account_id,
+                            character.money,
+                            &mut active_items,
+                            &mut active_stored_items,
+                            src_bag,
+                            src_slot,
+                            dest_bag,
+                            dest_slot,
+                            logger,
+                        )?;
+                        if let Some(packet) = packet {
+                            if let Some(send) = aes_send.as_mut() {
+                                send_encrypted(
+                                    &mut stream,
+                                    send,
+                                    use_expanded_send_key,
+                                    packet,
+                                    "0x0204 warehouse item move",
+                                    logger,
+                                )?;
+                            }
+                        }
+                    } else {
+                        handle_item_bag_to_bag_request(
+                            &mut db_conn,
+                            &character,
+                            &connected_player,
+                            is_admin,
+                            &mut active_items,
+                            &decrypted_payload,
+                            &mut stream,
+                            &mut aes_send,
+                            use_expanded_send_key,
+                            logger,
+                        )?;
+                    }
+                } else if decrypted_opcode == Opcode::ShopSell as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected shop sell without active character");
+                        continue;
+                    };
+                    let character_id = character.id;
+                    let current_money = character.money;
+                    if let Some((packet, new_money)) = handle_shop_sell(
                         &mut db_conn,
-                        &character,
-                        &connected_player,
-                        is_admin,
+                        character_id,
+                        current_money,
                         &mut active_items,
                         &decrypted_payload,
-                        &mut stream,
-                        &mut aes_send,
-                        use_expanded_send_key,
                         logger,
-                    )?;
+                    )? {
+                        if let Some(active) = active_character.as_mut() {
+                            active.money = new_money;
+                            if let Some(player) = connected_player.as_ref() {
+                                player.update_character(active.clone());
+                            }
+                        }
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                packet,
+                                "0x0703 shop sell",
+                                logger,
+                            )?;
+                        }
+                    }
                 } else if decrypted_opcode == Opcode::ExchangeRequest as u16
                     && decrypted_payload.len() >= 6
                 {
@@ -1867,6 +2108,13 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         }
                     }
                 } else if decrypted_opcode == Opcode::CharacterMove as u16 {
+                    // Movement cancels an in-progress cast unconditionally
+                    // (confirmed by Imgeneus's SkillCastingManager, which
+                    // hooks the same move event) -- no distance threshold,
+                    // any move packet interrupts.
+                    if pending_cast.take().is_some() {
+                        logger.line("Rapture World cancelled pending skill cast due to movement");
+                    }
                     handle_character_move(
                         &decrypted_payload,
                         &mut active_character,
@@ -1922,7 +2170,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     // self broke the player's own ability to sit).
                     let my_gm_visible = connected_player.as_ref().is_some_and(|p| p.gm_visible());
                     for player in
-                        players_on_map_near(character.map_id, character.pos_x, character.pos_z)
+                        players_on_map_near(character.map_id, character.pos_x, character.pos_z, VIEWPORT_RADIUS)
                     {
                         if player.character_id != character.id
                             && !can_see_character(player.is_admin, is_admin, my_gm_visible)
@@ -1970,6 +2218,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             use_expanded_send_key,
                             selected_faction,
                             active_character.as_ref(),
+                            is_admin,
                             &active_items,
                             &current_map_items,
                             &current_map_entities,
@@ -2020,6 +2269,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             character.id,
                             character.pos_x,
                             character.pos_z,
+                            VIEWPORT_RADIUS,
                         );
                         if let Some(send) = aes_send.as_mut() {
                             for other in &others {
@@ -2138,14 +2388,36 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         logger.line("Rapture World rejected learn skill without active character");
                         continue;
                     };
-                    let result_packet = handle_learn_new_skill(
+                    let character = character.clone();
+                    let (result_packet, new_skill_point) = handle_learn_new_skill(
                         &mut db_conn,
-                        character.id,
+                        &character,
                         skill_id,
                         skill_level,
                         &mut active_skills,
                         logger,
                     )?;
+                    // NOTE: do not resend 0x0105 CharacterDetails here to
+                    // "fix" the stale skill-point display. Tried that once;
+                    // it visibly corrupted HP/MP/SP/kills/etc. client-side
+                    // until relog. 0x0105 is a once-only, character-select
+                    // packet -- confirmed the hard way, not just a comment
+                    // guess. Also confirmed via a real client screenshot
+                    // that even the correctly-loaded StatPoint/SkillPoint
+                    // values (10 / 0 in the DB) don't match what the client
+                    // displays (198 / 150) at ANY point, including initial
+                    // login -- so this isn't a "live update" gap, it's a
+                    // wrong-field/wrong-formula bug in 0x0105 itself that
+                    // needs a real packet capture to pin down before
+                    // touching this again.
+                    if let Some(new_skill_point) = new_skill_point {
+                        if let Some(active) = active_character.as_mut() {
+                            active.skill_point = new_skill_point;
+                            if let Some(player) = connected_player.as_ref() {
+                                player.update_character(active.clone());
+                            }
+                        }
+                    }
 
                     if let Some(send) = aes_send.as_mut() {
                         send_encrypted(
@@ -2156,6 +2428,44 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             "0x0209 learn skill ok",
                             logger,
                         )?;
+                    }
+                } else if decrypted_opcode == Opcode::SetStatPoint as u16 {
+                    let equipment_stats = db::get_equipment_stats(&mut db_conn, &active_items)?;
+                    let Some(character) = active_character.as_mut() else {
+                        logger.line("Rapture World rejected stat point apply without active character");
+                        continue;
+                    };
+                    let outcome = handle_apply_stat_points(
+                        &mut db_conn,
+                        character,
+                        equipment_stats,
+                        &decrypted_payload,
+                        logger,
+                    )?;
+                    if let Some(player) = connected_player.as_ref() {
+                        player.update_character(character.clone());
+                    }
+                    if let Some(outcome) = outcome {
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                outcome.response,
+                                "0x0208 stat point applied",
+                                logger,
+                            )?;
+                            for (hitpoint_type, value) in outcome.max_energy_packets {
+                                send_encrypted(
+                                    &mut stream,
+                                    send,
+                                    use_expanded_send_key,
+                                    build_max_energy(Some(&*character), hitpoint_type, value)?,
+                                    "0x050B max energy update",
+                                    logger,
+                                )?;
+                            }
+                        }
                     }
                 } else if decrypted_opcode == Opcode::CharacterSkillBar as u16 {
                     let Some(character) = active_character.as_ref() else {
@@ -2200,6 +2510,44 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     )? {
                         active_auto_attack = None;
                     }
+                } else if (decrypted_opcode == Opcode::SkillUse as u16
+                    || decrypted_opcode == Opcode::SkillUseNoTarget as u16)
+                    && decrypted_payload.len() >= 7
+                {
+                    // 0x0511 is the same request shape as 0x0517, sent
+                    // instead by the client for skills that need no target
+                    // ("cast around yourself", target_type 6, and self-
+                    // heals) -- target_id is always 0 in that case, which
+                    // `handle_use_skill` already tolerates. The outgoing
+                    // ack must mirror whichever of the two opcodes the
+                    // request came in on (confirmed by a real capture), so
+                    // it's threaded straight through instead of hardcoding
+                    // SkillUse.
+                    let request_opcode = if decrypted_opcode == Opcode::SkillUseNoTarget as u16 {
+                        Opcode::SkillUseNoTarget
+                    } else {
+                        Opcode::SkillUse
+                    };
+                    let number = decrypted_payload[2];
+                    let target_mob_id = read_le_u32(&decrypted_payload[3..7])?;
+                    handle_use_skill(
+                        target_mob_id,
+                        number,
+                        request_opcode,
+                        &mut pending_cast,
+                        &mut active_character,
+                        &connected_player,
+                        &active_items,
+                        &active_skills,
+                        &mut skill_cooldowns,
+                        &mut active_heals,
+                        &mut active_buffs,
+                        &mut db_conn,
+                        &mut stream,
+                        &mut aes_send,
+                        use_expanded_send_key,
+                        logger,
+                    )?;
                 } else if decrypted_opcode == Opcode::TargetMobHpUpdate as u16
                     && decrypted_payload.len() >= 6
                 {
@@ -2264,22 +2612,47 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         logger.line("Rapture World rejected undersized point buy packet");
                         continue;
                     }
-                    let product_code = read_fixed_ascii(&decrypted_payload[2..]);
-                    logger.line(format!(
-                        "Rapture World point buy request product_code='{product_code}'"
-                    ));
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected point buy without active character");
+                        continue;
+                    };
+                    let character = character.clone();
+
+                    let outcome = handle_point_buy(
+                        &mut db_conn,
+                        &character,
+                        character.account_id,
+                        active_account_points,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )?;
+                    active_account_points = outcome.new_points;
 
                     if let Some(send) = aes_send.as_mut() {
+                        for (index, packet) in outcome.add_item_packets.into_iter().enumerate() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                packet,
+                                &format!("0x0205 point buy add item {}", index + 1),
+                                logger,
+                            )?;
+                        }
                         send_encrypted(
                             &mut stream,
                             send,
                             use_expanded_send_key,
-                            build_point_buy_failure(&product_code)?,
-                            "0x2602 point buy rejected",
+                            outcome.response,
+                            "0x2602 point buy result",
                             logger,
                         )?;
                     }
                 } else if decrypted_opcode == Opcode::CashPoint as u16 {
+                    // Empty-body request: the client is asking to refresh
+                    // its displayed point balance (e.g. opening the cash
+                    // shop UI). Just echo the session's current value.
                     logger.line("Rapture World cash point request");
 
                     if let Some(send) = aes_send.as_mut() {
@@ -2287,7 +2660,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             &mut stream,
                             send,
                             use_expanded_send_key,
-                            build_cash_points()?,
+                            build_cash_points(active_account_points)?,
                             "0x2605 cash points",
                             logger,
                         )?;
@@ -2320,6 +2693,19 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         ));
                         }
                     }
+                    if let Some(character) = active_character.as_ref() {
+                        persist_active_buffs(&mut db_conn, character.id, &active_buffs)?;
+                    }
+                    active_buffs.clear();
+                    // Unlike active_buffs (persisted above) and skill_cooldowns
+                    // (persisted continuously via CharSkills, rebuilt fresh at
+                    // the next SelectCharacter), active_heals/pending_cast have
+                    // no per-character persistence at all -- leaving them set
+                    // here would let a heal-over-time tick or a delayed cast
+                    // started by THIS character keep firing against whichever
+                    // character is selected next on this same connection.
+                    active_heals.clear();
+                    pending_cast = None;
                     logger.line("Rapture World logout requested (relog to character select)");
                     let character_id = active_character.as_ref().map_or(0, |c| c.id);
                     if let Some(send) = aes_send.as_mut() {
@@ -2344,7 +2730,10 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     active_items.clear();
                     active_skills.clear();
                     active_quick_slots.clear();
+                    active_stored_items.clear();
+                    active_account_points = 0;
                     item_cooldowns.clear();
+                    skill_cooldowns.clear();
                     entity_visibility = EntityVisibility::default();
                     position_dirty = false;
                     use_expanded_send_key = false;

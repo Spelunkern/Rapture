@@ -11,6 +11,7 @@ use crate::character::*;
 use crate::chat::*;
 use crate::inventory::*;
 use crate::movement::*;
+use crate::protocol::*;
 use crate::session::*;
 use crate::svmap::*;
 use crate::world_entities::*;
@@ -427,6 +428,7 @@ pub(crate) fn handle_getitem_request(
                 && item.quality == definition.quality
                 && item.gems == [0; 6]
                 && item.craft_name.is_empty()
+                && !item.dyed
                 && item.count < max_stack
         }) else {
             break;
@@ -570,6 +572,7 @@ fn parse_char_attribute(token: &str) -> Option<CharAttribute> {
         "level" => CharAttribute::Level,
         "grow" => CharAttribute::Grow,
         "money" => CharAttribute::Money,
+        "exp" => CharAttribute::Exp,
         "statpoint" => CharAttribute::StatPoint,
         "skillpoint" => CharAttribute::SkillPoint,
         "str" => CharAttribute::Str,
@@ -584,7 +587,25 @@ fn parse_char_attribute(token: &str) -> Option<CharAttribute> {
     })
 }
 
-const SET_USAGE: &str = "Usage: set [charname] <level|grow|money|statpoint|skillpoint|str|dex|rec|int|luc|wis|kills|deaths> <amount>";
+/// What `set`'s property token resolves to: either a per-character DB
+/// column (`Chars`, via `CharAttribute`/`set_character_attribute`), or the
+/// Item Mall point balance, which lives on the ACCOUNT (`Users_Master.Point`)
+/// rather than on any one character -- a different table/key entirely, so
+/// it can't be folded into `CharAttribute`'s single-table dispatch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SetProperty {
+    Char(CharAttribute),
+    Point,
+}
+
+fn parse_set_property(token: &str) -> Option<SetProperty> {
+    if token.eq_ignore_ascii_case("point") {
+        return Some(SetProperty::Point);
+    }
+    parse_char_attribute(token).map(SetProperty::Char)
+}
+
+const SET_USAGE: &str = "Usage: set [charname] <level|grow|money|exp|statpoint|skillpoint|str|dex|rec|int|luc|wis|kills|deaths|point> <amount>";
 
 /// `set [charname] <property> <amount>`. `charname` is optional -- if the
 /// first argument after `set` isn't a recognized property name, it's
@@ -592,7 +613,7 @@ const SET_USAGE: &str = "Usage: set [charname] <level|grow|money|statpoint|skill
 /// otherwise the target is the caller themselves.
 pub(crate) fn parse_set_command(
     message: &str,
-) -> Option<Result<(Option<String>, CharAttribute, i64)>> {
+) -> Option<Result<(Option<String>, SetProperty, i64)>> {
     let mut parts = message.split_whitespace();
     let command = parts.next()?;
     if !command.eq_ignore_ascii_case("set") {
@@ -603,7 +624,7 @@ pub(crate) fn parse_set_command(
         return Some(Err(anyhow::anyhow!(SET_USAGE)));
     };
 
-    let (charname, property_token) = match parse_char_attribute(first) {
+    let (charname, property_token) = match parse_set_property(first) {
         Some(_) => (None, first),
         None => {
             let Some(second) = parts.next() else {
@@ -613,7 +634,7 @@ pub(crate) fn parse_set_command(
         }
     };
 
-    let Some(attribute) = parse_char_attribute(property_token) else {
+    let Some(property) = parse_set_property(property_token) else {
         return Some(Err(anyhow::anyhow!(SET_USAGE)));
     };
 
@@ -625,7 +646,7 @@ pub(crate) fn parse_set_command(
     }
 
     match amount.parse::<i64>() {
-        Ok(amount) => Some(Ok((charname, attribute, amount))),
+        Ok(amount) => Some(Ok((charname, property, amount))),
         Err(_) => Some(Err(anyhow::anyhow!(SET_USAGE))),
     }
 }
@@ -653,6 +674,7 @@ pub(crate) fn apply_attribute_in_memory(
         CharAttribute::Kills => character.kills = value as u32,
         CharAttribute::Deaths => character.deaths = value as u32,
         CharAttribute::Money => character.money = value as u32,
+        CharAttribute::Exp => character.exp = value as u32,
     }
 }
 
@@ -719,6 +741,21 @@ pub(crate) fn parse_eclear_command(message: &str) -> Option<Result<Option<String
     Some(Ok(charname))
 }
 
+/// `cure [charname]`. Instantly restores HP/MP/SP to full. Defaults to the
+/// caller if no name is given.
+pub(crate) fn parse_cure_command(message: &str) -> Option<Result<Option<String>>> {
+    let mut parts = message.split_whitespace();
+    let command = parts.next()?;
+    if !command.eq_ignore_ascii_case("cure") {
+        return None;
+    }
+    let charname = parts.next().map(str::to_string);
+    if parts.next().is_some() {
+        return Some(Err(anyhow::anyhow!("Usage: cure [charname]")));
+    }
+    Some(Ok(charname))
+}
+
 /// Executes an already-parsed `mmake` command: scatters `count` mobs of
 /// `mob_id` within `radius` of the caller and broadcasts their spawn to
 /// nearby players. Returns the chat response text.
@@ -741,7 +778,7 @@ pub(crate) fn execute_mmake(
         "Rapture World mmake character_id={} mob_id={} count={count} radius={radius:.1} map={}",
         character.id, mob_id, character.map_id
     ));
-    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z) {
+    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z, VIEWPORT_RADIUS) {
         for mob in &mobs {
             let packet = build_mob_enter(mob, true)?;
             player.send_packet(&packet, "0x0601 mmake spawn mob", logger)?;
@@ -763,7 +800,7 @@ pub(crate) fn execute_mera(character: &DbCharacter, radius: f32, logger: &Logger
         removed.len(),
         character.map_id
     ));
-    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z) {
+    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z, VIEWPORT_RADIUS) {
         for &mob_id in &removed {
             let packet = build_mob_leave(mob_id)?;
             player.send_packet(&packet, "0x0602 mera despawn mob", logger)?;
@@ -794,7 +831,7 @@ pub(crate) fn execute_nmake(
         character.id, npc.id, character.map_id, npc.pos_x, npc.pos_y, npc.pos_z
     ));
     let packet = build_npc_enter(&npc)?;
-    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z) {
+    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z, VIEWPORT_RADIUS) {
         player.send_packet(&packet, "0x0E01 nmake spawn npc", logger)?;
     }
     Ok(format!("Spawned NPC {npc_type} {type_id}."))
@@ -810,7 +847,7 @@ pub(crate) fn execute_nera(character: &DbCharacter, radius: f32, logger: &Logger
         removed.len(),
         character.map_id
     ));
-    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z) {
+    for player in players_on_map_near(character.map_id, character.pos_x, character.pos_z, VIEWPORT_RADIUS) {
         for &npc_id in &removed {
             let packet = build_npc_leave(npc_id)?;
             player.send_packet(&packet, "0x0E02 nera despawn npc", logger)?;
@@ -931,6 +968,7 @@ pub(crate) fn execute_char_visibility(
                 character.id,
                 character.pos_x,
                 character.pos_z,
+                VIEWPORT_RADIUS,
             );
             let entered = player.entered_map_packet()?;
             let shape = player.shape_packet()?;
@@ -1204,71 +1242,104 @@ pub(crate) fn execute_set(
     aes_send: &mut Option<AesCtr>,
     use_expanded_send_key: bool,
     charname: Option<String>,
-    attribute: CharAttribute,
+    property: SetProperty,
     amount: i64,
+    active_account_points: &mut u32,
     logger: &Logger,
 ) -> Result<String> {
     let target = match &charname {
         Some(name) => db::get_character_by_name(db_conn, name)?,
         None => Some(character.clone()),
     };
-    match target {
-        Some(target_char) => {
-            let applied = db::set_character_attribute(db_conn, target_char.id, attribute, amount)?;
-            logger.line(format!(
-                "Rapture World set character_id={} attribute={} value={applied} (by character_id={})",
-                target_char.id,
-                attribute.name(),
-                character.id
-            ));
-            if target_char.id == character.id {
-                if let Some(active) = active_character.as_mut() {
-                    apply_attribute_in_memory(active, attribute, applied);
-                    if let Some(player) = connected_player.as_ref() {
-                        player.update_character(active.clone());
-                    }
-                    // Push the recalculated stats live so the client shows
-                    // the change immediately -- without this, the change is
-                    // correct in the DB/session but invisible until relog
-                    // (0x0526/0x051F/0x050B are the "live stat update"
-                    // packets, distinct from 0x0105 CharacterDetails which
-                    // is only sent once at character select).
-                    if let Some(send) = aes_send.as_mut() {
-                        if matches!(attribute, CharAttribute::Money) {
-                            send_encrypted(
-                                stream,
-                                send,
-                                use_expanded_send_key,
-                                build_set_money(active.money)?,
-                                "0x0213 set money update",
-                                logger,
-                            )?;
-                        }
-                        let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
-                        let character_stats =
-                            CharacterStats::from_character(Some(active), equipment_stats);
-                        send_character_stat_packets(
-                            stream,
-                            send,
-                            use_expanded_send_key,
-                            Some(active),
-                            &character_stats,
-                            logger,
-                        )?;
-                    }
-                }
-            }
-            Ok(format!(
-                "Set {} on {} to {applied}.",
-                attribute.name(),
-                target_char.name
-            ))
-        }
-        None => Ok(format!(
+    let Some(target_char) = target else {
+        return Ok(format!(
             "Character '{}' not found.",
             charname.unwrap_or_default()
-        )),
+        ));
+    };
+
+    let attribute = match property {
+        SetProperty::Point => {
+            let points = amount.clamp(0, i64::from(u32::MAX)) as u32;
+            let applied = db::set_account_points(db_conn, target_char.account_id, points)?;
+            logger.line(format!(
+                "Rapture World set account_id={} point={applied} (by character_id={})",
+                target_char.account_id, character.id
+            ));
+            if target_char.id == character.id {
+                *active_account_points = applied;
+                if let Some(send) = aes_send.as_mut() {
+                    send_encrypted(
+                        stream,
+                        send,
+                        use_expanded_send_key,
+                        build_account_points(applied)?,
+                        "0x2601 account points update",
+                        logger,
+                    )?;
+                    send_encrypted(
+                        stream,
+                        send,
+                        use_expanded_send_key,
+                        build_cash_points(applied)?,
+                        "0x2605 cash points update",
+                        logger,
+                    )?;
+                }
+            }
+            return Ok(format!("Set point on {} to {applied}.", target_char.name));
+        }
+        SetProperty::Char(attribute) => attribute,
+    };
+
+    let applied = db::set_character_attribute(db_conn, target_char.id, attribute, amount)?;
+    logger.line(format!(
+        "Rapture World set character_id={} attribute={} value={applied} (by character_id={})",
+        target_char.id,
+        attribute.name(),
+        character.id
+    ));
+    if target_char.id == character.id {
+        if let Some(active) = active_character.as_mut() {
+            apply_attribute_in_memory(active, attribute, applied);
+            if let Some(player) = connected_player.as_ref() {
+                player.update_character(active.clone());
+            }
+            // Push the recalculated stats live so the client shows
+            // the change immediately -- without this, the change is
+            // correct in the DB/session but invisible until relog
+            // (0x0526/0x051F/0x050B are the "live stat update"
+            // packets, distinct from 0x0105 CharacterDetails which
+            // is only sent once at character select).
+            if let Some(send) = aes_send.as_mut() {
+                if matches!(attribute, CharAttribute::Money) {
+                    send_encrypted(
+                        stream,
+                        send,
+                        use_expanded_send_key,
+                        build_set_money(active.money)?,
+                        "0x0213 set money update",
+                        logger,
+                    )?;
+                }
+                let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
+                let character_stats = CharacterStats::from_character(Some(active), equipment_stats);
+                send_character_stat_packets(
+                    stream,
+                    send,
+                    use_expanded_send_key,
+                    Some(active),
+                    &character_stats,
+                    logger,
+                )?;
+            }
+        }
     }
+    Ok(format!(
+        "Set {} on {} to {applied}.",
+        attribute.name(),
+        target_char.name
+    ))
 }
 
 /// Executes an already-parsed, already-admin-checked `amove` command:
@@ -1445,6 +1516,9 @@ pub(crate) fn execute_iclear(
                     let packet = build_remove_item(item, true)?;
                     target_player.send_packet(&packet, "0x0206 iclear remove item", logger)?;
                 }
+                let remaining: Vec<DbCharacterItem> =
+                    items.into_iter().filter(|item| item.bag == 0).collect();
+                target_player.update_items(remaining);
             }
             Ok(format!(
                 "Cleared {count} inventory item(s) from {target_name}."
@@ -1535,6 +1609,7 @@ pub(crate) fn execute_eclear(
                             character.id,
                             character.pos_x,
                             character.pos_z,
+                            VIEWPORT_RADIUS,
                         );
                         for &slot in &cleared_slots {
                             let equipment_packet = player.equipment_packet(slot)?;
@@ -1557,10 +1632,110 @@ pub(crate) fn execute_eclear(
                     let packet = build_remove_item(item, true)?;
                     target_player.send_packet(&packet, "0x0206 eclear remove item", logger)?;
                 }
+                let remaining: Vec<DbCharacterItem> =
+                    items.into_iter().filter(|item| item.bag != 0).collect();
+                target_player.update_items(remaining);
             }
             Ok(format!(
                 "Cleared {count} equipped item(s) from {target_name}."
             ))
+        }
+        None => Ok(format!(
+            "Character '{}' not found.",
+            charname.unwrap_or_default()
+        )),
+    }
+}
+
+/// Executes an already-parsed, already-admin-checked `cure` command:
+/// instantly restores HP/MP/SP to full for the caller (no charname given)
+/// or another character by name (online or offline). The DB write stores
+/// the raw current_* fields at the character's raw max_* -- `CharacterStats`
+/// re-adds equipment/stat bonuses and clamps to the effective max on every
+/// read, so this always lands exactly at the true (bonus-inclusive) full
+/// value shown to the player, matching how a level-up full-heal already
+/// works, rather than duplicating the equipment-bonus math here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_cure(
+    character: &DbCharacter,
+    active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
+    active_items: &[DbCharacterItem],
+    db_conn: &mut db::Db,
+    stream: &mut TcpStream,
+    aes_send: &mut Option<AesCtr>,
+    use_expanded_send_key: bool,
+    charname: Option<String>,
+    logger: &Logger,
+) -> Result<String> {
+    let resolved = resolve_clear_target(character, &charname, db_conn)?;
+    match resolved {
+        Some((target_id, target_name)) => {
+            let is_self = target_id == character.id;
+            let online_target = if is_self {
+                None
+            } else {
+                find_player_by_name(&target_name)
+            };
+
+            let target_char = if is_self {
+                character.clone()
+            } else {
+                db::get_character_by_name(db_conn, &target_name)?
+                    .ok_or_else(|| anyhow::anyhow!("target character disappeared"))?
+            };
+
+            db::set_character_status(
+                db_conn,
+                target_id,
+                target_char.max_hp,
+                target_char.max_mp,
+                target_char.max_sp,
+            )?;
+            logger.line(format!(
+                "Rapture World cure character_id={target_id} restored full hp/mp/sp (by character_id={})",
+                character.id
+            ));
+
+            if is_self {
+                if let Some(active) = active_character.as_mut() {
+                    active.current_hp = active.max_hp;
+                    active.current_mp = active.max_mp;
+                    active.current_sp = active.max_sp;
+                    if let Some(player) = connected_player.as_ref() {
+                        player.update_character(active.clone());
+                    }
+                }
+                if let Some(send) = aes_send.as_mut() {
+                    let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
+                    let stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
+                    send_encrypted(
+                        stream,
+                        send,
+                        use_expanded_send_key,
+                        build_current_hitpoints(&stats)?,
+                        "0x0521 cure current hp/mp/sp",
+                        logger,
+                    )?;
+                }
+            } else if let Some(target_player) = online_target {
+                let mut updated_target = target_char.clone();
+                updated_target.current_hp = updated_target.max_hp;
+                updated_target.current_mp = updated_target.max_mp;
+                updated_target.current_sp = updated_target.max_sp;
+                target_player.update_character(updated_target);
+
+                let remote_items = db::get_character_items(db_conn, target_id)?;
+                let equipment_stats = db::get_equipment_stats(db_conn, &remote_items)?;
+                let stats = CharacterStats::from_character(Some(&target_char), equipment_stats);
+                target_player.send_packet(
+                    &build_current_hitpoints(&stats)?,
+                    "0x0521 cure current hp/mp/sp (remote)",
+                    logger,
+                )?;
+            }
+
+            Ok(format!("Restored {target_name}'s HP/MP/SP to full."))
         }
         None => Ok(format!(
             "Character '{}' not found.",

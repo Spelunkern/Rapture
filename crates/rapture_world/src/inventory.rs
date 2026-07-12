@@ -13,6 +13,7 @@ use crate::character::*;
 use crate::chat::*;
 use crate::protocol::*;
 use crate::session::*;
+use crate::world_entities::VIEWPORT_RADIUS;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MapItem {
@@ -1042,6 +1043,7 @@ pub(crate) fn handle_item_bag_to_bag_request(
             character.id,
             character.pos_x,
             character.pos_z,
+            VIEWPORT_RADIUS,
         );
         for &slot in &changed_equipment_slots {
             if let Some(player) = connected_player.as_ref() {

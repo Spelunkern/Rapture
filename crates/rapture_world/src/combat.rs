@@ -26,6 +26,17 @@ pub(crate) fn basic_auto_attack_damage(stats: CharacterStats) -> u32 {
     min.saturating_add(max).saturating_div(2).max(1)
 }
 
+/// Same shape as `basic_auto_attack_damage`, but off `min_magic`/`max_magic`
+/// (INT/WIS-derived) instead of `min_attack`/`max_attack` (STR/DEX-derived)
+/// -- used for skills where `Skills.TypeAttack == 3` (magic), confirmed by
+/// cross-referencing that column against class eligibility on every
+/// damaging skill in the live DB.
+pub(crate) fn basic_magic_attack_damage(stats: CharacterStats) -> u32 {
+    let min = stats.min_magic.min(stats.max_magic);
+    let max = stats.min_magic.max(stats.max_magic);
+    min.saturating_add(max).saturating_div(2).max(1)
+}
+
 pub(crate) fn equipped_weapon_combat(
     db_conn: &mut db::Db,
     items: &[DbCharacterItem],
@@ -166,13 +177,50 @@ pub(crate) fn process_auto_attack_swing(
         ATTACK_SUCCESS_NORMAL,
         result.damage_hp,
     )?;
-    for player in players_on_map_near(character.map_id, result.mob.pos_x, result.mob.pos_z) {
+    for player in players_on_map_near(character.map_id, result.mob.pos_x, result.mob.pos_z, COMBAT_RADIUS) {
         player.send_packet(&attack_packet, "0x0503 character mob auto attack", logger)?;
     }
 
+    resolve_mob_damage_result(
+        &result,
+        character.map_id,
+        character.id,
+        character.pos_y,
+        active_character,
+        connected_player,
+        active_items,
+        db_conn,
+        stream,
+        aes_send,
+        use_expanded_send_key,
+        logger,
+    )
+}
+
+/// Shared "what happens after a mob takes damage" handling -- death
+/// broadcast + drops + exp/level gain if it died, or just a target-HP
+/// update if it didn't. Used by both auto-attack and skill-cast damage,
+/// since the consequences of a kill don't depend on how the killing blow
+/// was dealt. Returns whether the mob is still alive (mirroring
+/// `process_auto_attack_swing`'s original "keep attacking?" return value).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_mob_damage_result(
+    result: &MobDamageResult,
+    map_id: u16,
+    killer_id: u32,
+    killer_pos_y: f32,
+    active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
+    active_items: &[DbCharacterItem],
+    db_conn: &mut db::Db,
+    stream: &mut TcpStream,
+    aes_send: &mut Option<AesCtr>,
+    use_expanded_send_key: bool,
+    logger: &Logger,
+) -> Result<bool> {
     if result.killed {
-        let death_packet = build_mob_death(result.mob.id, character.id)?;
-        for player in players_on_map_near(character.map_id, result.mob.pos_x, result.mob.pos_z) {
+        let death_packet = build_mob_death(result.mob.id, killer_id)?;
+        for player in players_on_map_near(map_id, result.mob.pos_x, result.mob.pos_z, COMBAT_RADIUS) {
             player.send_packet(&death_packet, "0x0606 mob death", logger)?;
         }
         // Y uses the killer's own live position, not the mob's stored pos_y:
@@ -183,19 +231,18 @@ pub(crate) fn process_auto_attack_swing(
         // clear line-of-sight range of) the mob when it dies, so it tracks
         // local terrain far more reliably than an area-wide average.
         let drop_packets = roll_mob_drops(
-            character.map_id,
+            map_id,
             result.mob.mob_id,
             result.mob.money_min,
             result.mob.money_max,
-            character.id,
+            killer_id,
             result.mob.pos_x,
-            character.pos_y,
+            killer_pos_y,
             result.mob.pos_z,
             logger,
         )?;
         if !drop_packets.is_empty() {
-            let recipients =
-                players_on_map_near(character.map_id, result.mob.pos_x, result.mob.pos_z);
+            let recipients = players_on_map_near(map_id, result.mob.pos_x, result.mob.pos_z, COMBAT_RADIUS);
             for packet in drop_packets {
                 for player in &recipients {
                     player.send_packet(&packet, "0x0401 mob drop", logger)?;
@@ -205,7 +252,8 @@ pub(crate) fn process_auto_attack_swing(
 
         if result.mob.exp > 0 {
             if let Some(active) = active_character.as_mut() {
-                let gain = apply_exp_gain(active, result.mob.exp);
+                let scaled_exp = scaled_kill_exp(active.level, result.mob.level, result.mob.exp);
+                let gain = apply_exp_gain(active, scaled_exp);
                 db::set_character_level_exp(db_conn, active.id, active.level, active.exp)?;
                 if gain.levels_gained > 0 {
                     db::set_character_status(
@@ -220,10 +268,12 @@ pub(crate) fn process_auto_attack_swing(
                     player.update_character(active.clone());
                 }
                 logger.line(format!(
-                    "Rapture World exp character_id={} mob_id={} gained={} level={} exp={} leveled_up={} levels_gained={}",
+                    "Rapture World exp character_id={} mob_id={} mob_level={} base_exp={} scaled_gained={} level={} exp={} leveled_up={} levels_gained={}",
                     active.id,
                     result.mob.mob_id,
+                    result.mob.level,
                     result.mob.exp,
+                    scaled_exp,
                     gain.new_level,
                     gain.new_exp,
                     gain.leveled_up,

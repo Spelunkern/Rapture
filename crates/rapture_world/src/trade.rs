@@ -969,10 +969,26 @@ fn offer_valid(items: &[DbCharacterItem], offer: &TradeOffer, current_money: u32
     if offer.money > current_money {
         return false;
     }
-    offer.items.iter().flatten().all(|offered| {
+    // Sums every offer slot referencing the same `row_id` before comparing
+    // against the item's actual count -- checking each slot independently
+    // (the previous behavior) let two trade slots each offer, say, 8 of a
+    // 10-count stack (8 <= 10 passes both checks individually) while the
+    // combined 16 exceeds what the sender actually has, which
+    // `transfer_offer` would otherwise grant to the receiver in full.
+    let mut offered_totals: Vec<(u32, u32)> = Vec::new();
+    for offered in offer.items.iter().flatten() {
+        let total = offered_totals
+            .iter_mut()
+            .find(|(row_id, _)| *row_id == offered.row_id);
+        match total {
+            Some((_, count)) => *count += u32::from(offered.count),
+            None => offered_totals.push((offered.row_id, u32::from(offered.count))),
+        }
+    }
+    offered_totals.iter().all(|(row_id, total_offered)| {
         items
             .iter()
-            .any(|item| item.row_id == offered.row_id && item.count >= offered.count)
+            .any(|item| item.row_id == *row_id && u32::from(item.count) >= *total_offered)
     })
 }
 
@@ -1029,7 +1045,14 @@ fn transfer_offer(
         let Some(index) = from_items.iter().position(|item| item.row_id == offered.row_id) else {
             continue;
         };
-        let remaining_after = from_items[index].count.saturating_sub(offered.count);
+        // Clamped to whatever's actually left on this row at this point in
+        // the loop -- defense in depth against two offer slots referencing
+        // the same row_id (should already be rejected by `offer_valid`,
+        // but this guarantees the receiver can never be granted more than
+        // the sender actually loses, matching the "leftover" defensiveness
+        // already used below for the capacity case).
+        let grant_count = offered.count.min(from_items[index].count);
+        let remaining_after = from_items[index].count.saturating_sub(grant_count);
         if remaining_after == 0 {
             from_packets.push(build_remove_item(&from_items[index], true)?);
             db::delete_character_item(db_conn, from_id, offered.row_id)?;
@@ -1042,6 +1065,10 @@ fn transfer_offer(
             from_items[index].count = remaining_after;
         }
 
+        if grant_count == 0 {
+            continue;
+        }
+
         let template = DbCharacterItem {
             row_id: 0,
             bag: 0,
@@ -1050,7 +1077,7 @@ fn transfer_offer(
             type_id: offered.type_id,
             quality: offered.quality,
             gems: offered.gems,
-            count: offered.count,
+            count: grant_count,
             craft_name: offered.craft_name.clone(),
             dyed: offered.dyed,
         };
@@ -1058,7 +1085,7 @@ fn transfer_offer(
             .map(|definition| definition.max_stack.max(1))
             .unwrap_or(1);
         let (add_packets, leftover) =
-            give_item_to_inventory(db_conn, to_id, to_items, &template, offered.count, max_stack)?;
+            give_item_to_inventory(db_conn, to_id, to_items, &template, grant_count, max_stack)?;
         to_packets.extend(add_packets);
         if leftover > 0 {
             // Shouldn't happen now that offer_fits pre-validates capacity,

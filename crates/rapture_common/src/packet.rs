@@ -23,6 +23,7 @@ pub enum Opcode {
     ItemBagToBag = 0x0204,
     AddItem = 0x0205,
     RemoveItem = 0x0206,
+    SetStatPoint = 0x0208,
     LearnNewSkill = 0x0209,
     CharacterEnteredPortal = 0x020A,
     CharacterMapTeleport = 0x020B,
@@ -45,6 +46,26 @@ pub enum Opcode {
     MapNpcMove = 0x0E03,
     UseItem = 0x050A,
     CharacterMaxEnergy = 0x050B,
+    /// "USED_SP_MP" -- notifies the client of a skill's own MP/SP cast
+    /// cost, separate from the skill-use ack (which never carries it).
+    /// Confirmed against real captures cross-referenced with `Skills.MP`.
+    SkillUsedSpMp = 0x050C,
+    /// "CHARACTER_SKILL_CASTING" -- sent once when a skill with a nonzero
+    /// `ReadyTime` (cast time) begins casting, before the delayed result.
+    /// Confirmed against a real capture and Imgeneus's `PacketType.
+    /// CHARACTER_SKILL_CASTING`.
+    SkillCastStarted = 0x0510,
+    /// "BUFF_ADD" per Imgeneus / "TP_PC_SKILL_SET" per Aries -- same
+    /// opcode number in both references, but they disagree on payload
+    /// shape (Imgeneus: id+skillId+skillLv+countdown, 11 bytes; Aries:
+    /// objectId+skillId+skillLv, 7 bytes, no duration). Using Aries's
+    /// shape as the first guess (it has been the more reliable reference
+    /// for this specific build so far), UNCONFIRMED against a real
+    /// capture -- flag this to the user and correct once one exists.
+    BuffAdd = 0x050D,
+    /// "BUFF_REMOVE" per Imgeneus / "TP_PC_SKILL_REMOVE" per Aries -- both
+    /// agree on a bare `objectId:u32` payload for this one.
+    BuffRemove = 0x050E,
     CharacterMaxHpMpSp = 0x051F,
     CharacterCurrentHitpoints = 0x0521,
     CharacterAdditionalStats = 0x0526,
@@ -57,6 +78,10 @@ pub enum Opcode {
     ChatError = 0x1106,
     ChatMap = 0x1111,
     WarehouseItemList = 0x0711,
+    ShopSell = 0x0703,
+    SkillUseNoTarget = 0x0511,
+    SkillUse = 0x0517,
+    SkillExtraDamage = 0x051A,
     AccountPoints = 0x2601,
     PointBuy = 0x2602,
     CashPoint = 0x2605,

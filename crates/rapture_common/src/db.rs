@@ -46,6 +46,8 @@ pub struct DbAccount {
     // AdminE=5; used to pick which tier to report in the login success
     // packet.
     pub admin_level: u8,
+    /// `Users_Master.Point` -- Item Mall / cash shop point balance.
+    pub point: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +151,9 @@ pub struct DbItemDefinition {
     pub type_id: u8,
     pub quality: u16,
     pub max_stack: u8,
+    /// `PS_GameDefs.dbo.Items.Sell` -- gold paid per unit when sold to an
+    /// NPC vendor.
+    pub sell_price: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,12 +177,93 @@ pub struct DbCharacterSkill {
     pub skill_id: u16,
     pub skill_level: u8,
     pub number: u8,
+    /// Seconds remaining on this skill's cooldown, as of when it was
+    /// loaded (`get_character_skills` computes this live from
+    /// `Delay`/`CreateTime` via `DATEDIFF`, so it's always fresh at load
+    /// time -- see `set_character_skill_cooldown` for how those two
+    /// columns are actually used).
     pub delay: i32,
+}
+
+/// One (SkillID, SkillLevel) row from `PS_GameDefs.dbo.Skills`.
+/// `class_eligible` is indexed by `DbCharacter::character_class` (0-5):
+/// 0=Attackfighter, 1=Defensefighter, 2=Patrolrogue, 3=Shootrogue,
+/// 4=Attackmage, 5=Defensemage -- confirmed mapping.
+#[derive(Clone, Copy, Debug)]
+pub struct DbSkillDefinition {
+    pub skill_id: u16,
+    pub skill_level: u8,
+    pub req_level: u16,
+    pub skill_point_cost: u8,
+    pub prev_skill_id: u16,
+    pub class_eligible: [bool; 6],
+    /// Combat fields (used when actually casting the skill, not just
+    /// learning it): MP/SP cost, cooldown (`ResetTime`, seconds), flat
+    /// damage bonus (`DamageHP` + `AddDamageHP`, added to the caster's
+    /// stat-based attack damage), and cast range.
+    pub mp_cost: u16,
+    pub sp_cost: u16,
+    pub reset_time_seconds: u16,
+    pub damage_hp: i32,
+    pub add_damage_hp: i32,
+    /// `Skills.HealHP/HealSP/HealMP` -- an instant restore instead of
+    /// damage. Present independently of `damage_hp` (never both nonzero on
+    /// the same row in the live DB) and independently of each other -- a
+    /// skill can restore any subset of HP/MP/SP, including all three.
+    pub heal_hp: i32,
+    pub heal_sp: i32,
+    pub heal_mp: i32,
+    /// `Skills.TypeDetail` -- confirmed by the user against native-client
+    /// testing: `41` = instant heal (`HealHP`/`HealSP`/`HealMP`), `81` =
+    /// periodic heal over time (`TimeHealHP`/`TimeHealSP`/`TimeHealMP`,
+    /// ticking every 3 seconds for `KeepTime` seconds total). Both are
+    /// confirmed to correlate 1:1 with their respective heal columns being
+    /// nonzero across every row in the live DB.
+    pub type_detail: u16,
+    /// `Skills.KeepTime` -- total duration in seconds a periodic
+    /// (`type_detail == 81`) effect lasts.
+    pub keep_time: u16,
+    /// `Skills.TimeHealHP/TimeHealSP/TimeHealMP` -- the flat amount
+    /// restored per 3-second tick of a periodic heal. Confirmed by the
+    /// user to never scale with WIS (unlike instant `HealHP`, which does
+    /// for `TypeAttack == 3` skills).
+    pub time_heal_hp: i32,
+    pub time_heal_sp: i32,
+    pub time_heal_mp: i32,
+    /// `Skills.ReadyTime` -- cast time, in units of 250ms (confirmed via
+    /// Imgeneus's `Skill.CastTime => ReadyTime * 250` and matched against a
+    /// real capture: `ReadyTime == 4` on a heal that took ~1 real second to
+    /// resolve). `0` means the skill resolves instantly with no cast bar.
+    pub ready_time: u8,
+    /// `Skills.AbilityType1..10`/`AbilityValue1..10` -- used by `TypeDetail
+    /// == 82` ("Buff") skills. Confirmed via Imgeneus's `AbilityType` enum:
+    /// `1`=HP, `2`=MP, `3`=SP, `4`=Str, `5`=Rec, `6`=Int, `7`=Wis, `8`=Dex,
+    /// `9`=Luc (only these are currently applied -- see skillcast.rs's
+    /// buff handling; every other `AbilityType` is logged and ignored for
+    /// now, matching this project's incremental scope).
+    pub ability_type: [u8; 10],
+    pub ability_value: [i16; 10],
+    pub attack_range: u8,
+    /// `Skills.TypeAttack` -- confirmed by cross-referencing its values
+    /// against class eligibility on every damaging skill in the live DB:
+    /// 0 = no damage component (passive/buff), 1 = melee physical
+    /// (fighter/defender/ranger), 2 = ranged physical (archer), 3 = magic
+    /// (mage/priest). Determines whether a skill's damage scales off
+    /// STR/DEX (`CharacterStats::min_attack/max_attack`) or INT/WIS
+    /// (`min_magic/max_magic`).
+    pub type_attack: u8,
+    /// `Skills.TargetType`/`ApplyRange`/`MultiAttack` -- present in the
+    /// schema (AoE/multi-hit) but not yet interpreted; exposed here for
+    /// callers that want to inspect them, not consumed by combat yet.
+    pub target_type: u8,
+    pub apply_range: u8,
+    pub multi_attack: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct DbMobDefinition {
     pub mob_id: u16,
+    pub level: u16,
     pub max_hp: u32,
     pub money_min: u32,
     pub money_max: u32,
@@ -366,6 +452,7 @@ pub fn authenticate_account(
             u.UserID,
             u.Admin,
             u.AdminLevel,
+            u.Point,
             ISNULL(g.Country, 2) AS Country,
             ISNULL(g.MaxGrow, 3) AS MaxGrow
         FROM PS_UserData.dbo.Users_Master AS u
@@ -395,6 +482,7 @@ pub fn get_account_by_id(conn: &mut Db, account_id: u32) -> Result<Option<DbAcco
             u.UserID,
             u.Admin,
             u.AdminLevel,
+            u.Point,
             ISNULL(g.Country, 2) AS Country,
             ISNULL(g.MaxGrow, 3) AS MaxGrow
         FROM PS_UserData.dbo.Users_Master AS u
@@ -522,6 +610,7 @@ pub enum CharAttribute {
     Level,
     Grow,
     Money,
+    Exp,
     StatPoint,
     SkillPoint,
     Str,
@@ -544,6 +633,7 @@ impl CharAttribute {
             CharAttribute::Level => "level",
             CharAttribute::Grow => "grow",
             CharAttribute::Money => "money",
+            CharAttribute::Exp => "exp",
             CharAttribute::StatPoint => "statpoint",
             CharAttribute::SkillPoint => "skillpoint",
             CharAttribute::Str => "str",
@@ -573,6 +663,7 @@ pub fn set_character_attribute(
         CharAttribute::Level => ("Level", 0, 255),
         CharAttribute::Grow => ("Grow", 0, 3),
         CharAttribute::Money => ("Money", 0, MONEY_CAP as i64),
+        CharAttribute::Exp => ("Exp", 0, i32::MAX as i64),
         CharAttribute::StatPoint => ("StatPoint", 0, i16::MAX as i64),
         CharAttribute::SkillPoint => ("SkillPoint", 0, i16::MAX as i64),
         CharAttribute::Str => ("Str", 0, i16::MAX as i64),
@@ -846,7 +937,7 @@ pub fn get_item_definition(
 ) -> Result<Option<DbItemDefinition>> {
     let sql = r#"
         SELECT TOP (1)
-            Type, TypeID, Quality, Count
+            Type, TypeID, Quality, Count, Sell
         FROM PS_GameDefs.dbo.Items
         WHERE Type = @P1
             AND TypeID = @P2
@@ -860,6 +951,7 @@ pub fn get_item_definition(
         type_id: tinyint_or_default(&row, "TypeID", type_id),
         quality: positive_smallint_as_u16(&row, "Quality", 0),
         max_stack: tinyint_or_default(&row, "Count", 1).max(1),
+        sell_price: row.get::<i32, _>("Sell").unwrap_or_default().max(0) as u32,
     }))
 }
 
@@ -936,6 +1028,7 @@ pub fn get_item_definitions_by_grade(conn: &mut Db) -> Result<HashMap<u16, Vec<D
                     type_id: tinyint_or_default(&row, "TypeID", 0),
                     quality: positive_smallint_as_u16(&row, "Quality", 0),
                     max_stack: tinyint_or_default(&row, "Count", 1).max(1),
+                    sell_price: 0,
                 });
         }
 
@@ -945,7 +1038,7 @@ pub fn get_item_definitions_by_grade(conn: &mut Db) -> Result<HashMap<u16, Vec<D
 
 pub fn get_mob_definitions(conn: &mut Db) -> Result<HashMap<u16, DbMobDefinition>> {
     let sql = r#"
-        SELECT MobID, HP, Money1, Money2, AttackSpecial3, Exp
+        SELECT MobID, Level, HP, Money1, Money2, AttackSpecial3, Exp
         FROM PS_GameDefs.dbo.Mobs
     "#;
 
@@ -967,6 +1060,7 @@ pub fn get_mob_definitions(conn: &mut Db) -> Result<HashMap<u16, DbMobDefinition
                 if mob_id == 0 {
                     return None;
                 }
+                let level = numeric_u16(&row, "Level", 1).max(1);
                 let max_hp = numeric_u32(&row, "HP", 100).max(1);
                 let money_min = numeric_u32(&row, "Money1", 0);
                 let money_max = numeric_u32(&row, "Money2", 0);
@@ -977,6 +1071,7 @@ pub fn get_mob_definitions(conn: &mut Db) -> Result<HashMap<u16, DbMobDefinition
                     mob_id,
                     DbMobDefinition {
                         mob_id,
+                        level,
                         max_hp,
                         money_min,
                         money_max,
@@ -1417,6 +1512,229 @@ pub fn swap_character_items(
     .context("failed to swap character items")
 }
 
+/// Warehouse storage (`PS_GameData.dbo.UserStoredItems`) is keyed by
+/// `UserUID` (account), not `CharID` -- shared across every character on the
+/// account, matching retail Shaiya's per-account bank/warehouse. Row shape
+/// mirrors `CharItems` closely (see `get_character_items`) minus the `Bag`
+/// column, since there's only one storage "bag" per account.
+pub fn get_stored_items(conn: &mut Db, account_id: u32) -> Result<Vec<DbCharacterItem>> {
+    let sql = r#"
+        SELECT
+            RowID, Slot, Type, TypeID, Quality,
+            Gem1, Gem2, Gem3, Gem4, Gem5, Gem6,
+            Count, Craftname
+        FROM PS_GameData.dbo.UserStoredItems
+        WHERE UserUID = @P1
+            AND Del = 0
+            AND Count > 0
+        ORDER BY Slot
+    "#;
+
+    let account_id = account_id as i32;
+    let _ = conn;
+    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
+        let rows = client
+            .query(sql, &[&account_id])
+            .await
+            .context("failed to load stored items")?
+            .into_results()
+            .await
+            .context("failed to read stored items")?;
+
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .map(|row| DbCharacterItem {
+                row_id: row.get::<i32, _>("RowID").unwrap_or_default().max(0) as u32,
+                bag: 0,
+                slot: row.get::<i32, _>("Slot").unwrap_or_default().max(0) as u8,
+                item_type: tinyint_or_default(&row, "Type", 0),
+                type_id: tinyint_or_default(&row, "TypeID", 0),
+                quality: positive_smallint_as_u16(&row, "Quality", 0),
+                gems: [
+                    tinyint_or_default(&row, "Gem1", 0),
+                    tinyint_or_default(&row, "Gem2", 0),
+                    tinyint_or_default(&row, "Gem3", 0),
+                    tinyint_or_default(&row, "Gem4", 0),
+                    tinyint_or_default(&row, "Gem5", 0),
+                    tinyint_or_default(&row, "Gem6", 0),
+                ],
+                count: tinyint_or_default(&row, "Count", 1),
+                craft_name: row
+                    .get::<&str, _>("Craftname")
+                    .unwrap_or_default()
+                    .trim_end()
+                    .to_string(),
+                dyed: false,
+            })
+            .collect())
+    }))
+}
+
+pub fn create_stored_item_from_template(
+    conn: &mut Db,
+    account_id: u32,
+    item: &DbCharacterItem,
+    slot: u8,
+    count: u8,
+) -> Result<DbCharacterItem> {
+    let sql = r#"
+        INSERT INTO PS_GameData.dbo.UserStoredItems (
+            ServerID, UserUID, ItemID, Type, TypeID, ItemUID, Slot, Quality,
+            Gem1, Gem2, Gem3, Gem4, Gem5, Gem6, Craftname, Count, Maketime, Maketype, Del
+        )
+        OUTPUT INSERTED.RowID
+        VALUES (
+            @P1, @P2, @P3,
+            @P4, @P5,
+            CAST(ABS(CHECKSUM(NEWID())) AS bigint) * 2147483648 + CAST(ABS(CHECKSUM(NEWID())) AS bigint),
+            @P6, @P7,
+            @P8, @P9, @P10, @P11, @P12, @P13, @P14, @P15, GETDATE(), 'S', 0
+        )
+    "#;
+
+    let server_id = i32::from(SERVER_ID);
+    let account_id_i32 = account_id as i32;
+    let item_id = i32::from(item.item_type) * 1000 + i32::from(item.type_id);
+    let item_type = i32::from(item.item_type);
+    let type_id = i32::from(item.type_id);
+    let slot_i32 = i32::from(slot);
+    let quality = i32::from(item.quality);
+    let gem1 = i32::from(item.gems[0]);
+    let gem2 = i32::from(item.gems[1]);
+    let gem3 = i32::from(item.gems[2]);
+    let gem4 = i32::from(item.gems[3]);
+    let gem5 = i32::from(item.gems[4]);
+    let gem6 = i32::from(item.gems[5]);
+    let count_i32 = i32::from(count.max(1));
+    let row = query_one(
+        conn,
+        "PS_GameData",
+        sql,
+        &[
+            &server_id,
+            &account_id_i32,
+            &item_id,
+            &item_type,
+            &type_id,
+            &slot_i32,
+            &quality,
+            &gem1,
+            &gem2,
+            &gem3,
+            &gem4,
+            &gem5,
+            &gem6,
+            &item.craft_name,
+            &count_i32,
+        ],
+    )?
+    .context("stored item was not created")?;
+
+    let mut created = item.clone();
+    created.row_id = row.get::<i32, _>(0).unwrap_or_default().max(0) as u32;
+    created.bag = 0;
+    created.slot = slot;
+    created.count = count.max(1);
+    Ok(created)
+}
+
+pub fn move_stored_item(conn: &mut Db, account_id: u32, row_id: u32, slot: u8) -> Result<()> {
+    let sql = r#"
+        UPDATE PS_GameData.dbo.UserStoredItems
+        SET Slot = @P3
+        WHERE UserUID = @P1
+            AND RowID = @P2
+            AND Del = 0
+    "#;
+
+    let account_id = account_id as i32;
+    let row_id = row_id as i32;
+    let slot = i32::from(slot);
+    execute(conn, "PS_GameData", sql, &[&account_id, &row_id, &slot])
+        .context("failed to move stored item")
+}
+
+pub fn swap_stored_items(
+    conn: &mut Db,
+    account_id: u32,
+    first_row_id: u32,
+    first_slot: u8,
+    second_row_id: u32,
+    second_slot: u8,
+) -> Result<()> {
+    let sql = r#"
+        UPDATE PS_GameData.dbo.UserStoredItems
+        SET Slot = CASE RowID
+                WHEN @P2 THEN @P3
+                WHEN @P4 THEN @P5
+                ELSE Slot
+            END
+        WHERE UserUID = @P1
+            AND RowID IN (@P2, @P4)
+            AND Del = 0
+    "#;
+
+    let account_id = account_id as i32;
+    let first_row_id = first_row_id as i32;
+    let first_slot = i32::from(first_slot);
+    let second_row_id = second_row_id as i32;
+    let second_slot = i32::from(second_slot);
+    execute(
+        conn,
+        "PS_GameData",
+        sql,
+        &[
+            &account_id,
+            &first_row_id,
+            &first_slot,
+            &second_row_id,
+            &second_slot,
+        ],
+    )
+    .context("failed to swap stored items")
+}
+
+pub fn set_stored_item_count(
+    conn: &mut Db,
+    account_id: u32,
+    row_id: u32,
+    count: u8,
+) -> Result<()> {
+    if count == 0 {
+        return delete_stored_item(conn, account_id, row_id);
+    }
+
+    let sql = r#"
+        UPDATE PS_GameData.dbo.UserStoredItems
+        SET Count = @P3
+        WHERE UserUID = @P1
+            AND RowID = @P2
+            AND Del = 0
+    "#;
+
+    let account_id = account_id as i32;
+    let row_id = row_id as i32;
+    let count = i32::from(count);
+    execute(conn, "PS_GameData", sql, &[&account_id, &row_id, &count])
+        .context("failed to update stored item count")
+}
+
+pub fn delete_stored_item(conn: &mut Db, account_id: u32, row_id: u32) -> Result<()> {
+    let sql = r#"
+        UPDATE PS_GameData.dbo.UserStoredItems
+        SET Count = 0, Del = 1
+        WHERE UserUID = @P1
+            AND RowID = @P2
+            AND Del = 0
+    "#;
+
+    let account_id = account_id as i32;
+    let row_id = row_id as i32;
+    execute(conn, "PS_GameData", sql, &[&account_id, &row_id])
+        .context("failed to delete stored item")
+}
+
 pub fn get_character_quick_slots(conn: &mut Db, character_id: u32) -> Result<Vec<DbQuickSlot>> {
     let sql = r#"
         SELECT QuickBar, QuickSlot, Bag, Number
@@ -1488,8 +1806,20 @@ pub fn save_character_quick_slots(
 }
 
 pub fn get_character_skills(conn: &mut Db, character_id: u32) -> Result<Vec<DbCharacterSkill>> {
+    // `CreateTime` is `smalldatetime` (minute precision only), so the
+    // moment a cooldown started can be stored up to ~30s off from when it
+    // really started. A 30s safety margin is subtracted here so that
+    // worst-case rounding error can only make a skill appear ready a
+    // little EARLY, never stuck on cooldown longer than it really should
+    // be -- the direction that matters, since "ready a bit early" is a
+    // minor inconvenience but "stuck longer than real" would look broken.
     let sql = r#"
-        SELECT SkillID, SkillLevel, Number, Delay
+        SELECT SkillID, SkillLevel, Number,
+            CASE
+                WHEN Delay - DATEDIFF(SECOND, CreateTime, GETDATE()) - 30 > 0
+                    THEN Delay - DATEDIFF(SECOND, CreateTime, GETDATE()) - 30
+                ELSE 0
+            END AS RemainingCooldown
         FROM PS_GameData.dbo.CharSkills
         WHERE CharID = @P1
             AND Del = 0
@@ -1514,10 +1844,220 @@ pub fn get_character_skills(conn: &mut Db, character_id: u32) -> Result<Vec<DbCh
                 skill_id: positive_smallint_as_u16(&row, "SkillID", 0),
                 skill_level: tinyint_or_default(&row, "SkillLevel", 1),
                 number: tinyint_or_default(&row, "Number", 0),
-                delay: row.get::<i16, _>("Delay").unwrap_or_default().max(0) as i32,
+                delay: row.get::<i32, _>("RemainingCooldown").unwrap_or_default().max(0),
             })
             .collect())
     }))
+}
+
+pub fn get_skill_definition(
+    conn: &mut Db,
+    skill_id: u16,
+    skill_level: u8,
+) -> Result<Option<DbSkillDefinition>> {
+    let sql = r#"
+        SELECT TOP (1)
+            SkillID, SkillLevel, ReqLevel, SkillPoint, PrevSkillID,
+            Attackfighter, Defensefighter, Patrolrogue, Shootrogue,
+            Attackmage, Defensemage,
+            SP, MP, ResetTime, ReadyTime, DamageHP, AddDamageHP, HealHP, HealSP, HealMP,
+            TypeDetail, KeepTime, TimeHealHP, TimeHealSP, TimeHealMP,
+            AbilityType1, AbilityValue1, AbilityType2, AbilityValue2,
+            AbilityType3, AbilityValue3, AbilityType4, AbilityValue4,
+            AbilityType5, AbilityValue5, AbilityType6, AbilityValue6,
+            AbilityType7, AbilityValue7, AbilityType8, AbilityValue8,
+            AbilityType9, AbilityValue9, AbilityType10, AbilityValue10,
+            AttackRange, TypeAttack, TargetType, ApplyRange, MultiAttack
+        FROM PS_GameDefs.dbo.Skills
+        WHERE SkillID = @P1
+            AND SkillLevel = @P2
+    "#;
+
+    let skill_id_i32 = i32::from(skill_id);
+    let skill_level_i32 = i32::from(skill_level);
+    let row = query_one(conn, "PS_GameDefs", sql, &[&skill_id_i32, &skill_level_i32])?;
+    Ok(row.map(|row| DbSkillDefinition {
+        skill_id: row
+            .get::<i32, _>("SkillID")
+            .map(|value| value.max(0) as u16)
+            .unwrap_or(skill_id),
+        skill_level: tinyint_or_default(&row, "SkillLevel", skill_level),
+        req_level: row.get::<i16, _>("ReqLevel").unwrap_or_default().max(0) as u16,
+        skill_point_cost: tinyint_or_default(&row, "SkillPoint", 0),
+        prev_skill_id: row.get::<i16, _>("PrevSkillID").unwrap_or_default().max(0) as u16,
+        class_eligible: [
+            tinyint_or_default(&row, "Attackfighter", 0) != 0,
+            tinyint_or_default(&row, "Defensefighter", 0) != 0,
+            tinyint_or_default(&row, "Patrolrogue", 0) != 0,
+            tinyint_or_default(&row, "Shootrogue", 0) != 0,
+            tinyint_or_default(&row, "Attackmage", 0) != 0,
+            tinyint_or_default(&row, "Defensemage", 0) != 0,
+        ],
+        mp_cost: row.get::<i16, _>("MP").unwrap_or_default().max(0) as u16,
+        sp_cost: row.get::<i16, _>("SP").unwrap_or_default().max(0) as u16,
+        reset_time_seconds: row.get::<i16, _>("ResetTime").unwrap_or_default().max(0) as u16,
+        damage_hp: i32::from(row.get::<i16, _>("DamageHP").unwrap_or_default()),
+        add_damage_hp: i32::from(row.get::<i16, _>("AddDamageHP").unwrap_or_default()),
+        heal_hp: i32::from(row.get::<i16, _>("HealHP").unwrap_or_default()),
+        heal_sp: i32::from(row.get::<i16, _>("HealSP").unwrap_or_default()),
+        heal_mp: i32::from(row.get::<i16, _>("HealMP").unwrap_or_default()),
+        type_detail: positive_smallint_as_u16(&row, "TypeDetail", 0),
+        keep_time: positive_smallint_as_u16(&row, "KeepTime", 0),
+        time_heal_hp: i32::from(row.get::<i16, _>("TimeHealHP").unwrap_or_default()),
+        time_heal_sp: i32::from(row.get::<i16, _>("TimeHealSP").unwrap_or_default()),
+        time_heal_mp: i32::from(row.get::<i16, _>("TimeHealMP").unwrap_or_default()),
+        ready_time: tinyint_or_default(&row, "ReadyTime", 0),
+        ability_type: [
+            tinyint_or_default(&row, "AbilityType1", 0),
+            tinyint_or_default(&row, "AbilityType2", 0),
+            tinyint_or_default(&row, "AbilityType3", 0),
+            tinyint_or_default(&row, "AbilityType4", 0),
+            tinyint_or_default(&row, "AbilityType5", 0),
+            tinyint_or_default(&row, "AbilityType6", 0),
+            tinyint_or_default(&row, "AbilityType7", 0),
+            tinyint_or_default(&row, "AbilityType8", 0),
+            tinyint_or_default(&row, "AbilityType9", 0),
+            tinyint_or_default(&row, "AbilityType10", 0),
+        ],
+        ability_value: [
+            row.get::<i16, _>("AbilityValue1").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue2").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue3").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue4").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue5").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue6").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue7").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue8").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue9").unwrap_or_default(),
+            row.get::<i16, _>("AbilityValue10").unwrap_or_default(),
+        ],
+        attack_range: tinyint_or_default(&row, "AttackRange", 0),
+        type_attack: tinyint_or_default(&row, "TypeAttack", 0),
+        target_type: tinyint_or_default(&row, "TargetType", 0),
+        apply_range: tinyint_or_default(&row, "ApplyRange", 0),
+        multi_attack: tinyint_or_default(&row, "MultiAttack", 0),
+    }))
+}
+
+/// `CharSkills.Delay` is a `smallint` -- too small to hold an absolute unix
+/// timestamp, so it can't work like `UserStoredItems`-style "expiry" columns
+/// elsewhere in this project. Instead, `Delay` holds the cooldown's
+/// DURATION in seconds and `CreateTime` (otherwise unused after a skill is
+/// learned -- only written once at learn time and never read back) is
+/// repurposed as "cooldown started at", so `get_character_skills` can
+/// always recompute an accurate "seconds remaining" via `DATEDIFF`
+/// regardless of how much real time passed since this was set (including
+/// across a relog or a long time offline).
+pub fn set_character_skill_cooldown(
+    conn: &mut Db,
+    character_id: u32,
+    skill_id: u16,
+    duration_seconds: u16,
+) -> Result<()> {
+    let sql = r#"
+        UPDATE PS_GameData.dbo.CharSkills
+        SET Delay = @P3, CreateTime = GETDATE()
+        WHERE CharID = @P1
+            AND SkillID = @P2
+    "#;
+
+    let character_id_param = character_id as i32;
+    let skill_id_param = i32::from(skill_id);
+    let duration_param = i32::from(duration_seconds);
+    execute(
+        conn,
+        "PS_GameData",
+        sql,
+        &[&character_id_param, &skill_id_param, &duration_param],
+    )
+    .context("failed to update character skill cooldown")
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DbCharacterAppliedBuff {
+    pub skill_id: u16,
+    pub skill_level: u8,
+    pub left_reset_time_seconds: u32,
+}
+
+/// Reads every buff row persisted for this character in `CharApplySkills`.
+/// Unlike skill cooldowns, buffs freeze while offline rather than
+/// continuing to count down (confirmed by the user), so `LeftResetTime`
+/// is a plain snapshot of remaining seconds -- no timestamp/DATEDIFF
+/// trick is needed to recompute elapsed offline time.
+pub fn get_character_apply_skills(conn: &mut Db, character_id: u32) -> Result<Vec<DbCharacterAppliedBuff>> {
+    let sql = r#"
+        SELECT SkillID, SkillLevel, LeftResetTime
+        FROM PS_GameData.dbo.CharApplySkills
+        WHERE CharID = @P1
+    "#;
+
+    let character_id_param = character_id as i32;
+    let _ = conn;
+    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
+        let rows = client
+            .query(sql, &[&character_id_param])
+            .await
+            .context("failed to query character apply skills")?
+            .into_results()
+            .await
+            .context("failed to read character apply skills rows")?;
+
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .map(|row| DbCharacterAppliedBuff {
+                skill_id: positive_smallint_as_u16(&row, "SkillID", 0),
+                skill_level: tinyint_or_default(&row, "SkillLevel", 0),
+                left_reset_time_seconds: row
+                    .get::<i32, _>("LeftResetTime")
+                    .unwrap_or_default()
+                    .max(0) as u32,
+            })
+            .collect())
+    }))
+}
+
+/// Upserts one buff's remaining seconds -- `CharApplySkills` has no unique
+/// constraint on (CharID, SkillID), so this deletes any existing row for
+/// the pair before inserting the fresh one (same pattern already used by
+/// `save_character_quick_slots`).
+pub fn set_character_apply_skill(
+    conn: &mut Db,
+    character_id: u32,
+    skill_id: u16,
+    skill_level: u8,
+    left_reset_time_seconds: u32,
+) -> Result<()> {
+    clear_character_apply_skill(conn, character_id, skill_id)?;
+
+    let sql = r#"
+        INSERT INTO PS_GameData.dbo.CharApplySkills (CharID, SkillID, SkillLevel, LeftResetTime)
+        VALUES (@P1, @P2, @P3, @P4)
+    "#;
+    let character_id_param = character_id as i32;
+    let skill_id_param = i32::from(skill_id);
+    let skill_level_param = i32::from(skill_level);
+    let left_reset_time_param = left_reset_time_seconds as i32;
+    execute(
+        conn,
+        "PS_GameData",
+        sql,
+        &[&character_id_param, &skill_id_param, &skill_level_param, &left_reset_time_param],
+    )
+    .context("failed to insert character apply skill")
+}
+
+pub fn clear_character_apply_skill(conn: &mut Db, character_id: u32, skill_id: u16) -> Result<()> {
+    let character_id_param = character_id as i32;
+    let skill_id_param = i32::from(skill_id);
+    execute(
+        conn,
+        "PS_GameData",
+        "DELETE FROM PS_GameData.dbo.CharApplySkills WHERE CharID = @P1 AND SkillID = @P2",
+        &[&character_id_param, &skill_id_param],
+    )
+    .context("failed to clear character apply skill")
 }
 
 pub fn learn_character_skill(
@@ -1590,8 +2130,15 @@ pub fn learn_character_skill(
 }
 
 fn next_character_skill_number(conn: &mut Db, character_id: u32) -> Result<u8> {
+    // ISNULL(MAX(Number), -1) crashes with "Arithmetic overflow ... tinyint,
+    // value = -1" whenever a character has zero rows (MAX returns NULL):
+    // ISNULL's replacement value gets type-matched to MAX(Number)'s own
+    // type (tinyint, unsigned 0-255) BEFORE the outer CAST to int ever
+    // runs, and -1 doesn't fit in a tinyint. Casting MAX(Number) to int
+    // FIRST avoids that -- NULL survives a CAST fine, and ISNULL then only
+    // ever deals with int-typed values.
     let sql = r#"
-        SELECT CAST(ISNULL(MAX(Number), -1) AS int) AS MaxNumber
+        SELECT ISNULL(CAST(MAX(Number) AS int), -1) AS MaxNumber
         FROM PS_GameData.dbo.CharSkills
         WHERE CharID = @P1
     "#;
@@ -1766,7 +2313,80 @@ fn account_from_row(row: Row) -> DbAccount {
         is_admin: bit_or_default(&row, "Admin", false)
             || tinyint_or_default(&row, "AdminLevel", 0) > 0,
         admin_level: tinyint_or_default(&row, "AdminLevel", 0),
+        point: row.get::<i32, _>("Point").unwrap_or_default().max(0) as u32,
     }
+}
+
+pub fn set_account_points(conn: &mut Db, account_id: u32, points: u32) -> Result<u32> {
+    let account_id_param = account_id as i32;
+    let points_param = points.min(i32::MAX as u32) as i32;
+    execute(
+        conn,
+        "PS_UserData",
+        "UPDATE PS_UserData.dbo.Users_Master SET Point = @P1 WHERE UserUID = @P2",
+        &[&points_param, &account_id_param],
+    )?;
+    Ok(points_param as u32)
+}
+
+/// Item Mall / cash shop catalog entry (`PS_GameDefs.dbo.ProductList`).
+/// `items` is derived from the table's 24 `ItemIDn`/`ItemCountn` column
+/// pairs (skipping empty ones), converting each `ItemIDn` the same way
+/// `create_character_item` does going the other way (`item_id = type*1000 +
+/// type_id`).
+#[derive(Clone, Debug)]
+pub struct DbProduct {
+    pub product_code: String,
+    pub buy_cost: u32,
+    pub items: Vec<(u8, u8, u8)>,
+}
+
+pub fn get_product_by_code(conn: &mut Db, product_code: &str) -> Result<Option<DbProduct>> {
+    let item_columns: String = (1..=24)
+        .map(|i| format!("ItemID{i}, ItemCount{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT TOP (1) ProductCode, BuyCost, {item_columns} \
+         FROM PS_GameDefs.dbo.ProductList WHERE ProductCode = @P1"
+    );
+
+    let _ = conn;
+    let product_code = product_code.to_string();
+    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
+        let rows = client
+            .query(&sql, &[&product_code])
+            .await
+            .context("failed to load product")?
+            .into_results()
+            .await
+            .context("failed to read product")?;
+
+        let Some(row) = rows.into_iter().flatten().next() else {
+            return Ok(None);
+        };
+
+        let mut items = Vec::new();
+        for i in 1..=24 {
+            let item_id = row.get::<i32, _>(format!("ItemID{i}").as_str()).unwrap_or(0);
+            let count = tinyint_or_default(&row, format!("ItemCount{i}").as_str(), 0);
+            if item_id > 0 && count > 0 {
+                let item_type = (item_id / 1000).clamp(0, i32::from(u8::MAX)) as u8;
+                let type_id = (item_id % 1000).clamp(0, i32::from(u8::MAX)) as u8;
+                items.push((item_type, type_id, count));
+            }
+        }
+
+        Ok(Some(DbProduct {
+            product_code: row
+                .get::<&str, _>("ProductCode")
+                .unwrap_or_default()
+                .trim_end()
+                .to_string(),
+            buy_cost: row.get::<i32, _>("BuyCost").unwrap_or_default().max(0) as u32,
+            items,
+        }))
+    }))
 }
 
 /// Single source of truth for every column row_to_character() reads.

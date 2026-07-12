@@ -8,9 +8,12 @@ use crate::character::*;
 use crate::inventory::*;
 use crate::protocol::*;
 use crate::session::*;
+use crate::skillcast::{ActiveBuff, build_character_active_buffs};
 use crate::skills::*;
+use crate::warehouse::build_warehouse_item_list;
 use crate::world_entities::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_initial_character_state(
     stream: &mut TcpStream,
     aes: &mut AesCtr,
@@ -21,6 +24,9 @@ pub(crate) fn send_initial_character_state(
     items: &[DbCharacterItem],
     skills: &[DbCharacterSkill],
     quick_slots: &[DbQuickSlot],
+    stored_items: &[DbCharacterItem],
+    account_points: u32,
+    active_buffs: &[ActiveBuff],
     logger: &Logger,
 ) -> Result<()> {
     let before_inventory = [
@@ -90,7 +96,7 @@ pub(crate) fn send_initial_character_state(
             "0x0906 finished quests",
         ),
         (
-            build_zero_count_packet(Opcode::CharacterActiveBuffs)?,
+            build_character_active_buffs(active_buffs)?,
             "0x010A active buffs",
         ),
         (build_bless_init(selected_faction)?, "0x0211 bless"),
@@ -98,12 +104,18 @@ pub(crate) fn send_initial_character_state(
             build_zero_count_packet(Opcode::BankItemList)?,
             "0xB101 bank",
         ),
-        (build_empty_warehouse()?, "0x0711 warehouse"),
+        (
+            build_warehouse_item_list(stored_items)?,
+            "0x0711 warehouse",
+        ),
         (
             build_zero_count_packet(Opcode::TeleportSavePositionList)?,
             "0x0225 saved teleports",
         ),
-        (build_account_points()?, "0x2601 account points"),
+        (
+            build_account_points(account_points)?,
+            "0x2601 account points",
+        ),
         (build_character_skill_bar(quick_slots)?, "0x010B skill bar"),
     ];
 
@@ -117,12 +129,14 @@ pub(crate) fn send_initial_character_state(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_map_loaded_state(
     stream: &mut TcpStream,
     aes: &mut AesCtr,
     use_expanded_send_key: bool,
     selected_faction: u8,
     character: Option<&DbCharacter>,
+    is_admin: bool,
     items: &[DbCharacterItem],
     map_items: &[MapItem],
     map_entities: &MapEntities,
@@ -134,7 +148,9 @@ pub(crate) fn send_map_loaded_state(
             "0x020B set map position",
         ),
         (
-            build_character_entered_map(character)?,
+            // This is the character's own fresh entry into the map, not an
+            // introduction of an already-present character to a viewer.
+            build_character_entered_map(character, is_admin, true)?,
             "0x0201 entered map",
         ),
         (

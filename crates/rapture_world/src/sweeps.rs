@@ -34,7 +34,7 @@ pub(crate) fn run_map_item_despawn_sweep(logger: Arc<Logger>) {
             let Ok(remove_packet) = build_map_remove_item(item.id) else {
                 continue;
             };
-            for player in players_on_map_near(map_id, item.pos_x, item.pos_z) {
+            for player in players_on_map_near(map_id, item.pos_x, item.pos_z, VIEWPORT_RADIUS) {
                 let _ = player.send_packet(&remove_packet, "0x0402 map item despawn", &logger);
             }
         }
@@ -67,7 +67,7 @@ pub(crate) fn run_mob_roam_sweep(logger: Arc<Logger>) {
         }
         for (map_id, moves) in moves_by_map {
             for (x, z, packet) in moves {
-                for player in players_on_map_near(map_id, x, z) {
+                for player in players_on_map_near(map_id, x, z, VIEWPORT_RADIUS) {
                     let _ = player.send_packet(&packet, "0x0603 mob roam move", &logger);
                 }
             }
@@ -101,7 +101,7 @@ pub(crate) fn run_mob_respawn_sweep(logger: Arc<Logger>) {
         }
         for (map_id, respawns) in enters_by_map {
             for (x, z, packet) in respawns {
-                for player in players_on_map_near(map_id, x, z) {
+                for player in players_on_map_near(map_id, x, z, VIEWPORT_RADIUS) {
                     let _ = player.send_packet(&packet, "0x0601 mob respawn", &logger);
                 }
             }
@@ -132,7 +132,7 @@ pub(crate) fn run_npc_patrol_sweep(logger: Arc<Logger>) {
         }
         for (map_id, moves) in moves_by_map {
             for (x, z, packet) in moves {
-                for player in players_on_map_near(map_id, x, z) {
+                for player in players_on_map_near(map_id, x, z, VIEWPORT_RADIUS) {
                     let _ = player.send_packet(&packet, "0x0E03 npc patrol move", &logger);
                 }
             }

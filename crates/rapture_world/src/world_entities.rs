@@ -30,6 +30,7 @@ pub(crate) struct NpcPatrolPoint {
 pub(crate) struct MapMob {
     pub(crate) id: u32,
     pub(crate) mob_id: u16,
+    pub(crate) level: u16,
     pub(crate) pos_x: f32,
     pub(crate) pos_z: f32,
     home_x: f32,
@@ -114,7 +115,6 @@ pub(crate) struct MapEntities {
 #[derive(Clone, Debug)]
 struct MapGrid {
     map_size: u32,
-    cell_size: u32,
     map_mask: Vec<u8>,
 }
 
@@ -180,28 +180,20 @@ pub(crate) fn entities_on_map(map_id: u16) -> MapEntities {
     lock_or_recover(&map_handle(map_id)).clone()
 }
 
-pub(crate) fn register_map_grid(map_id: u16, map_size: u32, cell_size: u32, map_mask: Vec<u8>) {
-    let cell_size = if cell_size == 0 { 128 } else { cell_size };
-    lock_or_recover(grids()).insert(
-        map_id,
-        MapGrid {
-            map_size,
-            cell_size,
-            map_mask,
-        },
-    );
+pub(crate) fn register_map_grid(map_id: u16, map_size: u32, map_mask: Vec<u8>) {
+    lock_or_recover(grids()).insert(map_id, MapGrid { map_size, map_mask });
 }
 
-/// Entities within one grid cell of `(x, z)`. Unlike a naive "clone the
-/// whole map then filter" pass, this clones only the entities that actually
-/// pass the neighbor-cell check, so the cost scales with what's visible
-/// rather than with everything on the map.
+/// Entities within the 5x5 visibility window of `(x, z)`. Unlike a naive
+/// "clone the whole map then filter" pass, this clones only the entities
+/// that actually pass the neighbor-cell check, so the cost scales with
+/// what's visible rather than with everything on the map.
 pub(crate) fn entities_near(map_id: u16, x: f32, z: f32) -> MapEntities {
-    let Some(grid) = lock_or_recover(grids()).get(&map_id).cloned() else {
+    if !lock_or_recover(grids()).contains_key(&map_id) {
         return entities_on_map(map_id);
-    };
+    }
 
-    let viewer_cell = cell_for(x, z, grid.cell_size);
+    let viewer_cell = cell_for(x, z, VISIBILITY_CELL_SIZE);
     let handle = map_handle(map_id);
     let entities = lock_or_recover(&handle);
     MapEntities {
@@ -209,7 +201,7 @@ pub(crate) fn entities_near(map_id: u16, x: f32, z: f32) -> MapEntities {
             .npcs
             .iter()
             .filter(|npc| {
-                is_neighbor_cell(viewer_cell, cell_for(npc.pos_x, npc.pos_z, grid.cell_size))
+                is_neighbor_cell(viewer_cell, cell_for(npc.pos_x, npc.pos_z, VISIBILITY_CELL_SIZE))
             })
             .cloned()
             .collect(),
@@ -218,7 +210,7 @@ pub(crate) fn entities_near(map_id: u16, x: f32, z: f32) -> MapEntities {
             .iter()
             .filter(|mob| mob.current_hp > 0)
             .filter(|mob| {
-                is_neighbor_cell(viewer_cell, cell_for(mob.pos_x, mob.pos_z, grid.cell_size))
+                is_neighbor_cell(viewer_cell, cell_for(mob.pos_x, mob.pos_z, VISIBILITY_CELL_SIZE))
             })
             .cloned()
             .collect(),
@@ -362,7 +354,26 @@ pub(crate) fn damage_mob(
 /// equipment, combat, item drop/pickup/despawn) down to nearby players only
 /// -- matching Aries's real CZone::SendView spatial-cell view range instead
 /// of notifying every player on the map regardless of distance.
-pub(crate) const VISIBILITY_RANGE: f32 = 180.0;
+/// Fixed grid cell size for the visibility system, matching the real
+/// server's `cell_x = floor(pos.x / 40)` partitioning (per a GitHub issue
+/// report on the public repo) -- used purely as a broad-phase search
+/// bucket (which players/entities are even worth checking), not as the
+/// visibility boundary itself; the actual boundary is one of the radii
+/// below, checked within the resulting 5x5 cell window (see
+/// `is_neighbor_cell`).
+pub(crate) const VISIBILITY_CELL_SIZE: u32 = 40;
+
+/// General appearance/movement visibility radius (character move/shape/
+/// equipment, mob/NPC spawns, item drop/pickup/despawn) -- confirmed
+/// against the real server's `viewport_visibility_radius`.
+pub(crate) const VIEWPORT_RADIUS: f32 = 120.0;
+
+/// Combat-specific broadcast radius (auto-attack results, mob death,
+/// drops) -- confirmed against the real server's `combat_visibility_radius`.
+/// Smaller than `VIEWPORT_RADIUS` since combat feedback only needs to reach
+/// players close enough to plausibly be involved, not everyone who can
+/// merely see the mob.
+pub(crate) const COMBAT_RADIUS: f32 = 80.0;
 
 pub(crate) fn distance_xz(left_x: f32, left_z: f32, right_x: f32, right_z: f32) -> f32 {
     let dx = left_x - right_x;
@@ -375,11 +386,11 @@ pub(crate) fn distance_xz(left_x: f32, left_z: f32, right_x: f32, right_z: f32) 
 /// is O(viewers), same as one pass of the naive approach, but every
 /// `is_near_any_bucketed` call afterwards is O(populated cells) instead of
 /// O(all viewers) -- a real win once players cluster (towns, hunting spots).
-fn bucket_viewers(viewers: &[(f32, f32)], cell_size: u32) -> HashMap<(i32, i32), Vec<(f32, f32)>> {
+fn bucket_viewers(viewers: &[(f32, f32)]) -> HashMap<(i32, i32), Vec<(f32, f32)>> {
     let mut buckets: HashMap<(i32, i32), Vec<(f32, f32)>> = HashMap::new();
     for &(x, z) in viewers {
         buckets
-            .entry(cell_for(x, z, cell_size))
+            .entry(cell_for(x, z, VISIBILITY_CELL_SIZE))
             .or_default()
             .push((x, z));
     }
@@ -404,13 +415,6 @@ fn is_near_any_bucketed(
         })
 }
 
-fn grid_cell_size(map_id: u16) -> u32 {
-    lock_or_recover(grids())
-        .get(&map_id)
-        .map(|grid| grid.cell_size)
-        .unwrap_or(128)
-}
-
 pub(crate) fn tick_mob_roam_for_viewers(
     viewers_by_map: &HashMap<u16, Vec<(f32, f32)>>,
     max_moves_per_map: usize,
@@ -423,8 +427,7 @@ pub(crate) fn tick_mob_roam_for_viewers(
         // roam tick on one map never blocks player movement on another.
         let handle = map_handle(*map_id);
         let mut entities = lock_or_recover(&handle);
-        let cell_size = grid_cell_size(*map_id);
-        let buckets = bucket_viewers(viewers, cell_size);
+        let buckets = bucket_viewers(viewers);
         let mut moved_on_map = 0usize;
         let mut visited_on_map = 0usize;
 
@@ -432,10 +435,10 @@ pub(crate) fn tick_mob_roam_for_viewers(
             if moved_on_map >= max_moves_per_map {
                 break;
             }
-            let mob_cell = cell_for(mob.pos_x, mob.pos_z, cell_size);
+            let mob_cell = cell_for(mob.pos_x, mob.pos_z, VISIBILITY_CELL_SIZE);
             if mob.current_hp == 0
                 || mob.area.is_none()
-                || !is_near_any_bucketed((mob.pos_x, mob.pos_z), mob_cell, &buckets, VISIBILITY_RANGE)
+                || !is_near_any_bucketed((mob.pos_x, mob.pos_z), mob_cell, &buckets, VIEWPORT_RADIUS)
             {
                 continue;
             }
@@ -464,8 +467,7 @@ pub(crate) fn tick_mob_respawns_for_viewers(
     for (map_id, viewers) in viewers_by_map {
         let handle = map_handle(*map_id);
         let mut entities = lock_or_recover(&handle);
-        let cell_size = grid_cell_size(*map_id);
-        let buckets = bucket_viewers(viewers, cell_size);
+        let buckets = bucket_viewers(viewers);
         let mut respawned_on_map = 0usize;
 
         for mob in &mut entities.mobs {
@@ -491,8 +493,8 @@ pub(crate) fn tick_mob_respawns_for_viewers(
             mob.respawn_at = None;
             respawned_on_map = respawned_on_map.saturating_add(1);
 
-            let mob_cell = cell_for(mob.pos_x, mob.pos_z, cell_size);
-            if is_near_any_bucketed((mob.pos_x, mob.pos_z), mob_cell, &buckets, VISIBILITY_RANGE) {
+            let mob_cell = cell_for(mob.pos_x, mob.pos_z, VISIBILITY_CELL_SIZE);
+            if is_near_any_bucketed((mob.pos_x, mob.pos_z), mob_cell, &buckets, VIEWPORT_RADIUS) {
                 enters.push((*map_id, mob.pos_x, mob.pos_z, build_mob_enter(mob, true)?));
             }
         }
@@ -511,8 +513,7 @@ pub(crate) fn tick_npc_patrol_for_viewers(
     for (map_id, viewers) in viewers_by_map {
         let handle = map_handle(*map_id);
         let mut entities = lock_or_recover(&handle);
-        let cell_size = grid_cell_size(*map_id);
-        let buckets = bucket_viewers(viewers, cell_size);
+        let buckets = bucket_viewers(viewers);
         let mut moved_on_map = 0usize;
         let mut visited_on_map = 0usize;
 
@@ -520,9 +521,9 @@ pub(crate) fn tick_npc_patrol_for_viewers(
             if moved_on_map >= max_moves_per_map {
                 break;
             }
-            let npc_cell = cell_for(npc.pos_x, npc.pos_z, cell_size);
+            let npc_cell = cell_for(npc.pos_x, npc.pos_z, VISIBILITY_CELL_SIZE);
             if !npc.has_patrol()
-                || !is_near_any_bucketed((npc.pos_x, npc.pos_z), npc_cell, &buckets, VISIBILITY_RANGE)
+                || !is_near_any_bucketed((npc.pos_x, npc.pos_z), npc_cell, &buckets, VIEWPORT_RADIUS)
             {
                 continue;
             }
@@ -553,10 +554,14 @@ fn coord_cell(value: f32, cell_size: f32) -> i32 {
     (value.round() / cell_size).floor() as i32
 }
 
+/// True 5x5 visibility window (Chebyshev distance <= 2 in both axes),
+/// matching the real server's neighbor-cell check. Previously used Manhattan
+/// distance (`dx + dz <= 1`), which was smaller than even a 3x3 window and
+/// excluded diagonal neighbor cells entirely.
 fn is_neighbor_cell(a: (i32, i32), b: (i32, i32)) -> bool {
     let dx = (a.0 - b.0).abs();
     let dz = (a.1 - b.1).abs();
-    dx + dz <= 1
+    dx <= 2 && dz <= 2
 }
 
 pub(crate) fn add_entities(map_id: u16, entities: MapEntities) {
@@ -755,6 +760,9 @@ pub(crate) fn spawn_mob(map_id: u16, mob_id: u16, pos_x: f32, pos_z: f32) -> Map
     let mob = MapMob {
         id: next_mob_id(),
         mob_id,
+        // GM-spawned mobs (`mmake`) don't look up real mob definitions --
+        // pre-existing placeholder gap, not touched here.
+        level: 1,
         pos_x,
         pos_z,
         home_x: pos_x,
@@ -909,8 +917,10 @@ pub(crate) fn add_npcs(map_id: u16, npcs: Vec<MapNpc>) {
     lock_or_recover(&map_handle(map_id)).npcs.extend(npcs);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_static_mob(
     mob_id: u16,
+    level: u16,
     pos_x: f32,
     pos_z: f32,
     max_hp: u32,
@@ -923,6 +933,7 @@ pub(crate) fn build_static_mob(
     MapMob {
         id: next_mob_id(),
         mob_id,
+        level,
         pos_x,
         pos_z,
         home_x: pos_x,

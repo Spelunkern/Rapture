@@ -41,6 +41,31 @@ use crate::session::Logger;
 /// content is ready; no other code here needs to change.
 pub(crate) const LEVEL_CAP: u16 = 60;
 
+/// Global server exp rate, applied on top of the level-difference scaling
+/// below (percent; 100 = unmodified). Imgeneus exposes this as a
+/// configurable server setting (`ExpGainRate`); kept as a constant here
+/// since nothing else in this project reads server-wide rate config yet.
+pub(crate) const EXP_GAIN_RATE_PERCENT: i64 = 100;
+
+/// Scales a mob's flat `Mobs.Exp` by the killer/mob level difference,
+/// matching Imgeneus's `CalculateExperienceFromMob` formula (party-size
+/// division deliberately omitted -- not needed here):
+/// `scaled = mobExp * (-24 * (characterLevel - mobLevel) + 167) / 100`,
+/// then the global rate on top, and zero if the level gap is too wide in
+/// either direction (mob more than 8 levels below, or more than 6 above,
+/// the character) to be worth anything.
+pub(crate) fn scaled_kill_exp(character_level: u16, mob_level: u16, mob_exp: u32) -> u32 {
+    let level_difference = i64::from(character_level) - i64::from(mob_level);
+    if level_difference < -8 || level_difference > 6 {
+        return 0;
+    }
+
+    let multiplier_percent = -24 * level_difference + 167;
+    let scaled = i64::from(mob_exp) * multiplier_percent / 100;
+    let scaled = scaled * EXP_GAIN_RATE_PERCENT / 100;
+    scaled.clamp(0, i64::from(u32::MAX)) as u32
+}
+
 static EXP_TABLE: OnceLock<HashMap<(u16, u8), u32>> = OnceLock::new();
 static STATUS_TABLE: OnceLock<HashMap<(u16, u8), (u32, u32, u32)>> = OnceLock::new();
 

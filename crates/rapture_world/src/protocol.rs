@@ -67,13 +67,6 @@ pub(crate) fn build_zero_count_packet(opcode: Opcode) -> Result<Vec<u8>> {
     packet.into_bytes()
 }
 
-pub(crate) fn build_empty_warehouse() -> Result<Vec<u8>> {
-    let mut packet = PacketWriter::new(Opcode::WarehouseItemList);
-    packet.write_u32(0); // gold
-    packet.write_u8(0); // count
-    packet.into_bytes()
-}
-
 pub(crate) fn build_bless_init(faction: u8) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::BlessInit);
     packet.write_u8(faction);
@@ -82,16 +75,25 @@ pub(crate) fn build_bless_init(faction: u8) -> Result<Vec<u8>> {
     packet.into_bytes()
 }
 
-pub(crate) fn build_account_points() -> Result<Vec<u8>> {
+/// `AccountPoints` (0x2601): a server-push notification of the account's
+/// Item Mall point balance, sent once at character select (confirmed via
+/// Imgeneus, which comments this as required for item-mall/points display
+/// -- not documented in Shaiya-Aries's own headers at all, so the trailing
+/// zero byte's purpose is unconfirmed but harmless).
+pub(crate) fn build_account_points(points: u32) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::AccountPoints);
-    packet.write_u32(0);
+    packet.write_u32(points);
     packet.write_u8(0);
     packet.into_bytes()
 }
 
-pub(crate) fn build_cash_points() -> Result<Vec<u8>> {
+/// `CashPoint` (0x2605): response to the client's (empty-body) request to
+/// refresh its displayed point balance, e.g. on opening the cash shop UI.
+/// Confirmed against Shaiya-Aries's `network/game/outgoing/2600.h`
+/// (`GamePointOutgoing`): a bare `u32`, no trailing byte (unlike 0x2601).
+pub(crate) fn build_cash_points(points: u32) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::CashPoint);
-    packet.write_u32(0);
+    packet.write_u32(points);
     packet.into_bytes()
 }
 
@@ -99,17 +101,6 @@ pub(crate) fn build_cash_points() -> Result<Vec<u8>> {
 pub(crate) fn build_ping() -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::Ping);
     packet.write_u16(0);
-    packet.into_bytes()
-}
-
-pub(crate) fn build_point_buy_failure(product_code: &str) -> Result<Vec<u8>> {
-    let mut packet = PacketWriter::new(Opcode::PointBuy);
-    packet.write_u8(1); // product code does not exist
-    packet.write_u32(0); // remaining points
-    packet.write_fixed_string(product_code, 21)?;
-    packet.write_u32(0); // purchase date
-    packet.write_u32(0); // purchase points
-    packet.write_u8(0); // item count
     packet.into_bytes()
 }
 

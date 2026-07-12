@@ -162,7 +162,7 @@ pub(crate) fn load_svmap_entities(logger: &Logger) -> Result<()> {
                 let mob_count = load.entities.mobs.len();
                 let portal_count = load.entities.portals.len();
                 let spawn_area_count = load.entities.spawn_areas.len();
-                register_map_grid(map_id, load.map_size, load.cell_size, load.map_mask.clone());
+                register_map_grid(map_id, load.map_size, load.map_mask.clone());
                 add_entities(map_id, load.entities);
                 loaded_maps += 1;
                 loaded_npcs += npc_count;
@@ -232,7 +232,7 @@ pub(crate) fn load_svmap_mobs(
     logger: &Logger,
 ) -> Result<Vec<crate::world_entities::MapMob>> {
     let load = reload_svmap_file(map_id, logger)?;
-    register_map_grid(map_id, load.map_size, load.cell_size, load.map_mask);
+    register_map_grid(map_id, load.map_size, load.map_mask);
     Ok(load.entities.mobs)
 }
 
@@ -243,7 +243,7 @@ pub(crate) fn load_svmap_npcs(
     logger: &Logger,
 ) -> Result<Vec<crate::world_entities::MapNpc>> {
     let load = reload_svmap_file(map_id, logger)?;
-    register_map_grid(map_id, load.map_size, load.cell_size, load.map_mask);
+    register_map_grid(map_id, load.map_size, load.map_mask);
     Ok(load.entities.npcs)
 }
 
@@ -343,6 +343,10 @@ fn read_monster_areas(
                 continue;
             }
 
+            let level = mob_definitions
+                .get(&(mob_id as u16))
+                .map(|definition| definition.level)
+                .unwrap_or(1);
             let max_hp = mob_definitions
                 .get(&(mob_id as u16))
                 .map(|definition| definition.max_hp)
@@ -367,6 +371,7 @@ fn read_monster_areas(
                 let position = position_in_area(area, area_spawn_index, map_size, map_mask);
                 mobs.push(build_static_mob(
                     mob_id as u16,
+                    level,
                     position.x,
                     position.z,
                     max_hp,
@@ -416,29 +421,39 @@ fn read_npcs(reader: &mut SvmapReader<'_>) -> Result<Vec<crate::world_entities::
         let npc_type = reader.read_i32()?;
         let npc_id = reader.read_i32()?;
         let position_count = reader.read_count("npc position")?;
-        let mut patrol_points = Vec::with_capacity(position_count);
+        // Checked ONCE per NPC, before reading its patrol points -- the
+        // previous version re-checked this inside the per-point loop and
+        // `continue`d there, which only ever skipped adding THAT patrol
+        // point. The NPC itself still got built afterward via
+        // `npc_type as u8`/`npc_id as u16`, silently WRAPPING an
+        // out-of-range id (e.g. 300 truncates to 44) instead of the
+        // record being discarded as intended.
+        let valid =
+            (0..=u8::MAX as i32).contains(&npc_type) && (0..=u16::MAX as i32).contains(&npc_id);
+        let mut patrol_points = Vec::with_capacity(if valid { position_count } else { 0 });
 
         for _ in 0..position_count {
+            // Still read every patrol point unconditionally even when
+            // `!valid` -- the reader must stay in sync with the file's
+            // byte layout regardless of whether this NPC gets kept.
             let position = reader.read_vec3()?;
             let yaw = reader.read_f32()?;
-
-            if !(0..=u8::MAX as i32).contains(&npc_type) || !(0..=u16::MAX as i32).contains(&npc_id)
-            {
-                continue;
+            if valid {
+                patrol_points.push(NpcPatrolPoint {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                    angle: yaw_to_angle(yaw),
+                });
             }
-
-            patrol_points.push(NpcPatrolPoint {
-                x: position.x,
-                y: position.y,
-                z: position.z,
-                angle: yaw_to_angle(yaw),
-            });
         }
 
-        if let Some(npc) =
-            build_static_npc_with_patrol(npc_type as u8, npc_id as u16, patrol_points)
-        {
-            npcs.push(npc);
+        if valid {
+            if let Some(npc) =
+                build_static_npc_with_patrol(npc_type as u8, npc_id as u16, patrol_points)
+            {
+                npcs.push(npc);
+            }
         }
     }
 
