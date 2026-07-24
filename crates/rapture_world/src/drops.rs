@@ -21,7 +21,7 @@ fn tables() -> &'static Mutex<DropTables> {
     TABLES.get_or_init(|| Mutex::new(DropTables::default()))
 }
 
-fn next_random_u64() -> u64 {
+pub(crate) fn next_random_u64() -> u64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut state = STATE.load(Ordering::Relaxed);
     if state == 0 {
@@ -37,7 +37,7 @@ fn next_random_u64() -> u64 {
     state
 }
 
-fn chance_succeeds(percent: u32) -> bool {
+pub(crate) fn chance_succeeds(percent: u32) -> bool {
     if percent == 0 {
         return false;
     }

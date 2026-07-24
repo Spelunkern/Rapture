@@ -84,6 +84,15 @@ fn apply_keepalive(stream: &TcpStream, logger: &Logger) {
     }
 }
 
+/// Disables Nagle's algorithm -- see rapture_world's apply_nodelay (same
+/// fix, same reasoning) for the full explanation of the "spell works
+/// instantly but the visual arrives late" bug this addresses.
+fn apply_nodelay(stream: &TcpStream, logger: &Logger) {
+    if let Err(error) = stream.set_nodelay(true) {
+        logger.line(format!("Rapture Login failed to disable Nagle's algorithm: {error:?}"));
+    }
+}
+
 struct ConnectionGuard;
 
 impl ConnectionGuard {
@@ -431,6 +440,7 @@ fn main() -> Result<()> {
                     continue;
                 };
                 apply_keepalive(&stream, &logger);
+                apply_nodelay(&stream, &logger);
                 let logger = Arc::clone(&logger);
                 thread::spawn(move || {
                     let _guard = guard;

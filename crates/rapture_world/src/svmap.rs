@@ -366,6 +366,18 @@ fn read_monster_areas(
                 .get(&(mob_id as u16))
                 .map(|definition| definition.exp)
                 .unwrap_or(0);
+            let attack = mob_definitions
+                .get(&(mob_id as u16))
+                .map(|definition| definition.attack)
+                .unwrap_or(0);
+            let ai = mob_definitions
+                .get(&(mob_id as u16))
+                .map(|definition| definition.ai)
+                .unwrap_or(0);
+            let chase_range = mob_definitions
+                .get(&(mob_id as u16))
+                .map(|definition| definition.chase_range)
+                .unwrap_or(0.0);
 
             for _ in 0..count {
                 let position = position_in_area(area, area_spawn_index, map_size, map_mask);
@@ -378,6 +390,9 @@ fn read_monster_areas(
                     money_min,
                     money_max,
                     exp,
+                    attack,
+                    ai,
+                    chase_range,
                     Some(mob_area),
                     respawn_seconds,
                 ));
@@ -460,14 +475,22 @@ fn read_npcs(reader: &mut SvmapReader<'_>) -> Result<Vec<crate::world_entities::
     Ok(npcs)
 }
 
+/// Ground truth from the real client's own rotation conversion (decoded by
+/// the user from the client binary): `degrees = -yaw * (180/pi)`, wrapped
+/// into `[0, 360)` and truncated to an integer -- confirmed to be plain
+/// degrees, NOT the 0..65536 fraction-of-a-circle encoding used elsewhere
+/// for character move direction. The previous implementation here used
+/// that other encoding, which was wrong for NPC facing.
 fn yaw_to_angle(yaw: f32) -> u16 {
     if !yaw.is_finite() {
         return 0;
     }
 
-    let normalized = yaw.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
-    let angle = (normalized * 65536.0).round() as u16;
-    angle.wrapping_add(32768)
+    let mut degrees = 0.0_f64 - f64::from(yaw) * 57.29578;
+    if degrees < 0.0 {
+        degrees += 360.0;
+    }
+    degrees as u16
 }
 
 fn read_portals(reader: &mut SvmapReader<'_>) -> Result<Vec<MapPortal>> {

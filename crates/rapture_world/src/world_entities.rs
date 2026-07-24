@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rapture_common::db::DbMobDefinition;
 use rapture_common::packet::{Opcode, PacketWriter};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,6 +45,55 @@ pub(crate) struct MapMob {
     respawn_delay: Option<Duration>,
     respawn_at: Option<Instant>,
     roam_step: u32,
+    /// `Mobs.Attack1` -- basic melee attack damage before the target's
+    /// defense is subtracted (see combat::apply_incoming_mob_damage).
+    pub(crate) attack: u32,
+    /// `Mobs.AI` -- 0 passive (retaliate only), >= 1 aggressive (see
+    /// `chase_range`). See DbMobDefinition's docs.
+    pub(crate) ai: u8,
+    /// `Mobs.ChaseRange` (meters) -- aggro detection radius for an
+    /// aggressive mob, also the leash distance past which any mob (however
+    /// aggroed) gives up and returns to roaming.
+    pub(crate) chase_range: f32,
+    /// The character this mob is currently fighting, if any. Set either by
+    /// retaliation (`set_mob_aggro`, when a player damages the mob) or by
+    /// proximity (an aggressive mob picking up a nearby player in
+    /// `tick_mob_combat_for_viewers`). Cleared when the target dies,
+    /// disconnects, or leashes out of range.
+    pub(crate) aggro_target: Option<u32>,
+    /// When this mob last landed an attack, for both the
+    /// `MOB_ATTACK_INTERVAL` cooldown and the brief post-swing pause in
+    /// pursuit (`MOB_ATTACK_PAUSE`). `None` until it attacks for the first
+    /// time.
+    last_attack_at: Option<Instant>,
+    /// True while the mob is walking back to its home coordinate after a
+    /// chase ended (de-aggro, target death, or leash). Driven by the combat
+    /// sweep at walk speed; the roam sweep leaves it alone until it arrives.
+    /// Prevents the old "snap instantly back home" behavior.
+    returning_home: bool,
+    /// Active periodic-damage (DoT) effects on this mob (`Skills.
+    /// TypeDetail == 61`) -- lives on the mob itself, not on any specific
+    /// player's connection, since a mob is shared/global state that
+    /// multiple players can damage and any of them (or none, if they've
+    /// since disconnected) can be the one who applied a given DoT. Ticked
+    /// by `tick_all_mob_dots`, a background sweep (see sweeps.rs),
+    /// independent of any per-connection loop.
+    pub(crate) dots: Vec<ActiveDot>,
+}
+
+/// One active periodic-damage effect on a `MapMob`. See `MapMob::dots`'s
+/// doc for why this lives on the mob rather than a player's connection.
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveDot {
+    /// Whoever cast this DoT -- attributed the kill/exp/drops if a tick
+    /// finishes the mob off, whether they're still online or not (see
+    /// `tick_all_mob_dots`).
+    pub(crate) caster_character_id: u32,
+    pub(crate) skill_id: u16,
+    pub(crate) skill_level: u8,
+    ends_at: Instant,
+    next_tick_at: Instant,
+    damage_hp: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -321,7 +371,10 @@ pub(crate) fn damage_mob(
         .mobs
         .iter_mut()
         .find(|mob| mob.id == mob_global_id)?;
-    if mob.current_hp == 0 {
+    // A mob resetting home after a chase is immune to all damage and can't
+    // be re-aggroed (callers set aggro only after a successful damage_mob) --
+    // the reset is uninterruptible until it reaches home and restores HP.
+    if mob.current_hp == 0 || mob.returning_home {
         return None;
     }
 
@@ -349,6 +402,158 @@ pub(crate) fn damage_mob(
     })
 }
 
+/// A tick interval confirmed by the user for periodic damage, same as
+/// periodic heal (see skillcast.rs's PERIODIC_HEAL_TICK).
+const DOT_TICK: Duration = Duration::from_secs(3);
+
+/// Starts (or refreshes, if this same caster+skill already has a DoT on
+/// this mob) a periodic-damage effect. Called when a damage skill with
+/// nonzero `TimeDamageHP`/etc hits a mob (see skillcast.rs) -- independent
+/// of that skill's own instant `DamageHP`, if any. Only `TimeDamageHP` is
+/// tracked: mobs have no SP/MP concept in this project's model, so
+/// `TimeDamageSP/MP` are intentionally not passed through here.
+pub(crate) fn apply_dot_to_mob(
+    map_id: u16,
+    mob_global_id: u32,
+    caster_character_id: u32,
+    skill_id: u16,
+    skill_level: u8,
+    damage_hp: u32,
+    keep_time_seconds: u64,
+) {
+    let handle = map_handle(map_id);
+    let mut entities = lock_or_recover(&handle);
+    let Some(mob) = entities.mobs.iter_mut().find(|mob| mob.id == mob_global_id) else {
+        return;
+    };
+    // Immune while resetting home -- refuse to attach new DoTs too.
+    if mob.current_hp == 0 || mob.returning_home {
+        return;
+    }
+
+    let now = Instant::now();
+    mob.dots
+        .retain(|dot| !(dot.caster_character_id == caster_character_id && dot.skill_id == skill_id));
+    mob.dots.push(ActiveDot {
+        caster_character_id,
+        skill_id,
+        skill_level,
+        ends_at: now + Duration::from_secs(keep_time_seconds),
+        next_tick_at: now + DOT_TICK,
+        damage_hp,
+    });
+}
+
+/// Outcome of one DoT tick, returned to the caller (a background sweep,
+/// see sweeps.rs) to handle broadcasts/kill-consequences/exp OUTSIDE the
+/// per-map lock this function briefly holds while applying damage.
+#[derive(Clone, Debug)]
+pub(crate) struct DotTickOutcome {
+    pub(crate) map_id: u16,
+    pub(crate) mob: MapMob,
+    pub(crate) caster_character_id: u32,
+    pub(crate) skill_id: u16,
+    pub(crate) skill_level: u8,
+    pub(crate) applied_hp: u32,
+    pub(crate) killed: bool,
+    pub(crate) respawn_seconds: Option<u64>,
+    /// Whether this was the bonus final tick fired by the DoT expiring,
+    /// as opposed to a regular scheduled tick -- same "also tick once more
+    /// exactly at expiry" behavior confirmed by the user for periodic
+    /// heal, mirrored here for symmetry.
+    pub(crate) is_final_tick: bool,
+}
+
+/// Applies every due DoT tick (and one bonus final tick per DoT exactly
+/// when it expires) across every mob on every map, removing any DoT whose
+/// duration has ended. Only `damage_hp` is actually applied -- mobs have
+/// no SP/MP concept in this project's model, so `TimeDamageSP/MP` are
+/// stored on `ActiveDot` (for a possible future PvP use) but inert here.
+/// Called once per sweep iteration (see `sweeps::run_mob_dot_sweep`),
+/// independent of any per-connection loop -- a mob is shared/global state,
+/// not owned by whichever connection cast the DoT on it.
+pub(crate) fn tick_all_mob_dots() -> Vec<DotTickOutcome> {
+    let map_ids: Vec<u16> = lock_or_recover(registry()).keys().copied().collect();
+    let now = Instant::now();
+    let mut outcomes = Vec::new();
+
+    for map_id in map_ids {
+        let handle = map_handle(map_id);
+        let mut entities = lock_or_recover(&handle);
+        for mob in entities.mobs.iter_mut() {
+            // A mob walking home after a chase is "resetting" and immune to
+            // all damage (see damage_mob) -- its DoTs go inert too, and are
+            // cleared entirely when it reaches home and restores HP.
+            if mob.current_hp == 0 || mob.dots.is_empty() || mob.returning_home {
+                continue;
+            }
+
+            let mut index = 0;
+            while index < mob.dots.len() {
+                let is_expiring = mob.dots[index].ends_at <= now;
+                let due_tick = mob.dots[index].next_tick_at <= now;
+
+                if due_tick || is_expiring {
+                    let dot = &mob.dots[index];
+                    let caster_character_id = dot.caster_character_id;
+                    let skill_id = dot.skill_id;
+                    let skill_level = dot.skill_level;
+                    let damage_hp = dot.damage_hp;
+
+                    let applied_hp = damage_hp.min(mob.current_hp);
+                    mob.current_hp = mob.current_hp.saturating_sub(applied_hp);
+                    let killed = mob.current_hp == 0;
+                    let respawn_seconds = if killed {
+                        if let Some(delay) = mob.respawn_delay {
+                            mob.respawn_at = Some(now + delay);
+                            Some(delay.as_secs())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    outcomes.push(DotTickOutcome {
+                        map_id,
+                        mob: mob.clone(),
+                        caster_character_id,
+                        skill_id,
+                        skill_level,
+                        applied_hp,
+                        killed,
+                        respawn_seconds,
+                        is_final_tick: is_expiring,
+                    });
+
+                    if !is_expiring {
+                        mob.dots[index].next_tick_at += DOT_TICK;
+                    }
+
+                    // A kill stops every OTHER DoT on this mob from
+                    // ticking further too (nothing left to damage) --
+                    // matches the natural expectation that a dead mob's
+                    // remaining DoTs simply have nothing more to do.
+                    if killed {
+                        mob.dots.clear();
+                        break;
+                    }
+                }
+
+                if is_expiring {
+                    if index < mob.dots.len() {
+                        mob.dots.remove(index);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    outcomes
+}
+
 /// Shared "can see this" radius for mob/NPC AI visibility gating and for
 /// filtering every other whole-map broadcast (character move/shape/
 /// equipment, combat, item drop/pickup/despawn) down to nearby players only
@@ -374,6 +579,97 @@ pub(crate) const VIEWPORT_RADIUS: f32 = 120.0;
 /// players close enough to plausibly be involved, not everyone who can
 /// merely see the mob.
 pub(crate) const COMBAT_RADIUS: f32 = 80.0;
+
+/// Melee distance within which a mob can land a basic attack on its target.
+/// Slightly larger than a player's own auto-attack grace so a chasing mob
+/// that just caught up can swing without a one-tick gap.
+pub(crate) const MOB_ATTACK_RANGE: f32 = 3.0;
+
+/// How often a mob may land a basic attack. Server policy for now (a flat
+/// cadence for every mob) -- there's no confirmed per-mob attack-speed
+/// column yet; the target-HP packet's `AttackSpeed.Normal` is a display
+/// hint, not a real interval. Revisit if/when a real speed column is found.
+pub(crate) const MOB_ATTACK_INTERVAL: Duration = Duration::from_millis(2500);
+
+/// One chase step per combat tick (meters). With the combat sweep's
+/// `MOB_COMBAT_TICK` cadence this sets the mob's chase speed -- 3.5m every
+/// 500ms is ~7 m/s, close to a running player so an aggroed mob keeps pace
+/// and can actually close in to melee (a slower step let players trivially
+/// outrun mobs, which read as the mob "barely attacking"). Tunable.
+const MOB_CHASE_STEP: f32 = 3.5;
+
+/// Motion byte for a chasing mob's 0x0603 move -- 1 = running. Confirmed
+/// via capture (roam moves send 0 = walking). The client uses this to pick
+/// the mob's animation AND its move-interpolation speed.
+const MOB_MOTION_RUN: u8 = 1;
+
+/// Motion byte for a walking mob's 0x0603 move -- 0 = walking. Used for the
+/// unhurried walk back home after a chase ends.
+const MOB_MOTION_WALK: u8 = 0;
+
+/// How long a mob holds position after landing a hit before resuming
+/// pursuit -- a token recovery beat only. Kept well under the combat tick
+/// (`MOB_COMBAT_TICK`, 500ms) so it almost never actually skips a chase
+/// step: the attack tick itself already doesn't move, which is enough of a
+/// visible "pause to swing". A larger value made the mob skip ~2 chase ticks
+/// per hit, fall behind a running player, and end up attacking only every
+/// few seconds with a stuttery pursuit.
+const MOB_ATTACK_PAUSE: Duration = Duration::from_millis(200);
+
+/// One step per combat tick while walking back home after a chase (meters) --
+/// smaller than `MOB_CHASE_STEP` so the return is an unhurried walk, matching
+/// the walk motion it's sent with.
+const MOB_RETURN_STEP: f32 = 2.0;
+
+/// Distance from home at which a returning mob is considered arrived and
+/// snaps exactly onto its home coordinate.
+const MOB_RETURN_ARRIVE: f32 = 1.0;
+
+/// Minimum leash radius (from a mob's home) for a mob that was aggroed by
+/// retaliation rather than proximity. A passive mob (`ai == 0`) can have a
+/// zero `chase_range`, so leashing purely on `chase_range` would make it
+/// give up the instant it's hit; this floor lets it pursue a bit first.
+const MOB_RETALIATION_LEASH: f32 = 20.0;
+
+/// Extra slack added to a mob's leash radius before it gives up and returns
+/// to roaming, so a target hovering right at the edge doesn't cause rapid
+/// aggro/de-aggro flapping.
+const MOB_LEASH_GRACE: f32 = 8.0;
+
+/// One player's live combat-relevant snapshot, gathered once per combat
+/// sweep tick (see sweeps::run_mob_combat_sweep) and handed to
+/// `tick_mob_combat_for_viewers` so mob AI can read every target's position
+/// and alive state without touching any connection's own locals.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlayerCombatSnapshot {
+    pub(crate) character_id: u32,
+    pub(crate) map_id: u16,
+    pub(crate) pos_x: f32,
+    pub(crate) pos_z: f32,
+    pub(crate) alive: bool,
+}
+
+/// One mob->player basic attack the combat tick decided to land. The actual
+/// damage (after the target's defense) and all consequences are resolved by
+/// the victim's own connection thread via combat::apply_incoming_mob_damage,
+/// so this only carries who hit whom for how much raw attack.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MobAttackAction {
+    pub(crate) mob_global_id: u32,
+    pub(crate) mob_id: u16,
+    pub(crate) attack: u32,
+    pub(crate) target_character_id: u32,
+}
+
+/// Everything a single combat tick produced: attacks to route to victims'
+/// mailboxes, movement packets (chase or walk-home) to broadcast to nearby
+/// players, and HP-restore broadcasts for mobs that just reset at home.
+#[derive(Default)]
+pub(crate) struct MobCombatTick {
+    pub(crate) attacks: Vec<MobAttackAction>,
+    pub(crate) moves: Vec<(u16, f32, f32, Vec<u8>)>,
+    pub(crate) restores: Vec<(u16, f32, f32, Vec<u8>)>,
+}
 
 pub(crate) fn distance_xz(left_x: f32, left_z: f32, right_x: f32, right_z: f32) -> f32 {
     let dx = left_x - right_x;
@@ -436,8 +732,18 @@ pub(crate) fn tick_mob_roam_for_viewers(
                 break;
             }
             let mob_cell = cell_for(mob.pos_x, mob.pos_z, VISIBILITY_CELL_SIZE);
+            // A mob in combat (or walking back home after one) is driven
+            // entirely by the combat sweep (`tick_mob_combat_for_viewers`,
+            // which chases/attacks its target and walks it home afterward).
+            // Roaming it in parallel would fight that -- yanking it back
+            // toward its home area every tick -- which is the confirmed cause
+            // of aggroed mobs "wandering strangely" instead of pursuing, and
+            // would also teleport a returning mob. Skip it here; once it
+            // finishes returning home, roam resumes.
             if mob.current_hp == 0
                 || mob.area.is_none()
+                || mob.aggro_target.is_some()
+                || mob.returning_home
                 || !is_near_any_bucketed((mob.pos_x, mob.pos_z), mob_cell, &buckets, VIEWPORT_RADIUS)
             {
                 continue;
@@ -491,6 +797,11 @@ pub(crate) fn tick_mob_respawns_for_viewers(
             mob.home_z = z;
             mob.current_hp = mob.max_hp.max(1);
             mob.respawn_at = None;
+            // Clear any combat state carried from its previous life so it
+            // spawns fresh (idle, not mid-chase/return).
+            mob.aggro_target = None;
+            mob.last_attack_at = None;
+            mob.returning_home = false;
             respawned_on_map = respawned_on_map.saturating_add(1);
 
             let mob_cell = cell_for(mob.pos_x, mob.pos_z, VISIBILITY_CELL_SIZE);
@@ -540,6 +851,218 @@ pub(crate) fn tick_npc_patrol_for_viewers(
     }
 
     Ok(moves)
+}
+
+/// Marks `mob_global_id` on `map_id` as fighting `character_id` -- called
+/// when that character damages the mob (auto-attack or skill), so even a
+/// passive mob (`ai == 0`) fights back. Overwrites any existing target with
+/// the most recent attacker (last-hit aggro), matching the simplest retail
+/// behavior; no threat table yet.
+pub(crate) fn set_mob_aggro(map_id: u16, mob_global_id: u32, character_id: u32) {
+    let handle = map_handle(map_id);
+    let mut entities = lock_or_recover(&handle);
+    if let Some(mob) = entities
+        .mobs
+        .iter_mut()
+        .find(|mob| mob.id == mob_global_id && mob.current_hp > 0)
+    {
+        mob.aggro_target = Some(character_id);
+    }
+}
+
+
+/// Clears `mob_global_id`'s aggro (and its attack cooldown) -- called when
+/// its target dies, so it stops swinging and walks back home (rather than
+/// staying put where the kill happened).
+pub(crate) fn clear_mob_aggro(map_id: u16, mob_global_id: u32) {
+    let handle = map_handle(map_id);
+    let mut entities = lock_or_recover(&handle);
+    if let Some(mob) = entities.mobs.iter_mut().find(|mob| mob.id == mob_global_id) {
+        mob.aggro_target = None;
+        mob.last_attack_at = None;
+        mob.returning_home = true;
+    }
+}
+
+/// Advances every mob that is (or becomes) in combat by one tick: acquires
+/// proximity aggro for aggressive mobs, drops leashed/dead/absent targets,
+/// and either lands a basic attack (if in `MOB_ATTACK_RANGE` and off
+/// cooldown) or takes one chase step toward the target. Mirrors the
+/// per-map, lock-per-map structure of `tick_mob_roam_for_viewers`; the
+/// caller (sweeps::run_mob_combat_sweep) routes the returned attacks to
+/// victims and broadcasts the moves.
+pub(crate) fn tick_mob_combat_for_viewers(
+    players: &[PlayerCombatSnapshot],
+    max_actions_per_map: usize,
+) -> Result<MobCombatTick> {
+    let mut tick = MobCombatTick::default();
+    let now = Instant::now();
+
+    let mut players_by_map: HashMap<u16, Vec<PlayerCombatSnapshot>> = HashMap::new();
+    for player in players {
+        players_by_map.entry(player.map_id).or_default().push(*player);
+    }
+
+    for (map_id, map_players) in &players_by_map {
+        let handle = map_handle(*map_id);
+        let mut entities = lock_or_recover(&handle);
+        let mut actions_on_map = 0usize;
+
+        for mob in &mut entities.mobs {
+            if actions_on_map >= max_actions_per_map {
+                break;
+            }
+            if mob.current_hp == 0 {
+                mob.aggro_target = None;
+                mob.returning_home = false;
+                continue;
+            }
+
+            // Validate/refresh the current target: it must still be present
+            // on this map, alive, and within leash range of the mob's home.
+            // Losing the target starts the walk back home (never a snap).
+            if let Some(target_id) = mob.aggro_target {
+                let still_valid = map_players
+                    .iter()
+                    .find(|player| player.character_id == target_id && player.alive)
+                    .map(|player| {
+                        let leash = mob.chase_range.max(MOB_RETALIATION_LEASH) + MOB_LEASH_GRACE;
+                        distance_xz(mob.home_x, mob.home_z, player.pos_x, player.pos_z) <= leash
+                    })
+                    .unwrap_or(false);
+                if !still_valid {
+                    mob.aggro_target = None;
+                    mob.last_attack_at = None;
+                    mob.returning_home = true;
+                }
+            }
+
+            // Aggressive mobs pick up the nearest alive player inside their
+            // detection radius when idle. NOT while returning home: that
+            // reset is uninterruptible (the mob is immune and won't re-aggro
+            // until it's home again), matching the immunity in damage_mob.
+            if mob.aggro_target.is_none() && !mob.returning_home && mob.ai >= 1 && mob.chase_range > 0.0 {
+                let mut best: Option<(u32, f32)> = None;
+                for player in map_players.iter().filter(|player| player.alive) {
+                    let dist = distance_xz(mob.pos_x, mob.pos_z, player.pos_x, player.pos_z);
+                    if dist <= mob.chase_range && best.is_none_or(|(_, d)| dist < d) {
+                        best = Some((player.character_id, dist));
+                    }
+                }
+                if let Some((target_id, _)) = best {
+                    mob.aggro_target = Some(target_id);
+                }
+            }
+
+            let Some(target_id) = mob.aggro_target else {
+                // No target: if a chase just ended, walk (not teleport) back
+                // toward home one step at a time, at walk speed.
+                if mob.returning_home {
+                    let dist_home = distance_xz(mob.pos_x, mob.pos_z, mob.home_x, mob.home_z);
+                    let arrived = if dist_home <= MOB_RETURN_ARRIVE {
+                        mob.pos_x = mob.home_x;
+                        mob.pos_z = mob.home_z;
+                        true
+                    } else {
+                        let step = MOB_RETURN_STEP.min(dist_home);
+                        let next_x = mob.pos_x + (mob.home_x - mob.pos_x) / dist_home * step;
+                        let next_z = mob.pos_z + (mob.home_z - mob.pos_z) / dist_home * step;
+                        if is_map_walkable(*map_id, next_x, next_z) {
+                            mob.pos_x = next_x;
+                            mob.pos_z = next_z;
+                            false
+                        } else {
+                            // Blocked mid-return -- give up pathing and settle
+                            // at home rather than getting stuck out in the world.
+                            mob.pos_x = mob.home_x;
+                            mob.pos_z = mob.home_z;
+                            true
+                        }
+                    };
+                    actions_on_map = actions_on_map.saturating_add(1);
+                    tick.moves
+                        .push((*map_id, mob.pos_x, mob.pos_z, build_mob_move(mob, MOB_MOTION_WALK)?));
+                    if arrived {
+                        // Reset complete: full HP, clear any lingering DoTs,
+                        // and broadcast the restored HP so onlookers' bars
+                        // reflect the reset. Then it's an ordinary idle mob
+                        // again (roam resumes, damage/aggro re-enabled).
+                        mob.returning_home = false;
+                        mob.last_attack_at = None;
+                        mob.current_hp = mob.max_hp.max(1);
+                        mob.dots.clear();
+                        tick.restores.push((
+                            *map_id,
+                            mob.pos_x,
+                            mob.pos_z,
+                            build_mob_current_hp(mob.id, mob.current_hp)?,
+                        ));
+                    }
+                }
+                continue;
+            };
+            // Chasing a live target, so it's not returning home.
+            mob.returning_home = false;
+
+            let Some(target) = map_players
+                .iter()
+                .find(|player| player.character_id == target_id)
+            else {
+                continue;
+            };
+
+            let dist = distance_xz(mob.pos_x, mob.pos_z, target.pos_x, target.pos_z);
+            if dist <= MOB_ATTACK_RANGE {
+                let ready = mob
+                    .last_attack_at
+                    .is_none_or(|at| now.duration_since(at) >= MOB_ATTACK_INTERVAL);
+                if ready {
+                    mob.last_attack_at = Some(now);
+                    actions_on_map = actions_on_map.saturating_add(1);
+                    tick.attacks.push(MobAttackAction {
+                        mob_global_id: mob.id,
+                        mob_id: mob.mob_id,
+                        attack: mob.attack,
+                        target_character_id: target_id,
+                    });
+                }
+                continue;
+            }
+
+            // Just swung? Hold position a beat before resuming pursuit, so the
+            // mob visibly pauses to attack instead of gliding while it swings.
+            if mob
+                .last_attack_at
+                .is_some_and(|at| now.duration_since(at) < MOB_ATTACK_PAUSE)
+            {
+                continue;
+            }
+
+            // Out of melee range -- take one running step toward the target.
+            // Not constrained to the mob's roam area (it's actively chasing),
+            // only to map walkability.
+            if dist > 0.001 {
+                let step = MOB_CHASE_STEP.min(dist);
+                let next_x = mob.pos_x + (target.pos_x - mob.pos_x) / dist * step;
+                let next_z = mob.pos_z + (target.pos_z - mob.pos_z) / dist * step;
+                if is_map_walkable(*map_id, next_x, next_z) {
+                    mob.pos_x = next_x;
+                    mob.pos_z = next_z;
+                    actions_on_map = actions_on_map.saturating_add(1);
+                    // Motion 1 = running, confirmed via a real capture of a
+                    // mob chasing a player (0x0603 with motion byte 0x01,
+                    // vs 0x00 for a walking/roam move). Besides the run
+                    // animation, this drives the client to interpolate the
+                    // mob toward the next position at run speed instead of
+                    // walk speed.
+                    tick.moves
+                        .push((*map_id, mob.pos_x, mob.pos_z, build_mob_move(mob, MOB_MOTION_RUN)?));
+                }
+            }
+        }
+    }
+
+    Ok(tick)
 }
 
 fn cell_for(x: f32, z: f32, cell_size: u32) -> (i32, i32) {
@@ -756,35 +1279,45 @@ pub(crate) fn build_static_npc_with_patrol(
     })
 }
 
-pub(crate) fn spawn_mob(map_id: u16, mob_id: u16, pos_x: f32, pos_z: f32) -> MapMob {
-    let mob = MapMob {
-        id: next_mob_id(),
+/// Spawns a single GM-made (`mmake`) mob using its REAL definition
+/// (level/max HP/money/exp, same as any mob placed by a .svmap spawn
+/// area) -- the only difference from a normal mob is `respawn_delay`,
+/// which is always forced to `None` here regardless of the mob's real
+/// respawn timer, since this mob isn't part of any spawn area and must
+/// never come back on its own after dying; it lives indefinitely until
+/// killed (or `mera`'d) instead. `definition` is `None` for an unknown/
+/// invalid mob_id, in which case this falls back to the same defaults
+/// `get_mob_definitions`/`get_mob_definition` themselves use for a
+/// missing row (level 1, 100 HP, no money/exp) rather than refusing to
+/// spawn anything.
+pub(crate) fn spawn_mob(
+    map_id: u16,
+    mob_id: u16,
+    pos_x: f32,
+    pos_z: f32,
+    definition: Option<&DbMobDefinition>,
+) -> MapMob {
+    let area = MapMobArea {
+        lower_x: pos_x - 8.0,
+        lower_z: pos_z - 8.0,
+        upper_x: pos_x + 8.0,
+        upper_z: pos_z + 8.0,
+    };
+    let mob = build_static_mob(
         mob_id,
-        // GM-spawned mobs (`mmake`) don't look up real mob definitions --
-        // pre-existing placeholder gap, not touched here.
-        level: 1,
+        definition.map_or(1, |definition| definition.level),
         pos_x,
         pos_z,
-        home_x: pos_x,
-        home_z: pos_z,
-        current_hp: 100,
-        max_hp: 100,
-        money_min: 0,
-        money_max: 0,
-        exp: 0,
-        area: Some(
-            MapMobArea {
-                lower_x: pos_x - 8.0,
-                lower_z: pos_z - 8.0,
-                upper_x: pos_x + 8.0,
-                upper_z: pos_z + 8.0,
-            }
-            .normalized(),
-        ),
-        respawn_delay: None,
-        respawn_at: None,
-        roam_step: 0,
-    };
+        definition.map_or(100, |definition| definition.max_hp),
+        definition.map_or(0, |definition| definition.money_min),
+        definition.map_or(0, |definition| definition.money_max),
+        definition.map_or(0, |definition| definition.exp),
+        definition.map_or(0, |definition| definition.attack),
+        definition.map_or(0, |definition| definition.ai),
+        definition.map_or(0.0, |definition| definition.chase_range),
+        Some(area),
+        None,
+    );
     lock_or_recover(&map_handle(map_id)).mobs.push(mob.clone());
     mob
 }
@@ -806,7 +1339,9 @@ fn unit_from_seed(seed: u32) -> f32 {
 /// `(center_x, center_z)` (uniform over the disk area, not just the angle,
 /// so they don't cluster near the center). Each candidate point gets a few
 /// walkability retries (same bounded-retry pattern as MapMob::advance_roam)
-/// before falling back to using it anyway.
+/// before falling back to using it anyway. `definition` is looked up ONCE
+/// by the caller (this module doesn't touch the DB itself) and reused for
+/// every spawned mob rather than re-querying per mob.
 pub(crate) fn spawn_mobs_scattered(
     map_id: u16,
     mob_id: u16,
@@ -814,6 +1349,7 @@ pub(crate) fn spawn_mobs_scattered(
     center_x: f32,
     center_z: f32,
     radius: f32,
+    definition: Option<&DbMobDefinition>,
 ) -> Vec<MapMob> {
     let mut mobs = Vec::with_capacity(count as usize);
     for i in 0..count {
@@ -830,7 +1366,7 @@ pub(crate) fn spawn_mobs_scattered(
                 break;
             }
         }
-        mobs.push(spawn_mob(map_id, mob_id, chosen.0, chosen.1));
+        mobs.push(spawn_mob(map_id, mob_id, chosen.0, chosen.1, definition));
     }
     mobs
 }
@@ -927,6 +1463,9 @@ pub(crate) fn build_static_mob(
     money_min: u32,
     money_max: u32,
     exp: u32,
+    attack: u32,
+    ai: u8,
+    chase_range: f32,
     area: Option<MapMobArea>,
     respawn_seconds: Option<u64>,
 ) -> MapMob {
@@ -947,6 +1486,13 @@ pub(crate) fn build_static_mob(
         respawn_delay: respawn_seconds.map(Duration::from_secs),
         respawn_at: None,
         roam_step: 0,
+        attack,
+        ai,
+        chase_range,
+        aggro_target: None,
+        last_attack_at: None,
+        returning_home: false,
+        dots: Vec::new(),
     }
 }
 
@@ -1037,11 +1583,146 @@ pub(crate) fn build_character_mob_attack(
     packet.into_bytes()
 }
 
+/// Builds a 0x0605 mob->player basic-attack packet -- the mirror of
+/// `build_character_mob_attack` (0x0503) with the mob as attacker. `result`
+/// is 0 for a normal hit, 1 for the lethal blow (see
+/// `Opcode::MobAttackCharacter`). Only `damage_hp` is ever nonzero (players
+/// take HP damage from a basic attack; SP/MP slots exist on the wire but
+/// stay zero).
+pub(crate) fn build_mob_attack_character(
+    result: u8,
+    mob_id: u32,
+    character_id: u32,
+    damage_hp: u16,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::MobAttackCharacter);
+    packet.write_u8(result);
+    packet.write_u32(mob_id);
+    packet.write_u32(character_id);
+    packet.write_u16(damage_hp);
+    packet.write_u16(0);
+    packet.write_u16(0);
+    packet.into_bytes()
+}
+
+/// Builds a 0x0504 character-death packet (see `Opcode::CharacterDeath`).
+/// `death_type` is 0x02 for a mob kill; `killer_id` is the killer's global
+/// id (a mob id here).
+pub(crate) fn build_character_death(
+    character_id: u32,
+    death_type: u8,
+    killer_id: u32,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::CharacterDeath);
+    packet.write_u32(character_id);
+    packet.write_u8(death_type);
+    packet.write_u32(killer_id);
+    packet.into_bytes()
+}
+
+/// Builds the 0x051C packet the real server sends alongside 0x0504 on death.
+/// The two trailing bytes (0x07, 0x02) are replicated verbatim from a real
+/// capture -- their meaning isn't confirmed yet (see
+/// `Opcode::CharacterDeathState`).
+pub(crate) fn build_character_death_state(character_id: u32) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::CharacterDeathState);
+    packet.write_u32(character_id);
+    packet.write_u8(0x07);
+    packet.write_u8(0x02);
+    packet.into_bytes()
+}
+
+/// Builds the 0x0406 packet that opens the resurrection sequence (see
+/// `Opcode::CharacterReviveInit`). Payload is just the reviving character's
+/// id.
+pub(crate) fn build_character_revive_init(character_id: u32) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::CharacterReviveInit);
+    packet.write_u32(character_id);
+    packet.into_bytes()
+}
+
+/// Builds the 0x0551 resurrect-reposition packet (see
+/// `Opcode::CharacterResurrect`). The 5-byte blob `04 46 AF 37 01` is
+/// replicated verbatim from a real capture -- its fields aren't decoded yet.
+pub(crate) fn build_character_resurrect(character_id: u32, x: f32, y: f32, z: f32) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::CharacterResurrect);
+    packet.write_u32(character_id);
+    packet.write_bytes(&[0x04, 0x46, 0xAF, 0x37, 0x01]);
+    packet.write_f32(x);
+    packet.write_f32(y);
+    packet.write_f32(z);
+    packet.into_bytes()
+}
+
+/// Builds the 0x0505 revive stat-restore packet (see
+/// `Opcode::CharacterReviveHitpoints`): the reviving character's id plus the
+/// HP/MP/SP to restore them to.
+pub(crate) fn build_character_revive_hitpoints(
+    character_id: u32,
+    hp: u32,
+    mp: u32,
+    sp: u32,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::CharacterReviveHitpoints);
+    packet.write_u32(character_id);
+    packet.write_u32(hp);
+    packet.write_u32(mp);
+    packet.write_u32(sp);
+    packet.into_bytes()
+}
+
 pub(crate) fn build_mob_death(mob_id: u32, killer_character_id: u32) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::MobDeath);
     packet.write_u32(mob_id);
     packet.write_u8(1);
     packet.write_u32(killer_character_id);
+    packet.into_bytes()
+}
+
+/// The only `debuff_type` value observed in a real capture so far --
+/// see `Opcode::MobDebuffAdd`'s doc.
+pub(crate) const MOB_DEBUFF_TYPE_DOT: u8 = 0x02;
+
+pub(crate) fn build_mob_debuff_add(debuff_type: u8, mob_id: u32, skill_id: u16, skill_level: u8) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::MobDebuffAdd);
+    packet.write_u8(debuff_type);
+    packet.write_u32(mob_id);
+    packet.write_u16(skill_id);
+    packet.write_u8(skill_level);
+    packet.into_bytes()
+}
+
+pub(crate) fn build_mob_debuff_remove(debuff_type: u8, mob_id: u32, skill_id: u16, skill_level: u8) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::MobDebuffRemove);
+    packet.write_u8(debuff_type);
+    packet.write_u32(mob_id);
+    packet.write_u16(skill_id);
+    packet.write_u8(skill_level);
+    packet.into_bytes()
+}
+
+pub(crate) fn build_mob_periodic_damage(
+    mob_id: u32,
+    skill_id: u16,
+    skill_level: u8,
+    damage_hp: u16,
+    damage_sp: u16,
+    damage_mp: u16,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::MobPeriodicDamage);
+    packet.write_u32(mob_id);
+    packet.write_u16(skill_id);
+    packet.write_u8(skill_level);
+    packet.write_u16(damage_hp);
+    packet.write_u16(damage_sp);
+    packet.write_u16(damage_mp);
+    packet.into_bytes()
+}
+
+pub(crate) fn build_mob_current_hp(mob_id: u32, current_hp: u32) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::MobCurrentHitpoints);
+    packet.write_u32(mob_id);
+    packet.write_u32(current_hp);
     packet.into_bytes()
 }
 

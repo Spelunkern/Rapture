@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 eframe = "0.32"
+sysinfo = "0.32"

@@ -49,6 +49,7 @@ pub(crate) fn equipped_weapon_combat(
 
 pub(crate) fn process_auto_attack_swing(
     target_mob_id: u32,
+    mounted: bool,
     active_character: &mut Option<DbCharacter>,
     connected_player: &Option<Arc<ConnectedPlayer>>,
     active_items: &[DbCharacterItem],
@@ -69,6 +70,14 @@ pub(crate) fn process_auto_attack_swing(
         return Ok(false);
     };
     let character = &character;
+
+    if mounted {
+        logger.line(format!(
+            "Rapture World cancelled auto attack while mounted character_id={} mob_global_id={target_mob_id}",
+            character.id
+        ));
+        return Ok(false);
+    }
 
     let weapon_combat = match equipped_weapon_combat(db_conn, active_items) {
         Ok(Some(weapon_combat)) => weapon_combat,
@@ -144,6 +153,10 @@ pub(crate) fn process_auto_attack_swing(
         return Ok(false);
     };
 
+    // Provoke the mob into fighting back (retaliation aggro) -- applies even
+    // to passive mobs (`ai == 0`), which only ever engage this way.
+    set_mob_aggro(character.map_id, target_mob_id, character.id);
+
     *last_auto_attack_at = Some(Instant::now());
     logger.line(format!(
         "Rapture World auto attack character_id={} mob_global_id={} mob_id={} str={} dex={} atk={}-{} weapon_type={} weapon_type_id={} attack_time={} delay_ms={} original_delay_ms={} range={:.2} allowed_range={allowed_range:.2} distance={distance:.2} final_damage={} applied_hp={} hp={}/{} killed={} respawn_seconds={}",
@@ -195,6 +208,141 @@ pub(crate) fn process_auto_attack_swing(
         use_expanded_send_key,
         logger,
     )
+}
+
+/// Death-type value carried by `0x0504 CharacterDeath` for a mob kill --
+/// the only value observed in a real capture so far (see
+/// `Opcode::CharacterDeath`).
+const DEATH_TYPE_MOB: u8 = 0x02;
+
+/// Applies one incoming mob melee hit to the owning connection's own
+/// character: computes the post-defense damage, deducts it (respecting the
+/// raw-vs-effective HP invariant), persists it, broadcasts the 0x0605 swing
+/// to nearby players, and on a lethal hit runs the death sequence
+/// (0x051C + 0x0504 broadcast, deaths++, dropped mob aggro). Returns whether
+/// this hit killed the player, so the caller can enter its dead-input-gated
+/// state. Called only from the player's OWN connection thread, draining the
+/// `pending_damage` mailbox the combat sweep queues into (see
+/// chat::ConnectedPlayer::queue_damage / sweeps::run_mob_combat_sweep) --
+/// that keeps HP authority on a single thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_incoming_mob_damage(
+    mob_global_id: u32,
+    mob_id: u16,
+    raw_attack: u32,
+    active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
+    active_items: &[DbCharacterItem],
+    db_conn: &mut db::Db,
+    stream: &mut TcpStream,
+    aes_send: &mut Option<AesCtr>,
+    use_expanded_send_key: bool,
+    logger: &Logger,
+) -> Result<bool> {
+    let Some(character) = active_character.as_mut() else {
+        return Ok(false);
+    };
+
+    let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
+    let stats = CharacterStats::from_character(Some(character), equipment_stats);
+    let effective_hp = stats.current_hp;
+    if effective_hp == 0 {
+        // Already dead -- a queued hit that raced the death itself. Ignore.
+        return Ok(false);
+    }
+
+    // A mob with no `Attack1` (missing/zero column) still visibly swings but
+    // deals nothing; otherwise damage is attack minus the target's defense
+    // AND enchant absorption (a flat, universal reduction from enchanted
+    // armor -- see db::ARMOR_ENCHANT_ABSORPTION), floored at 1 so a real
+    // attack always chips something off.
+    let damage = if raw_attack == 0 {
+        0
+    } else {
+        raw_attack
+            .saturating_sub(stats.defense.saturating_add(stats.absorption))
+            .max(1)
+    };
+
+    // Mirror of apply_heal_skill's HP math, in reverse: work in a DELTA on
+    // the raw `current_hp` field, never assign an effective value to it (see
+    // CharacterStats::from_character's invariant note).
+    let new_effective = effective_hp.saturating_sub(damage);
+    let delta = effective_hp - new_effective;
+    let new_raw = character.current_hp.saturating_sub(delta);
+    let killed = damage > 0 && new_effective == 0;
+
+    character.current_hp = new_raw;
+    db::set_character_status(db_conn, character.id, new_raw, character.current_mp, character.current_sp)?;
+
+    let map_id = character.map_id;
+    let victim_id = character.id;
+    let pos_x = character.pos_x;
+    let pos_z = character.pos_z;
+    let result = if killed { 1 } else { 0 };
+    let damage_hp = damage.min(u32::from(u16::MAX)) as u16;
+
+    if let Some(player) = connected_player.as_ref() {
+        player.update_character(character.clone());
+    }
+
+    // The mob's swing, broadcast to everyone near the victim (including the
+    // victim's own client) via the stateless expanded-XOR path -- same
+    // mechanism auto-attack (0x0503) uses for its broadcast.
+    let attack_packet = build_mob_attack_character(result, mob_global_id, victim_id, damage_hp)?;
+    for player in players_on_map_near(map_id, pos_x, pos_z, COMBAT_RADIUS) {
+        player.send_packet(&attack_packet, "0x0605 mob attack character", logger)?;
+    }
+
+    logger.line(format!(
+        "Rapture World mob attack character_id={victim_id} mob_global_id={mob_global_id} mob_id={mob_id} raw_attack={raw_attack} defense={} absorption={} damage={damage} hp={new_effective}/{} killed={killed}",
+        stats.defense, stats.absorption, stats.max_hp
+    ));
+
+    // Re-sync the victim's authoritative HP to their own client.
+    if let Some(send) = aes_send.as_mut() {
+        let refreshed = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
+        send_encrypted(
+            stream,
+            send,
+            use_expanded_send_key,
+            build_current_hitpoints(&refreshed)?,
+            "0x0521 current hp after mob attack",
+            logger,
+        )?;
+    }
+
+    if killed {
+        // Death sequence, in the order the real server sent it (capture):
+        // 0x051C, then 0x0504, broadcast to everyone near the victim.
+        let death_state = build_character_death_state(victim_id)?;
+        let death = build_character_death(victim_id, DEATH_TYPE_MOB, mob_global_id)?;
+        for player in players_on_map_near(map_id, pos_x, pos_z, COMBAT_RADIUS) {
+            player.send_packet(&death_state, "0x051C character death state", logger)?;
+            player.send_packet(&death, "0x0504 character death", logger)?;
+        }
+
+        // Record the death and drop the killer's aggro so it stops swinging
+        // and returns to roaming.
+        db::set_character_attribute(
+            db_conn,
+            victim_id,
+            db::CharAttribute::Deaths,
+            i64::from(active_character.as_ref().map_or(0, |c| c.deaths)) + 1,
+        )?;
+        if let Some(active) = active_character.as_mut() {
+            active.deaths = active.deaths.saturating_add(1);
+        }
+        clear_mob_aggro(map_id, mob_global_id);
+        if let Some(player) = connected_player.as_ref() {
+            player.set_alive(false);
+        }
+        logger.line(format!(
+            "Rapture World character died character_id={victim_id} killer_mob_global_id={mob_global_id} mob_id={mob_id}"
+        ));
+    }
+
+    Ok(killed)
 }
 
 /// Shared "what happens after a mob takes damage" handling -- death
@@ -251,67 +399,40 @@ pub(crate) fn resolve_mob_damage_result(
         }
 
         if result.mob.exp > 0 {
-            if let Some(active) = active_character.as_mut() {
-                let scaled_exp = scaled_kill_exp(active.level, result.mob.level, result.mob.exp);
-                let gain = apply_exp_gain(active, scaled_exp);
-                db::set_character_level_exp(db_conn, active.id, active.level, active.exp)?;
-                if gain.levels_gained > 0 {
-                    db::set_character_status(
-                        db_conn,
-                        active.id,
-                        active.max_hp,
-                        active.max_mp,
-                        active.max_sp,
-                    )?;
-                }
-                if let Some(player) = connected_player.as_ref() {
-                    player.update_character(active.clone());
-                }
-                logger.line(format!(
-                    "Rapture World exp character_id={} mob_id={} mob_level={} base_exp={} scaled_gained={} level={} exp={} leveled_up={} levels_gained={}",
-                    active.id,
-                    result.mob.mob_id,
-                    result.mob.level,
-                    result.mob.exp,
-                    scaled_exp,
-                    gain.new_level,
-                    gain.new_exp,
-                    gain.leveled_up,
-                    gain.levels_gained
-                ));
-                // Real packet capture (2026-07-09) confirmed a level-up
-                // pushes 0x051F (max hp/mp/sp) live mid-session -- the exact
-                // packet this bundle already sends for the GM `set level`
-                // command, and further capture analysis traced the real
-                // source of that jump to PS_GameDefs.dbo.StatusDefs (see
-                // experience::apply_exp_gain), not the stat-derived
-                // component. Reusing the bundle here pushes the correct,
-                // now-StatusDefs-backed numbers live.
-                if let Some(send) = aes_send.as_mut() {
-                    let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
-                    let character_stats =
-                        CharacterStats::from_character(Some(active), equipment_stats);
-                    send_character_stat_packets(
-                        stream,
-                        send,
-                        use_expanded_send_key,
-                        Some(active),
-                        &character_stats,
-                        logger,
-                    )?;
-                }
-                // Still unconfirmed: the raw exp/level numbers themselves
-                // (client exp bar, "Lv.X" nameplate, any level-up toast) --
-                // no opcode for those was found in the Aries reference
-                // (checked game/outgoing 0x0100-0x0900; 0x0522
-                // GameUserKillInfoOutgoing is kills, not exp). DB and
-                // in-memory state are fully correct and will show right on
-                // next relog either way; only the LIVE mid-session exp/
-                // level display is unverified.
-            }
+            grant_mob_kill_exp(
+                result.mob.mob_id,
+                result.mob.level,
+                result.mob.exp,
+                active_character,
+                connected_player,
+                active_items,
+                db_conn,
+                stream,
+                aes_send,
+                use_expanded_send_key,
+                logger,
+            )?;
         }
         Ok(false)
     } else {
+        // Confirmed via a real capture of a hit-through-death sequence:
+        // the real server broadcasts a mob current-HP sync (0x0610) to
+        // everyone nearby after every non-lethal hit -- NOT the 0x0305
+        // ack below, which the capture never showed happening
+        // automatically (0x0305 only ever appeared as a direct response
+        // to the client explicitly requesting/re-selecting a target,
+        // matching this project's existing on-request handler in
+        // main.rs). Previously this broadcast only fired for DoT ticks
+        // (see sweeps.rs's run_mob_dot_sweep) -- missing it here left
+        // the client with no ongoing HP sync after an ordinary hit, which
+        // is the confirmed root cause of a reported bug where a mob's HP
+        // bar visibly reset to 0 about a second after any hit until the
+        // player re-selected the target (re-triggering 0x0305).
+        if let Ok(hp_packet) = build_mob_current_hp(result.mob.id, result.mob.current_hp) {
+            for player in players_on_map_near(map_id, result.mob.pos_x, result.mob.pos_z, COMBAT_RADIUS) {
+                let _ = player.send_packet(&hp_packet, "0x0610 mob current hp after attack", logger);
+            }
+        }
         if let Some(send) = aes_send.as_mut() {
             send_encrypted(
                 stream,
@@ -324,4 +445,112 @@ pub(crate) fn resolve_mob_damage_result(
         }
         Ok(true)
     }
+}
+
+/// Grants scaled EXP for a mob kill to `active_character` (if any is set),
+/// persists it, and pushes live stat packets to `stream`/`aes_send` (if
+/// present). Extracted out of `resolve_mob_damage_result` so a kill that
+/// happens OUTSIDE any specific connection's own call stack -- a DoT tick
+/// firing from the background sweep thread (see skillcast.rs/sweeps.rs),
+/// attributed to whichever character cast it -- can grant the exact same
+/// EXP via the killer's own connection thread (queued through
+/// `ConnectedPlayer::queue_mob_kill_exp`, drained in main.rs same as
+/// `pending_teleport`/`pending_trade_refresh`) instead of duplicating this
+/// logic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grant_mob_kill_exp(
+    mob_id: u16,
+    mob_level: u16,
+    mob_exp: u32,
+    active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
+    active_items: &[DbCharacterItem],
+    db_conn: &mut db::Db,
+    stream: &mut TcpStream,
+    aes_send: &mut Option<AesCtr>,
+    use_expanded_send_key: bool,
+    logger: &Logger,
+) -> Result<()> {
+    let Some(active) = active_character.as_mut() else {
+        return Ok(());
+    };
+
+    let scaled_exp = scaled_kill_exp(active.level, mob_level, mob_exp);
+    let gain = apply_exp_gain(active, scaled_exp);
+    db::set_character_level_exp(db_conn, active.id, active.level, active.exp)?;
+    if gain.levels_gained > 0 {
+        db::set_character_status(db_conn, active.id, active.max_hp, active.max_mp, active.max_sp)?;
+    }
+    if let Some(player) = connected_player.as_ref() {
+        player.update_character(active.clone());
+    }
+    logger.line(format!(
+        "Rapture World exp character_id={} mob_id={mob_id} mob_level={mob_level} base_exp={mob_exp} scaled_gained={} level={} exp={} leveled_up={} levels_gained={}",
+        active.id,
+        scaled_exp,
+        gain.new_level,
+        gain.new_exp,
+        gain.leveled_up,
+        gain.levels_gained
+    ));
+    // Real packet capture (2026-07-09) confirmed a level-up pushes 0x051F
+    // (max hp/mp/sp) live mid-session -- the exact packet this bundle
+    // already sends for the GM `set level` command. The base component of
+    // that jump is now a hardcoded flat 100/level (see
+    // experience::apply_exp_gain / character::base_pool_for_level), not the
+    // stat-derived component. Reusing the bundle here pushes the correct
+    // numbers live.
+    if let Some(send) = aes_send.as_mut() {
+        let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
+        let character_stats = CharacterStats::from_character(Some(active), equipment_stats);
+        send_character_stat_packets(stream, send, use_expanded_send_key, Some(active), &character_stats, logger)?;
+    }
+    // Still unconfirmed: the raw exp/level numbers themselves (client exp
+    // bar, "Lv.X" nameplate, any level-up toast) -- no opcode for those
+    // was found in the Aries reference (checked game/outgoing 0x0100-
+    // 0x0900; 0x0522 GameUserKillInfoOutgoing is kills, not exp). DB and
+    // in-memory state are fully correct and will show right on next relog
+    // either way; only the LIVE mid-session exp/level display is
+    // unverified.
+    Ok(())
+}
+
+/// Same EXP grant as `grant_mob_kill_exp`, but for a DoT kill attributed
+/// to a caster who's no longer online (see sweeps::run_mob_dot_sweep) --
+/// works purely against the DB, no live packets or in-memory state, since
+/// there's no connection to keep in sync.
+pub(crate) fn grant_offline_mob_kill_exp(
+    db_conn: &mut db::Db,
+    character_id: u32,
+    mob_id: u16,
+    mob_level: u16,
+    mob_exp: u32,
+    logger: &Logger,
+) -> Result<()> {
+    let Some(mut character) = db::get_character_by_char_id(db_conn, character_id)? else {
+        return Ok(());
+    };
+
+    let scaled_exp = scaled_kill_exp(character.level, mob_level, mob_exp);
+    let gain = apply_exp_gain(&mut character, scaled_exp);
+    db::set_character_level_exp(db_conn, character.id, character.level, character.exp)?;
+    if gain.levels_gained > 0 {
+        db::set_character_status(
+            db_conn,
+            character.id,
+            character.max_hp,
+            character.max_mp,
+            character.max_sp,
+        )?;
+    }
+    logger.line(format!(
+        "Rapture World offline exp character_id={} mob_id={mob_id} mob_level={mob_level} base_exp={mob_exp} scaled_gained={} level={} exp={} leveled_up={} levels_gained={}",
+        character.id,
+        scaled_exp,
+        gain.new_level,
+        gain.new_exp,
+        gain.leveled_up,
+        gain.levels_gained
+    ));
+    Ok(())
 }

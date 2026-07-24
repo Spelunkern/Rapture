@@ -4,16 +4,22 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use sysinfo::System;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const LOGIN_PROCESS: &str = "rapture_login.exe";
-const WORLD_PROCESS: &str = "rapture_world.exe";
+/// Binary names without a platform extension -- `std::env::consts::
+/// EXE_SUFFIX` supplies `.exe` on Windows and an empty string on Linux/
+/// macOS, both for the paths built below and for matching process names
+/// via `sysinfo` (which reports names including any platform extension).
+const LOGIN_BIN_NAME: &str = "rapture_login";
+const WORLD_BIN_NAME: &str = "rapture_world";
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// The repo root, derived from this exe's own location (`target/release/
-/// rapture_panel.exe`) rather than a hardcoded absolute path -- makes the
+/// rapture_panel[.exe]`) rather than a hardcoded absolute path -- makes the
 /// panel work regardless of where the repo is checked out.
 fn repo_root() -> PathBuf {
     std::env::current_exe()
@@ -22,12 +28,19 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn bin_path(bin_name: &str) -> PathBuf {
+    repo_root().join(format!(
+        "target/release/{bin_name}{}",
+        std::env::consts::EXE_SUFFIX
+    ))
+}
+
 fn login_exe() -> PathBuf {
-    repo_root().join("target/release/rapture_login.exe")
+    bin_path(LOGIN_BIN_NAME)
 }
 
 fn world_exe() -> PathBuf {
-    repo_root().join("target/release/rapture_world.exe")
+    bin_path(WORLD_BIN_NAME)
 }
 
 struct PanelApp {
@@ -65,16 +78,16 @@ impl eframe::App for PanelApp {
 
                 ui.add_space(18.0);
                 if ui.button("Start Server").clicked() {
-                    let _ = stop_process(LOGIN_PROCESS);
-                    let _ = stop_process(WORLD_PROCESS);
+                    stop_process(LOGIN_BIN_NAME);
+                    stop_process(WORLD_BIN_NAME);
                     let _ = start_process(&login_exe());
                     let _ = start_process(&world_exe());
                     self.refresh_status();
                 }
 
                 if ui.button("Stop Server").clicked() {
-                    let _ = stop_process(LOGIN_PROCESS);
-                    let _ = stop_process(WORLD_PROCESS);
+                    stop_process(LOGIN_BIN_NAME);
+                    stop_process(WORLD_BIN_NAME);
                     self.refresh_status();
                 }
             });
@@ -86,8 +99,8 @@ impl eframe::App for PanelApp {
 
 impl PanelApp {
     fn refresh_status(&mut self) {
-        self.login_running = is_process_running(LOGIN_PROCESS);
-        self.world_running = is_process_running(WORLD_PROCESS);
+        self.login_running = is_process_running(LOGIN_BIN_NAME);
+        self.world_running = is_process_running(WORLD_BIN_NAME);
         self.last_refresh = Instant::now();
     }
 }
@@ -105,7 +118,10 @@ fn status_pill(ui: &mut egui::Ui, label: &str, running: bool) {
 
 fn start_process(exe: &Path) -> Result<String, String> {
     if !exe.exists() {
-        return Err(format!("Missing {}. Run build-rust.ps1 first.", exe.display()));
+        return Err(format!(
+            "Missing {}. Run tools/build-rust (.ps1 on Windows, .sh on Linux) first.",
+            exe.display()
+        ));
     }
 
     let mut command = Command::new(exe);
@@ -117,32 +133,35 @@ fn start_process(exe: &Path) -> Result<String, String> {
         .map_err(|error| format!("Failed to start {}: {error}", exe.display()))
 }
 
-fn stop_process(process: &str) -> Result<String, String> {
-    let mut command = Command::new("taskkill");
-    command.args(["/IM", process, "/F"]);
-    apply_no_window(&mut command);
-
-    let _ = command.output();
-    Ok(format!("Stopped {process}"))
+/// Matches a `sysinfo` process by binary name, ignoring the platform's exe
+/// extension and case (`taskkill`/`tasklist` -- Windows-only console tools
+/// -- previously did this via shelling out; `sysinfo` gives one
+/// cross-platform implementation for both start/stop and status).
+fn process_matches(process: &sysinfo::Process, bin_name: &str) -> bool {
+    let expected = format!("{bin_name}{}", std::env::consts::EXE_SUFFIX);
+    process
+        .name()
+        .to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(&expected))
 }
 
-fn is_process_running(process: &str) -> bool {
-    let mut command = Command::new("tasklist");
-    command.args([
-        "/FI",
-        &format!("IMAGENAME eq {process}"),
-        "/FO",
-        "CSV",
-        "/NH",
-    ]);
-    apply_no_window(&mut command);
+fn stop_process(bin_name: &str) {
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    for process in system.processes().values() {
+        if process_matches(process, bin_name) {
+            process.kill();
+        }
+    }
+}
 
-    let Ok(output) = command.output() else {
-        return false;
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    stdout.contains(&process.to_ascii_lowercase())
+fn is_process_running(bin_name: &str) -> bool {
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .values()
+        .any(|process| process_matches(process, bin_name))
 }
 
 fn file_name(path: &Path) -> String {

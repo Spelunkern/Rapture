@@ -196,6 +196,121 @@ pub(crate) fn apply_teleport(
     Ok(())
 }
 
+/// Resurrects a dead character in response to 0x0553 ResurrectRequest.
+/// Moves them to the nearest faction town spawn (same respawn point `/town`
+/// uses), full-heals them, and replays the real server's revive packet
+/// sequence captured from the retail server: 0x0406 (revive init), the
+/// standard teleport + area-visibility reload via `apply_teleport`, then
+/// 0x0551 (reposition) and 0x0505 (HP/MP/SP restore). Clears the shared
+/// `alive` flag last so the combat sweep can target the player again only
+/// once they're fully back. Returns whether the character was actually
+/// revived (false if there was no active character).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resurrect_character(
+    active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
+    active_items: &[rapture_common::db::DbCharacterItem],
+    is_admin: bool,
+    selected_faction: u8,
+    entity_visibility: &mut EntityVisibility,
+    db_conn: &mut db::Db,
+    stream: &mut TcpStream,
+    aes_send: &mut Option<AesCtr>,
+    use_expanded_send_key: bool,
+    position_dirty: &mut bool,
+    last_position_save: &mut Instant,
+    logger: &Logger,
+) -> Result<bool> {
+    let Some(character) = active_character.as_mut() else {
+        return Ok(false);
+    };
+    let character_id = character.id;
+    let map_id = character.map_id;
+
+    // Same respawn point as `/town`: the nearest faction spawn area on the
+    // current map. Falls back to the current position if the map has none.
+    let (respawn_x, respawn_y, respawn_z) =
+        find_nearest_spawn_area(map_id, selected_faction, character.pos_x, character.pos_z)
+            .map(|area| area.center())
+            .unwrap_or((character.pos_x, character.pos_y, character.pos_z));
+
+    // Full heal: assign raw = max on all three pools (the sanctioned
+    // exception to the modify-by-delta HP invariant, see
+    // CharacterStats::from_character).
+    character.current_hp = character.max_hp;
+    character.current_mp = character.max_mp;
+    character.current_sp = character.max_sp;
+
+    // Effective (bonus-inclusive) maxes for the 0x0505 restore packet, which
+    // carries the displayed values (matching the captured revive).
+    let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
+    let stats = CharacterStats::from_character(Some(&*character), equipment_stats);
+    let (revive_hp, revive_mp, revive_sp) = (stats.max_hp, stats.max_mp, stats.max_sp);
+
+    db::set_character_status(db_conn, character_id, character.current_hp, character.current_mp, character.current_sp)?;
+
+    // 1) Revive-init, sent before the teleport/reload sequence.
+    if let Some(send) = aes_send.as_mut() {
+        send_encrypted(
+            stream,
+            send,
+            use_expanded_send_key,
+            build_character_revive_init(character_id)?,
+            "0x0406 revive init",
+            logger,
+        )?;
+    }
+
+    // 2) Teleport to the respawn point + area-visibility reload + introduce
+    //    the now-alive character to nearby players.
+    apply_teleport(
+        character,
+        connected_player,
+        is_admin,
+        entity_visibility,
+        db_conn,
+        stream,
+        aes_send,
+        use_expanded_send_key,
+        position_dirty,
+        last_position_save,
+        map_id,
+        respawn_x,
+        respawn_y,
+        respawn_z,
+        "resurrect",
+        logger,
+    )?;
+
+    // 3) Revive reposition + 4) stat restore, self-only.
+    if let Some(send) = aes_send.as_mut() {
+        send_encrypted(
+            stream,
+            send,
+            use_expanded_send_key,
+            build_character_resurrect(character_id, respawn_x, respawn_y, respawn_z)?,
+            "0x0551 resurrect reposition",
+            logger,
+        )?;
+        send_encrypted(
+            stream,
+            send,
+            use_expanded_send_key,
+            build_character_revive_hitpoints(character_id, revive_hp, revive_mp, revive_sp)?,
+            "0x0505 revive hitpoints",
+            logger,
+        )?;
+    }
+
+    if let Some(player) = connected_player.as_ref() {
+        player.set_alive(true);
+    }
+    logger.line(format!(
+        "Rapture World resurrected character_id={character_id} map={map_id} pos=({respawn_x:.2}, {respawn_y:.2}, {respawn_z:.2}) hp={revive_hp}"
+    ));
+    Ok(true)
+}
+
 /// Handles 0x0501 CharacterMove: updates position, checks for a portal at
 /// the new spot (walking onto one triggers a teleport the same way an
 /// explicit 0x020A CharacterEnteredPortal does -- see

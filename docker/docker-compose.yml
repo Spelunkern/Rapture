@@ -1,0 +1,61 @@
+services:
+  mariadb:
+    image: mariadb:11.4
+    container_name: rapture_mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mariadb_root_password
+      RAPTURE_APP_PASSWORD_FILE: /run/secrets/rapture_app_password
+    secrets:
+      - mariadb_root_password
+      - rapture_app_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - rapture_mariadb_data:/var/lib/mysql
+      - ./mariadb/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: rapture_mssql
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD_FILE: /run/secrets/mssql_sa_password
+    secrets:
+      - mssql_sa_password
+    ports:
+      # Mapped off the default 1433 so this can run alongside the existing
+      # native SQL Server Express instance without a port clash while both
+      # are being compared.
+      - "14330:1433"
+    volumes:
+      - rapture_mssql_data:/var/opt/mssql
+      - ../../Backups/Rapture/sql:/var/opt/mssql/backup:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$(cat /run/secrets/mssql_sa_password)\" -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+secrets:
+  mariadb_root_password:
+    file: ./mariadb/root_password.txt
+  rapture_app_password:
+    file: ./mariadb/app_password.txt
+  mssql_sa_password:
+    file: ./mssql/sa_password.txt
+
+volumes:
+  rapture_mariadb_data:
+  rapture_mssql_data:

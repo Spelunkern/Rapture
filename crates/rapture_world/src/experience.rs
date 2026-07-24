@@ -15,24 +15,18 @@
 //! (e.g. Imgeneus) of "current-level progress bar", not "total XP ever
 //! earned".
 //!
-//! Base max HP/MP/SP per level come from PS_GameDefs.dbo.StatusDefs
-//! (Level, Job, HP, MP, SP -- `Job` matches DbCharacter::character_class
-//! directly, same column name/range in both StatusDefs and Chars).
-//! Confirmed against a real capture (2026-07-09) that leveling up changes
-//! max hp/mp/sp by an amount far larger than the flat per-level stat
-//! growth alone could produce via CharacterStats's stat-derived component
-//! (e.g. +229 hp for a single level, vs. the +5 that formula gives per +1
-//! Reaction) -- StatusDefs is the real, authoritative source for that
-//! base component, previously hardcoded to a flat 100/100/100 placeholder
-//! everywhere a character was loaded (see db::row_to_character).
-//! StatusDefs values are absolute per level, not deltas: a level-up
-//! REPLACES the character's base hp/mp/sp with the new level's row.
+//! Base max HP/MP/SP per level are hardcoded to a flat 100/level for every
+//! class (see character::base_pool_for_level) -- NOT sourced from any DB
+//! table (this replaced an earlier PS_GameDefs.dbo.StatusDefs per-(level,
+//! job) lookup, per an explicit design decision). A level-up REPLACES the
+//! character's base hp/mp/sp with the new level's value and full-heals to it.
 
 use anyhow::Result;
 use rapture_common::db::{self, DbCharacter};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::character::base_pool_for_level;
 use crate::session::Logger;
 
 /// Level cap requested for the current content/balance pass. ExpDefs
@@ -67,7 +61,6 @@ pub(crate) fn scaled_kill_exp(character_level: u16, mob_level: u16, mob_exp: u32
 }
 
 static EXP_TABLE: OnceLock<HashMap<(u16, u8), u32>> = OnceLock::new();
-static STATUS_TABLE: OnceLock<HashMap<(u16, u8), (u32, u32, u32)>> = OnceLock::new();
 
 /// Loads PS_GameDefs.dbo.ExpDefs once at server startup, mirroring
 /// drops::load_drop_tables. Must be called before any `apply_exp_gain`.
@@ -84,30 +77,11 @@ pub(crate) fn load_exp_table(logger: &Logger) -> Result<()> {
     Ok(())
 }
 
-/// Loads PS_GameDefs.dbo.StatusDefs once at server startup. Must be called
-/// before any `apply_exp_gain`.
-pub(crate) fn load_status_table(logger: &Logger) -> Result<()> {
-    let mut db_conn = db::connect()?;
-    let table = db::get_status_definitions(&mut db_conn)?;
-    logger.line(format!(
-        "Rapture World loaded {} status requirement(s) from StatusDefs",
-        table.len()
-    ));
-    let _ = STATUS_TABLE.set(table);
-    Ok(())
-}
-
 /// Exp needed to advance from `level` to `level + 1` at growth stage
 /// `mode` (DbCharacter::mode, 0-3). `None` if the table isn't loaded yet or
 /// has no row for this (level, mode) pair.
 fn exp_required(level: u16, mode: u8) -> Option<u32> {
     EXP_TABLE.get()?.get(&(level, mode.saturating_add(1))).copied()
-}
-
-/// Base (hp, mp, sp) at `level` for job/class `character_class`. `None` if
-/// the table isn't loaded yet or has no row for this (level, class) pair.
-fn base_status(level: u16, character_class: u8) -> Option<(u32, u32, u32)> {
-    STATUS_TABLE.get()?.get(&(level, character_class)).copied()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,14 +136,15 @@ pub(crate) fn apply_exp_gain(character: &mut DbCharacter, gained: u32) -> ExpGai
     }
 
     if levels_gained > 0 {
-        if let Some((hp, mp, sp)) = base_status(character.level, character.character_class) {
-            character.max_hp = hp;
-            character.max_mp = mp;
-            character.max_sp = sp;
-            character.current_hp = hp;
-            character.current_mp = mp;
-            character.current_sp = sp;
-        }
+        // Hardcoded flat 100/level base (see base_pool_for_level), same for
+        // every class -- refresh base max and full-heal to it.
+        let base = base_pool_for_level(character.level);
+        character.max_hp = base;
+        character.max_mp = base;
+        character.max_sp = base;
+        character.current_hp = base;
+        character.current_mp = base;
+        character.current_sp = base;
     }
 
     ExpGainResult {

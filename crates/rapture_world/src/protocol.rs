@@ -24,7 +24,12 @@ pub(crate) fn is_valid_account_faction(faction: u8) -> bool {
 
 pub(crate) fn build_create_character_result(ok: bool) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(Opcode::CreateCharacter);
-    packet.write_u32(if ok { 0 } else { 1 });
+    // Single result byte (0 = ok, 1 = failure), confirmed via capture: a
+    // duplicate-name create replied `02 01 01` (opcode + one byte), which the
+    // client renders as a "name already in use" notice. Previously written as
+    // a u32; the client accepted that (it reads one byte and ignores the
+    // trailing padding), but one byte matches the real server exactly.
+    packet.write_u8(if ok { 0 } else { 1 });
     packet.into_bytes()
 }
 
@@ -32,6 +37,30 @@ pub(crate) fn build_select_character_result(ok: bool, character_id: u32) -> Resu
     let mut packet = PacketWriter::new(Opcode::SelectCharacter);
     packet.write_u8(if ok { 0 } else { 1 });
     packet.write_u32(character_id);
+    packet.into_bytes()
+}
+
+pub(crate) fn build_delete_character_result(ok: bool, character_id: u32) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::DeleteCharacter);
+    packet.write_u8(if ok { 0 } else { 1 });
+    packet.write_u32(character_id);
+    packet.into_bytes()
+}
+
+pub(crate) fn build_restore_character_result(ok: bool, character_id: u32) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::RestoreCharacter);
+    packet.write_u8(if ok { 0 } else { 1 });
+    packet.write_u32(character_id);
+    packet.into_bytes()
+}
+
+/// Rename result -- a single byte, and note the INVERTED convention vs
+/// delete/restore: here **1 = ok, 0 = fail** (confirmed via capture `0E 01 01`
+/// on success, and matching Imgeneus's SendRenamedCharacter). No charId in
+/// this client's response.
+pub(crate) fn build_rename_character_result(ok: bool) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::RenameCharacter);
+    packet.write_u8(if ok { 1 } else { 0 });
     packet.into_bytes()
 }
 

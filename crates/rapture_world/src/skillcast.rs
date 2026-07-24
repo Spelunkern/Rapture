@@ -67,13 +67,21 @@ use crate::combat::*;
 use crate::session::*;
 use crate::world_entities::*;
 
-const SKILL_TARGET_TYPE_MOB: u8 = 1;
-/// The outgoing ack's `targetType` byte for a self-heal -- confirmed
-/// against a real capture to be `0`, NOT `2` (`TargetType::Caster`) as
-/// originally guessed by analogy with `Skills.TargetType`; the ack's
-/// target-type byte apparently isn't the same enum/value space as the DB
-/// column.
-const SKILL_TARGET_TYPE_SELF: u8 = 0;
+/// The outgoing skill-use ack's FIRST byte. Confirmed against a real
+/// Magic Arrow (skill 29) capture on a mob to be `0`, and against our own
+/// working auto-attack (0x0503, whose identical leading byte is
+/// `combat::ATTACK_SUCCESS_NORMAL == 0`): this byte is the **attack-result
+/// code** (`GameCharAttackResult`: Normal=0, Critical=1, Miss=2, ... per
+/// Aries's 0500.h), NOT a "target type" as this project originally
+/// mislabeled it (the target is already conveyed by `target_id`; a self
+/// cast just has `sender_id == target_id`). It was wrongly hardcoded to
+/// `1` for mob-damage hits, which the client read as `Critical` and which
+/// broke the target's HP-bar update for skill hits specifically (the
+/// damage number and "critical" text still showed, but the bar snapped to
+/// 0) -- a real, capture-diagnosed bug. Every successful hit/heal/buff
+/// sends Normal (0); we don't compute skill crits, so there's no reason to
+/// ever send anything else here today.
+const SKILL_RESULT_NORMAL: u8 = 0;
 
 /// Same tolerance idea as `combat::AUTO_ATTACK_RANGE_GRACE`: a strict
 /// distance <= AttackRange check rejected valid casts constantly (client-
@@ -81,6 +89,20 @@ const SKILL_TARGET_TYPE_SELF: u8 = 0;
 /// known position), forcing the player to circle the mob dozens of times
 /// before a cast landed. Matches the auto-attack fix exactly.
 const SKILL_RANGE_GRACE: f32 = 2.0;
+
+/// For a skill WITH a cast time (`ReadyTime > 0`): how far the target may
+/// wander from where it stood at the moment casting started before the
+/// cast fails as "target escaped" once the cast time elapses. Confirmed by
+/// the user: re-checking the tight `attack_range` against the target's
+/// CURRENT position at resolution time (the previous behavior) was wrong
+/// -- ordinary target movement during a multi-second cast bar constantly
+/// failed casts that should have landed. This is deliberately much more
+/// generous than SKILL_RANGE_GRACE and is the ONLY range check applied
+/// when resolving an already-armed `PendingCast` (see
+/// `resolve_skill_use`'s `cast_origin_target_pos` parameter) -- an instant
+/// (no cast time) skill still uses the normal tight attack_range check,
+/// since there's no cast-time window for the target to have moved during.
+const SKILL_TARGET_ESCAPE_RANGE: f32 = 100.0;
 
 /// `Skills.TargetType` values (see module doc for the full mapping).
 const TARGET_TYPE_ANY_ENEMY: u8 = 1;
@@ -115,13 +137,22 @@ const ABILITY_WIS: u8 = 7;
 const ABILITY_DEX: u8 = 8;
 const ABILITY_LUC: u8 = 9;
 
-/// One active "stat buff" effect on the caster (self-only, matching the
-/// heal system's existing no-ally-targeting scope). Its bonuses are added
-/// directly into a copy of the caster's equipment stats (see
-/// `equipment_stats_with_buffs`) before computing `CharacterStats`, the
-/// same way equipment bonuses already work -- so `str`/`hp`/etc. below
-/// are deltas, not absolute values. Re-casting the same `skill_id`
-/// replaces (refreshes) any existing entry rather than stacking.
+/// One active buff effect on the caster (self-only, matching this
+/// project's no-ally-targeting scope). Covers BOTH `TypeDetail == 82`
+/// (flat stat bonuses, added into a copy of the caster's equipment stats
+/// via `equipment_stats_with_buffs` before computing `CharacterStats` --
+/// so `strength`/`max_hp`/etc. below are deltas, not absolute values) AND
+/// `TypeDetail == 81` (periodic heal-over-time, `heal_hp/sp/mp` +
+/// `next_tick_at`) as the SAME kind of object -- matching Imgeneus's own
+/// architecture, where a periodic heal is just one more `Buff` with its
+/// own tick timer, not a separate mechanic. A single skill can in
+/// principle carry both a stat bonus and a heal tick at once; both are
+/// just fields on this one struct, applied independently.
+///
+/// Cast ONCE, not re-cast every tick: `ends_at` is the single duration
+/// set at cast time, and only expiring (removed + `BUFF_REMOVE` sent)
+/// drops it -- re-casting the same `skill_id` before then just refreshes
+/// this same entry (reusing its `id`) rather than stacking a second one.
 pub(crate) struct ActiveBuff {
     id: u32,
     skill_id: u16,
@@ -136,6 +167,17 @@ pub(crate) struct ActiveBuff {
     max_hp: u32,
     max_mp: u32,
     max_sp: u32,
+    /// `Skills.TimeHealHP/TimeHealSP/TimeHealMP` -- flat, never WIS-scaled
+    /// (confirmed by the user), restored every `PERIODIC_HEAL_TICK` while
+    /// this buff is active, plus once more as a bonus final tick exactly
+    /// when it expires (confirmed by the user against native-client
+    /// testing), even if that doesn't land on a 3-second boundary.
+    heal_hp: u32,
+    heal_sp: u32,
+    heal_mp: u32,
+    /// `None` for a buff with no heal component (`heal_hp`/`heal_sp`/
+    /// `heal_mp` all zero); `Some(next tick time)` otherwise.
+    next_tick_at: Option<Instant>,
 }
 
 /// Merges every active buff's stat deltas into a copy of `equipment` --
@@ -161,24 +203,6 @@ pub(crate) fn equipment_stats_with_buffs(mut equipment: DbEquipmentStats, active
     equipment
 }
 
-/// One active "heal over time" effect on the caster (self-only, matching
-/// this project's current no-ally-targeting scope for healing). Re-casting
-/// the same `skill_id` replaces (refreshes) any existing entry rather than
-/// stacking a second one.
-pub(crate) struct ActiveHeal {
-    skill_id: u16,
-    skill_level: u8,
-    /// Mirrors whichever opcode the original cast request came in on (see
-    /// module doc) -- every tick's ack reuses it, matching the confirmed
-    /// request/response opcode symmetry.
-    response_opcode: Opcode,
-    ends_at: Instant,
-    next_tick_at: Instant,
-    heal_hp: u32,
-    heal_sp: u32,
-    heal_mp: u32,
-}
-
 /// A skill whose `ReadyTime` (cast time) hasn't elapsed yet. Stores
 /// exactly what's needed to re-invoke `resolve_skill_use` once `ready_at`
 /// passes, fully re-validating everything at that point rather than
@@ -188,6 +212,12 @@ pub(crate) struct PendingCast {
     number: u8,
     request_opcode: Opcode,
     ready_at: Instant,
+    /// The target mob's position when casting started (`None` for a
+    /// no-real-target skill, e.g. `TARGET_TYPE_ENEMIES_NEAR_CASTER`) --
+    /// used at resolution time for the lenient `SKILL_TARGET_ESCAPE_RANGE`
+    /// check instead of re-checking the skill's own tight attack_range
+    /// against the target's current position.
+    target_pos_at_cast: Option<(f32, f32)>,
 }
 
 fn build_cast_started(sender_id: u32, target_id: u32, skill_id: u16, skill_level: u8) -> Result<Vec<u8>> {
@@ -215,7 +245,7 @@ fn build_skill_used_sp_mp(sp: u32, mp: u32) -> Result<Vec<u8>> {
 
 fn build_skill_use_result(
     response_opcode: Opcode,
-    target_type: u8,
+    attack_result: u8,
     sender_id: u32,
     target_id: u32,
     skill_id: u16,
@@ -225,7 +255,7 @@ fn build_skill_use_result(
     mana: u16,
 ) -> Result<Vec<u8>> {
     let mut packet = PacketWriter::new(response_opcode);
-    packet.write_u8(target_type);
+    packet.write_u8(attack_result);
     packet.write_u32(sender_id);
     packet.write_u32(target_id);
     packet.write_u16(skill_id);
@@ -253,6 +283,28 @@ fn build_skill_extra_damage_result(
     packet.write_u16(health);
     packet.write_u16(stamina);
     packet.write_u16(mana);
+    packet.into_bytes()
+}
+
+/// One periodic tick of an already-active buff (see `Opcode::SkillKeep`'s
+/// doc) -- NOT a fresh skill use. `health`/`mana`/`stamina` carry the
+/// actual amount restored/changed by this specific tick (unlike the
+/// skill-use ack, which never carries a heal amount).
+fn build_skill_keep(
+    character_id: u32,
+    skill_id: u16,
+    skill_level: u8,
+    health: u16,
+    mana: u16,
+    stamina: u16,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::SkillKeep);
+    packet.write_u32(character_id);
+    packet.write_u16(skill_id);
+    packet.write_u8(skill_level);
+    packet.write_u16(health);
+    packet.write_u16(mana);
+    packet.write_u16(stamina);
     packet.into_bytes()
 }
 
@@ -318,13 +370,13 @@ pub(crate) fn handle_use_skill(
     target_mob_id: u32,
     number: u8,
     request_opcode: Opcode,
+    mounted: bool,
     pending_cast: &mut Option<PendingCast>,
     active_character: &mut Option<DbCharacter>,
     connected_player: &Option<Arc<ConnectedPlayer>>,
     active_items: &[DbCharacterItem],
     active_skills: &[DbCharacterSkill],
     skill_cooldowns: &mut HashMap<u16, Instant>,
-    active_heals: &mut Vec<ActiveHeal>,
     active_buffs: &mut Vec<ActiveBuff>,
     db_conn: &mut db::Db,
     stream: &mut TcpStream,
@@ -336,6 +388,14 @@ pub(crate) fn handle_use_skill(
         logger.line("Rapture World rejected skill use without active character");
         return Ok(());
     };
+
+    if mounted {
+        logger.line(format!(
+            "Rapture World rejected skill use while mounted character_id={}",
+            character.id
+        ));
+        return Ok(());
+    }
 
     if pending_cast.is_some() {
         logger.line(format!(
@@ -369,12 +429,12 @@ pub(crate) fn handle_use_skill(
             target_mob_id,
             number,
             request_opcode,
+            None,
             active_character,
             connected_player,
             active_items,
             active_skills,
             skill_cooldowns,
-            active_heals,
             active_buffs,
             db_conn,
             stream,
@@ -420,6 +480,27 @@ pub(crate) fn handle_use_skill(
         target_mob_id
     };
 
+    // Captured now (cast start) so resolution time can use the lenient
+    // SKILL_TARGET_ESCAPE_RANGE check against THIS position instead of
+    // re-checking the skill's tight attack_range against wherever the
+    // target has since wandered to. No real mob target exists for a
+    // self/around-caster cast, so there's nothing to capture (and nothing
+    // that can "escape") in that case.
+    let target_pos_at_cast = if cast_target_id == character.id
+        || definition.target_type == TARGET_TYPE_ENEMIES_NEAR_CASTER
+    {
+        None
+    } else {
+        let Some(mob) = mob_by_id(character.map_id, target_mob_id) else {
+            logger.line(format!(
+                "Rapture World rejected skill use: unknown mob target_mob_id={target_mob_id} character_id={}",
+                character.id
+            ));
+            return Ok(());
+        };
+        Some((mob.pos_x, mob.pos_z))
+    };
+
     if let Some(send) = aes_send.as_mut() {
         send_encrypted(stream, send, use_expanded_send_key, build_auto_attack_stop()?, "0x0212 auto attack stop (casting)", logger)?;
         send_encrypted(
@@ -442,6 +523,7 @@ pub(crate) fn handle_use_skill(
         number,
         request_opcode,
         ready_at: Instant::now() + Duration::from_millis(cast_time_ms),
+        target_pos_at_cast,
     });
 
     Ok(())
@@ -450,7 +532,7 @@ pub(crate) fn handle_use_skill(
 /// Checks the connection's single in-progress `PendingCast` (if any) and
 /// resolves it via `resolve_skill_use` once `ready_at` has passed. Called
 /// once per connection-loop iteration (see main.rs), same as
-/// `process_active_heals`. Movement cancels a pending cast directly in
+/// `process_active_buffs`. Movement cancels a pending cast directly in
 /// main.rs's `CharacterMove` handling (confirmed by Imgeneus's
 /// `SkillCastingManager` canceling on move) rather than here.
 #[allow(clippy::too_many_arguments)]
@@ -461,7 +543,6 @@ pub(crate) fn process_pending_cast(
     active_items: &[DbCharacterItem],
     active_skills: &[DbCharacterSkill],
     skill_cooldowns: &mut HashMap<u16, Instant>,
-    active_heals: &mut Vec<ActiveHeal>,
     active_buffs: &mut Vec<ActiveBuff>,
     db_conn: &mut db::Db,
     stream: &mut TcpStream,
@@ -479,18 +560,19 @@ pub(crate) fn process_pending_cast(
     let target_mob_id = cast.target_mob_id;
     let number = cast.number;
     let request_opcode = cast.request_opcode;
+    let target_pos_at_cast = cast.target_pos_at_cast;
     *pending_cast = None;
 
     resolve_skill_use(
         target_mob_id,
         number,
         request_opcode,
+        target_pos_at_cast,
         active_character,
         connected_player,
         active_items,
         active_skills,
         skill_cooldowns,
-        active_heals,
         active_buffs,
         db_conn,
         stream,
@@ -519,12 +601,12 @@ fn resolve_skill_use(
     target_mob_id: u32,
     number: u8,
     request_opcode: Opcode,
+    target_pos_at_cast: Option<(f32, f32)>,
     active_character: &mut Option<DbCharacter>,
     connected_player: &Option<Arc<ConnectedPlayer>>,
     active_items: &[DbCharacterItem],
     active_skills: &[DbCharacterSkill],
     skill_cooldowns: &mut HashMap<u16, Instant>,
-    active_heals: &mut Vec<ActiveHeal>,
     active_buffs: &mut Vec<ActiveBuff>,
     db_conn: &mut db::Db,
     stream: &mut TcpStream,
@@ -584,10 +666,13 @@ fn resolve_skill_use(
         return Ok(());
     }
 
-    // Stat buff (`TypeDetail == 82`): applies flat AbilityType bonuses for
-    // KeepTime seconds instead of anything instant. Self-only, same scope
-    // limitation as heals.
-    if definition.type_detail == TYPE_DETAIL_BUFF {
+    // Stat buff (`TypeDetail == 82`) and periodic heal (`TypeDetail == 81`)
+    // are the SAME kind of effect (a single cast starting a timed
+    // `ActiveBuff`, not applying anything instantly) -- both go through
+    // `start_buff`, which reads whichever of AbilityType/TimeHealHP fields
+    // are actually populated on this skill's row (the other is simply
+    // zero). Self-only, same scope limitation as instant heal below.
+    if definition.type_detail == TYPE_DETAIL_BUFF || definition.type_detail == TYPE_DETAIL_PERIODIC_HEAL {
         start_buff(
             &character,
             &definition,
@@ -598,30 +683,6 @@ fn resolve_skill_use(
             active_character,
             connected_player,
             active_items,
-            db_conn,
-            stream,
-            aes_send,
-            use_expanded_send_key,
-            logger,
-        )?;
-        return Ok(());
-    }
-
-    // Periodic heal (`TypeDetail == 81`): starts/refreshes a ticking
-    // "heal over time" effect instead of applying anything instantly --
-    // still pays the cast's own MP/SP cost and cooldown right away, same
-    // as any other skill use. Self-only, same scope limitation as the
-    // instant heal below.
-    if definition.type_detail == TYPE_DETAIL_PERIODIC_HEAL {
-        start_periodic_heal(
-            &character,
-            &definition,
-            known_skill,
-            request_opcode,
-            skill_cooldowns,
-            active_heals,
-            active_character,
-            connected_player,
             db_conn,
             stream,
             aes_send,
@@ -680,14 +741,36 @@ fn resolve_skill_use(
             return Ok(());
         }
 
-        let distance = distance_xz(character.pos_x, character.pos_z, mob.pos_x, mob.pos_z);
-        let allowed_range = f32::from(definition.attack_range).max(1.0) + SKILL_RANGE_GRACE;
-        if distance > allowed_range {
-            logger.line(format!(
-                "Rapture World rejected skill use: out of range skill_id={} distance={distance:.2} range={} allowed_range={allowed_range:.2} character_id={}",
-                known_skill.skill_id, definition.attack_range, character.id
-            ));
-            return Ok(());
+        // A skill with a cast time already validated the target existed
+        // (and captured its position) back at cast start -- see
+        // `handle_use_skill`'s `target_pos_at_cast` doc. Re-checking the
+        // skill's own tight attack_range against wherever the target has
+        // since wandered to (the previous behavior) failed constantly on
+        // completely ordinary target movement during a multi-second cast
+        // bar. Instead, only fail if the target moved further than
+        // SKILL_TARGET_ESCAPE_RANGE from where it stood when casting
+        // began -- an instant (no cast time) skill has no such window and
+        // still uses the normal tight range check against the caster's
+        // current position.
+        if let Some((cast_x, cast_z)) = target_pos_at_cast {
+            let escape_distance = distance_xz(cast_x, cast_z, mob.pos_x, mob.pos_z);
+            if escape_distance > SKILL_TARGET_ESCAPE_RANGE {
+                logger.line(format!(
+                    "Rapture World rejected skill use: target escaped during cast skill_id={} escape_distance={escape_distance:.2} character_id={}",
+                    known_skill.skill_id, character.id
+                ));
+                return Ok(());
+            }
+        } else {
+            let distance = distance_xz(character.pos_x, character.pos_z, mob.pos_x, mob.pos_z);
+            let allowed_range = f32::from(definition.attack_range).max(1.0) + SKILL_RANGE_GRACE;
+            if distance > allowed_range {
+                logger.line(format!(
+                    "Rapture World rejected skill use: out of range skill_id={} distance={distance:.2} range={} allowed_range={allowed_range:.2} character_id={}",
+                    known_skill.skill_id, definition.attack_range, character.id
+                ));
+                return Ok(());
+            }
         }
 
         match definition.target_type {
@@ -762,6 +845,31 @@ fn resolve_skill_use(
         definition.sp_cost,
     ));
 
+    // The skill-use ack is otherwise only ever sent per-target, inside
+    // apply_skill_hit_to_mob below -- for an around-caster AoE that hits
+    // nothing (no mob in range), that loop never runs, so the client was
+    // never told the skill was used at all: no cast animation, no visual
+    // cooldown, nothing but the MP/SP already deducted above (confirmed
+    // by the user). A self-targeted ack (same shape used for heal/buff
+    // casts) covers exactly this case without duplicating anything in the
+    // already-working "hit at least one mob" case, which doesn't need it.
+    if targets.is_empty() {
+        let response = build_skill_use_result(
+            request_opcode,
+            SKILL_RESULT_NORMAL,
+            character.id,
+            character.id,
+            known_skill.skill_id,
+            known_skill.skill_level,
+            0,
+            0,
+            0,
+        )?;
+        if let Some(send) = aes_send.as_mut() {
+            send_encrypted(stream, send, use_expanded_send_key, response, "0x0517/0x0511 skill use (no targets hit)", logger)?;
+        }
+    }
+
     for target_id in targets {
         apply_skill_hit_to_mob(
             target_id,
@@ -824,9 +932,13 @@ fn apply_skill_hit_to_mob(
         return Ok(());
     };
 
+    // A damaging skill provokes retaliation aggro the same way an auto-attack
+    // does (see combat::process_auto_attack_swing).
+    set_mob_aggro(character.map_id, target_mob_id, character.id);
+
     let response = build_skill_use_result(
         request_opcode,
-        SKILL_TARGET_TYPE_MOB,
+        SKILL_RESULT_NORMAL,
         character.id,
         main_result.mob.id,
         known_skill.skill_id,
@@ -835,8 +947,20 @@ fn apply_skill_hit_to_mob(
         0,
         0,
     )?;
-    if let Some(send) = aes_send.as_mut() {
-        send_encrypted(stream, send, use_expanded_send_key, response, "0x0517/0x0511 skill use", logger)?;
+    // BROADCAST to everyone near the mob (including the caster), NOT just
+    // the caster -- this matches how auto-attack sends its 0x0503 (which
+    // works) and how Imgeneus sends both attacks and skill hits
+    // (`Character_OnUsedSkill` -> all players via GetAllPlayers). Sending
+    // this only to the caster (the previous behavior) is the confirmed
+    // cause of the "skill damage is logged correctly but the target's HP
+    // bar snaps to 0" bug: the client apparently only updates a mob's HP
+    // bar from combat packets received through the area-broadcast channel
+    // (the same one it learns about nearby players' combat through,
+    // including its own), so a caster-only skill ack never drove the HP
+    // update the way the broadcast auto-attack packet did. Also means
+    // other nearby players now actually see skill hits land.
+    for player in players_on_map_near(character.map_id, main_result.mob.pos_x, main_result.mob.pos_z, COMBAT_RADIUS) {
+        player.send_packet(&response, "0x0517/0x0511 skill use", logger)?;
     }
 
     let main_killed = main_result.killed;
@@ -878,15 +1002,9 @@ fn apply_skill_hit_to_mob(
                 0,
                 0,
             )?;
-            if let Some(send) = aes_send.as_mut() {
-                send_encrypted(
-                    stream,
-                    send,
-                    use_expanded_send_key,
-                    extra_response,
-                    "0x051A skill extra damage",
-                    logger,
-                )?;
+            // Broadcast like the main hit above (same reasoning).
+            for player in players_on_map_near(character.map_id, extra_result.mob.pos_x, extra_result.mob.pos_z, COMBAT_RADIUS) {
+                player.send_packet(&extra_response, "0x051A skill extra damage", logger)?;
             }
 
             resolve_mob_damage_result(
@@ -903,6 +1021,41 @@ fn apply_skill_hit_to_mob(
                 use_expanded_send_key,
                 logger,
             )?;
+        }
+    }
+
+    // Independent of the instant DamageHP/AddDamageHP hits above -- a
+    // skill can deal both (e.g. "Meteor") or a DoT alone with
+    // DamageHP == 0 (e.g. "Poison"), confirmed by the user. No point
+    // starting a DoT on a mob the main hit already killed.
+    if !main_killed
+        && (definition.time_damage_hp > 0 || definition.time_damage_sp > 0 || definition.time_damage_mp > 0)
+    {
+        apply_dot_to_mob(
+            character.map_id,
+            target_mob_id,
+            character.id,
+            known_skill.skill_id,
+            known_skill.skill_level,
+            definition.time_damage_hp.max(0) as u32,
+            u64::from(definition.keep_time),
+        );
+        logger.line(format!(
+            "Rapture World skill dot started character_id={} skill_id={} level={} mob_global_id={target_mob_id} keep_time={} tick_hp={}",
+            character.id, known_skill.skill_id, known_skill.skill_level, definition.keep_time, definition.time_damage_hp
+        ));
+
+        // Confirmed via capture: everyone near the mob sees its debuff
+        // icon, not just the caster (unlike the skill-use ack above).
+        if let Ok(debuff_packet) = build_mob_debuff_add(
+            MOB_DEBUFF_TYPE_DOT,
+            target_mob_id,
+            known_skill.skill_id,
+            known_skill.skill_level,
+        ) {
+            for player in players_on_map_near(character.map_id, main_result.mob.pos_x, main_result.mob.pos_z, COMBAT_RADIUS) {
+                let _ = player.send_packet(&debuff_packet, "0x030C mob debuff add", logger);
+            }
         }
     }
 
@@ -1019,7 +1172,7 @@ fn apply_heal_skill(
 
     let response = build_skill_use_result(
         request_opcode,
-        SKILL_TARGET_TYPE_SELF,
+        SKILL_RESULT_NORMAL,
         character.id,
         character.id,
         known_skill.skill_id,
@@ -1041,221 +1194,6 @@ fn apply_heal_skill(
             "0x0521 current hp/mp/sp after heal",
             logger,
         )?;
-    }
-
-    Ok(())
-}
-
-/// Starts (or refreshes, if the same skill is already ticking) a periodic
-/// heal-over-time effect on the caster: pays the cast's own MP/SP cost and
-/// starts its cooldown immediately, same as any other skill use, but
-/// doesn't restore anything until the first 3-second tick (see
-/// `process_active_heals`). `TimeHealHP/SP/MP` never scale with WIS
-/// (confirmed by the user), unlike instant `HealHP`.
-#[allow(clippy::too_many_arguments)]
-fn start_periodic_heal(
-    character: &DbCharacter,
-    definition: &DbSkillDefinition,
-    known_skill: &DbCharacterSkill,
-    request_opcode: Opcode,
-    skill_cooldowns: &mut HashMap<u16, Instant>,
-    active_heals: &mut Vec<ActiveHeal>,
-    active_character: &mut Option<DbCharacter>,
-    connected_player: &Option<Arc<ConnectedPlayer>>,
-    db_conn: &mut db::Db,
-    stream: &mut TcpStream,
-    aes_send: &mut Option<AesCtr>,
-    use_expanded_send_key: bool,
-    logger: &Logger,
-) -> Result<()> {
-    skill_cooldowns.insert(
-        known_skill.skill_id,
-        Instant::now() + Duration::from_secs(u64::from(definition.reset_time_seconds)),
-    );
-    db::set_character_skill_cooldown(
-        db_conn,
-        character.id,
-        known_skill.skill_id,
-        definition.reset_time_seconds,
-    )?;
-
-    let new_mp = character.current_mp.saturating_sub(u32::from(definition.mp_cost));
-    let new_sp = character.current_sp.saturating_sub(u32::from(definition.sp_cost));
-    db::set_character_status(db_conn, character.id, character.current_hp, new_mp, new_sp)?;
-    if let Some(active) = active_character.as_mut() {
-        active.current_mp = new_mp;
-        active.current_sp = new_sp;
-        if let Some(player) = connected_player.as_ref() {
-            player.update_character(active.clone());
-        }
-    }
-    if let Some(send) = aes_send.as_mut() {
-        send_encrypted(
-            stream,
-            send,
-            use_expanded_send_key,
-            build_skill_used_sp_mp(u32::from(definition.sp_cost), u32::from(definition.mp_cost))?,
-            "0x050C skill used sp/mp",
-            logger,
-        )?;
-    }
-
-    let now = Instant::now();
-    active_heals.retain(|heal| heal.skill_id != known_skill.skill_id);
-    active_heals.push(ActiveHeal {
-        skill_id: known_skill.skill_id,
-        skill_level: known_skill.skill_level,
-        response_opcode: request_opcode,
-        ends_at: now + Duration::from_secs(u64::from(definition.keep_time)),
-        next_tick_at: now + PERIODIC_HEAL_TICK,
-        heal_hp: definition.time_heal_hp.max(0) as u32,
-        heal_sp: definition.time_heal_sp.max(0) as u32,
-        heal_mp: definition.time_heal_mp.max(0) as u32,
-    });
-
-    logger.line(format!(
-        "Rapture World skill periodic heal started character_id={} skill_id={} level={} keep_time={} tick_hp={} tick_sp={} tick_mp={} mp_cost={} sp_cost={}",
-        character.id,
-        known_skill.skill_id,
-        known_skill.skill_level,
-        definition.keep_time,
-        definition.time_heal_hp,
-        definition.time_heal_sp,
-        definition.time_heal_mp,
-        definition.mp_cost,
-        definition.sp_cost,
-    ));
-
-    // Ack the cast itself with a zero-amount result -- nothing is restored
-    // until the first tick fires.
-    let response = build_skill_use_result(
-        request_opcode,
-        SKILL_TARGET_TYPE_SELF,
-        character.id,
-        character.id,
-        known_skill.skill_id,
-        known_skill.skill_level,
-        0,
-        0,
-        0,
-    )?;
-    if let Some(send) = aes_send.as_mut() {
-        send_encrypted(stream, send, use_expanded_send_key, response, "0x0517/0x0511 skill periodic heal cast", logger)?;
-    }
-
-    Ok(())
-}
-
-/// Applies every due tick of every active periodic heal on the caller's
-/// own character, and drops any effect whose duration has expired. Called
-/// once per connection-loop iteration (see main.rs) so a 3-second cadence
-/// is kept regardless of whether the client is otherwise sending packets --
-/// the same approach already used for auto-attack swings.
-///
-/// Not yet confirmed against a real capture: the per-tick ack reuses
-/// 0x0517 (like the instant heal) since periodic ticks have never been
-/// captured, and a 0x0521 current-hitpoints refresh is sent alongside each
-/// tick to make sure the client's bars visibly move.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn process_active_heals(
-    active_heals: &mut Vec<ActiveHeal>,
-    active_character: &mut Option<DbCharacter>,
-    connected_player: &Option<Arc<ConnectedPlayer>>,
-    active_items: &[DbCharacterItem],
-    db_conn: &mut db::Db,
-    stream: &mut TcpStream,
-    aes_send: &mut Option<AesCtr>,
-    use_expanded_send_key: bool,
-    logger: &Logger,
-) -> Result<()> {
-    if active_heals.is_empty() {
-        return Ok(());
-    }
-
-    let now = Instant::now();
-    active_heals.retain(|heal| heal.ends_at > now);
-    if active_heals.is_empty() {
-        return Ok(());
-    }
-
-    if active_character.is_none() {
-        return Ok(());
-    }
-    let character_id = active_character.as_ref().unwrap().id;
-
-    // Re-reads `active_character` fresh on every iteration (rather than
-    // working off one clone taken before the loop) so that a second tick
-    // due in the same pass -- either a different active heal, or this same
-    // one on an unusually long-delayed loop wakeup -- sees the first
-    // tick's already-applied HP/MP/SP instead of stale pre-loop values.
-    for index in 0..active_heals.len() {
-        if active_heals[index].next_tick_at > now {
-            continue;
-        }
-        active_heals[index].next_tick_at += PERIODIC_HEAL_TICK;
-
-        let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
-        let stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
-
-        let heal = &active_heals[index];
-        let new_effective_hp = stats.current_hp.saturating_add(heal.heal_hp).min(stats.max_hp);
-        let new_effective_sp = stats.current_sp.saturating_add(heal.heal_sp).min(stats.max_sp);
-        let new_effective_mp = stats.current_mp.saturating_add(heal.heal_mp).min(stats.max_mp);
-        let actual_heal_hp = new_effective_hp - stats.current_hp;
-        let actual_heal_sp = new_effective_sp - stats.current_sp;
-        let actual_heal_mp = new_effective_mp - stats.current_mp;
-        let skill_id = heal.skill_id;
-        let skill_level = heal.skill_level;
-        let response_opcode = heal.response_opcode;
-
-        let current = active_character.as_ref().unwrap();
-        let new_hp = current.current_hp.saturating_add(actual_heal_hp);
-        let new_mp = current.current_mp.saturating_add(actual_heal_mp);
-        let new_sp = current.current_sp.saturating_add(actual_heal_sp);
-
-        db::set_character_status(db_conn, character_id, new_hp, new_mp, new_sp)?;
-        if let Some(active) = active_character.as_mut() {
-            active.current_hp = new_hp;
-            active.current_mp = new_mp;
-            active.current_sp = new_sp;
-            if let Some(player) = connected_player.as_ref() {
-                player.update_character(active.clone());
-            }
-        }
-
-        logger.line(format!(
-            "Rapture World skill periodic heal tick character_id={character_id} skill_id={skill_id} level={skill_level} heal_hp={actual_heal_hp} heal_sp={actual_heal_sp} heal_mp={actual_heal_mp}"
-        ));
-
-        // Zero health/stamina/mana here too, matching the confirmed
-        // instant-heal capture (this ack doesn't carry the restored
-        // amount) -- the 0x0521 refresh right below is what actually
-        // moves the client's bars.
-        let response = build_skill_use_result(
-            response_opcode,
-            SKILL_TARGET_TYPE_SELF,
-            character_id,
-            character_id,
-            skill_id,
-            skill_level,
-            0,
-            0,
-            0,
-        )?;
-        if let Some(send) = aes_send.as_mut() {
-            send_encrypted(stream, send, use_expanded_send_key, response, "0x0517/0x0511 skill periodic heal tick", logger)?;
-
-            let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
-            let refreshed_stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
-            send_encrypted(
-                stream,
-                send,
-                use_expanded_send_key,
-                build_current_hitpoints(&refreshed_stats)?,
-                "0x0521 current hp/mp/sp after periodic heal tick",
-                logger,
-            )?;
-        }
     }
 
     Ok(())
@@ -1291,11 +1229,15 @@ fn apply_ability_to_buff(buff: &mut ActiveBuff, ability_type: u8, ability_value:
     }
 }
 
-/// Starts (or refreshes) a stat buff on the caster: pays the cast's own
-/// MP/SP cost and cooldown immediately, applies the skill's flat
-/// `AbilityType`/`AbilityValue` bonuses for `KeepTime` seconds, and
-/// refreshes the client's stat display packets. Self-only (see module
-/// doc); UNCONFIRMED against a real capture (see `Opcode::BuffAdd`).
+/// Starts (or refreshes) a buff on the caster: pays the cast's own MP/SP
+/// cost and cooldown immediately, applies the skill's flat
+/// `AbilityType`/`AbilityValue` bonuses AND/OR `TimeHealHP/SP/MP` (a skill
+/// row populates whichever is relevant to it; the other reads as all
+/// zero) for `KeepTime` seconds, and refreshes the client's stat display
+/// packets. Self-only (see module doc); UNCONFIRMED against a real
+/// capture (see `Opcode::BuffAdd`). Confirmed by the user: a periodic
+/// heal is cast ONCE here, not re-cast every tick -- ticking happens
+/// entirely in `process_active_buffs`.
 #[allow(clippy::too_many_arguments)]
 fn start_buff(
     character: &DbCharacter,
@@ -1356,11 +1298,16 @@ fn start_buff(
         .find(|existing| existing.skill_id == known_skill.skill_id)
         .map(|existing| existing.id)
         .unwrap_or_else(|| active_buffs.iter().map(|buff| buff.id).max().unwrap_or(0) + 1);
+    let now = Instant::now();
+    let heal_hp = definition.time_heal_hp.max(0) as u32;
+    let heal_sp = definition.time_heal_sp.max(0) as u32;
+    let heal_mp = definition.time_heal_mp.max(0) as u32;
+    let has_heal_component = heal_hp > 0 || heal_sp > 0 || heal_mp > 0;
     let mut buff = ActiveBuff {
         id: buff_id,
         skill_id: known_skill.skill_id,
         skill_level: known_skill.skill_level,
-        ends_at: Instant::now() + Duration::from_secs(u64::from(definition.keep_time)),
+        ends_at: now + Duration::from_secs(u64::from(definition.keep_time)),
         strength: 0,
         reaction: 0,
         intelligence: 0,
@@ -1370,6 +1317,13 @@ fn start_buff(
         max_hp: 0,
         max_mp: 0,
         max_sp: 0,
+        heal_hp,
+        heal_sp,
+        heal_mp,
+        // Ticks start after the first 3-second interval, not immediately
+        // at cast time -- matches the instant-heal ack precedent (nothing
+        // is restored until a tick actually fires).
+        next_tick_at: has_heal_component.then(|| now + PERIODIC_HEAL_TICK),
     };
     for index in 0..10 {
         apply_ability_to_buff(&mut buff, definition.ability_type[index], definition.ability_value[index], logger);
@@ -1385,7 +1339,7 @@ fn start_buff(
 
     let response = build_skill_use_result(
         request_opcode,
-        SKILL_TARGET_TYPE_SELF,
+        SKILL_RESULT_NORMAL,
         character.id,
         character.id,
         known_skill.skill_id,
@@ -1436,13 +1390,19 @@ fn start_buff(
     Ok(())
 }
 
-/// Expires any active buff whose duration has ended, removing its stat
-/// bonuses and refreshing the client's stat packets. Called once per
-/// connection-loop iteration (see main.rs), same as `process_active_heals`
-/// and `process_pending_cast`.
+/// Per-iteration buff maintenance: applies every due periodic-heal tick
+/// (every `PERIODIC_HEAL_TICK`, for any buff with a heal component --
+/// see `ActiveBuff::next_tick_at`), applies one bonus FINAL tick to a
+/// heal-carrying buff exactly when it expires (confirmed by the user
+/// against native-client testing, even if that doesn't land on a
+/// 3-second boundary), then removes any buff whose duration has ended
+/// and refreshes the client's stat packets. Called once per
+/// connection-loop iteration (see main.rs), same as `process_pending_cast`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_active_buffs(
     active_buffs: &mut Vec<ActiveBuff>,
     active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
     active_items: &[DbCharacterItem],
     db_conn: &mut db::Db,
     stream: &mut TcpStream,
@@ -1453,67 +1413,145 @@ pub(crate) fn process_active_buffs(
     if active_buffs.is_empty() {
         return Ok(());
     }
+    if active_character.is_none() {
+        return Ok(());
+    }
+    let character_id = active_character.as_ref().unwrap().id;
 
     let now = Instant::now();
-    let expired: Vec<ActiveBuff> = {
-        let mut expired = Vec::new();
-        let mut index = 0;
-        while index < active_buffs.len() {
-            if active_buffs[index].ends_at <= now {
-                expired.push(active_buffs.remove(index));
-            } else {
-                index += 1;
+    let mut removed_ids = Vec::new();
+    let mut index = 0;
+    while index < active_buffs.len() {
+        let is_expiring = active_buffs[index].ends_at <= now;
+        let has_heal = active_buffs[index].heal_hp > 0
+            || active_buffs[index].heal_sp > 0
+            || active_buffs[index].heal_mp > 0;
+        let due_tick = active_buffs[index].next_tick_at.is_some_and(|tick| tick <= now);
+
+        // A tick fires either because it's due on schedule, or because
+        // the buff is expiring right now and carries a heal component --
+        // the latter is the bonus final tick. Never both in the same
+        // pass (this is an `||`, not two separate applications), even if
+        // a scheduled tick happens to land exactly on the expiry moment.
+        if due_tick || (is_expiring && has_heal) {
+            let heal_hp = active_buffs[index].heal_hp;
+            let heal_sp = active_buffs[index].heal_sp;
+            let heal_mp = active_buffs[index].heal_mp;
+            let skill_id = active_buffs[index].skill_id;
+            let skill_level = active_buffs[index].skill_level;
+
+            let equipment_stats =
+                equipment_stats_with_buffs(db::get_equipment_stats(db_conn, active_items)?, active_buffs);
+            let stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
+            let new_effective_hp = stats.current_hp.saturating_add(heal_hp).min(stats.max_hp);
+            let new_effective_sp = stats.current_sp.saturating_add(heal_sp).min(stats.max_sp);
+            let new_effective_mp = stats.current_mp.saturating_add(heal_mp).min(stats.max_mp);
+            let actual_heal_hp = new_effective_hp - stats.current_hp;
+            let actual_heal_sp = new_effective_sp - stats.current_sp;
+            let actual_heal_mp = new_effective_mp - stats.current_mp;
+
+            let current = active_character.as_ref().unwrap();
+            let new_hp = current.current_hp.saturating_add(actual_heal_hp);
+            let new_mp = current.current_mp.saturating_add(actual_heal_mp);
+            let new_sp = current.current_sp.saturating_add(actual_heal_sp);
+
+            db::set_character_status(db_conn, character_id, new_hp, new_mp, new_sp)?;
+            if let Some(active) = active_character.as_mut() {
+                active.current_hp = new_hp;
+                active.current_mp = new_mp;
+                active.current_sp = new_sp;
+                if let Some(player) = connected_player.as_ref() {
+                    player.update_character(active.clone());
+                }
+            }
+
+            logger.line(format!(
+                "Rapture World buff heal tick character_id={character_id} skill_id={skill_id} level={skill_level} heal_hp={actual_heal_hp} heal_sp={actual_heal_sp} heal_mp={actual_heal_mp}{}",
+                if is_expiring { " (final tick)" } else { "" }
+            ));
+
+            // Uses SkillKeep (0x050F), NOT the skill-use ack -- re-sending
+            // 0x0511/0x0517 on every tick (the previous approach) made the
+            // client visibly treat each tick as the skill being
+            // automatically re-cast, confirmed by the user. SkillKeep
+            // carries the actual per-tick amounts, unlike the skill-use
+            // ack, which never carries a heal amount.
+            let response = build_skill_keep(
+                character_id,
+                skill_id,
+                skill_level,
+                actual_heal_hp.min(u32::from(u16::MAX)) as u16,
+                actual_heal_mp.min(u32::from(u16::MAX)) as u16,
+                actual_heal_sp.min(u32::from(u16::MAX)) as u16,
+            )?;
+            if let Some(send) = aes_send.as_mut() {
+                send_encrypted(stream, send, use_expanded_send_key, response, "0x050F buff heal tick", logger)?;
+
+                let equipment_stats =
+                    equipment_stats_with_buffs(db::get_equipment_stats(db_conn, active_items)?, active_buffs);
+                let refreshed_stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
+                send_encrypted(
+                    stream,
+                    send,
+                    use_expanded_send_key,
+                    build_current_hitpoints(&refreshed_stats)?,
+                    "0x0521 current hp/mp/sp after buff heal tick",
+                    logger,
+                )?;
+            }
+
+            if !is_expiring {
+                if let Some(next) = active_buffs[index].next_tick_at.as_mut() {
+                    *next += PERIODIC_HEAL_TICK;
+                }
             }
         }
-        expired
-    };
-    if expired.is_empty() {
-        return Ok(());
-    }
 
-    let Some(character) = active_character.as_ref() else {
-        return Ok(());
-    };
-    let character_id = character.id;
-
-    for buff in &expired {
-        logger.line(format!(
-            "Rapture World skill buff expired character_id={character_id} skill_id={} level={}",
-            buff.skill_id, buff.skill_level
-        ));
-    }
-
-    if let Some(send) = aes_send.as_mut() {
-        for buff in &expired {
-            send_encrypted(stream, send, use_expanded_send_key, build_buff_remove(buff.id)?, "0x050E buff remove", logger)?;
+        if is_expiring {
+            let buff = active_buffs.remove(index);
+            logger.line(format!(
+                "Rapture World skill buff expired character_id={character_id} skill_id={} level={}",
+                buff.skill_id, buff.skill_level
+            ));
+            removed_ids.push(buff.id);
+        } else {
+            index += 1;
         }
+    }
 
-        let equipment_stats = equipment_stats_with_buffs(db::get_equipment_stats(db_conn, active_items)?, active_buffs);
-        let refreshed_stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
-        send_encrypted(
-            stream,
-            send,
-            use_expanded_send_key,
-            build_character_additional_stats(&refreshed_stats)?,
-            "0x0526 additional stats after buff expiry",
-            logger,
-        )?;
-        send_encrypted(
-            stream,
-            send,
-            use_expanded_send_key,
-            build_max_hp_mp_sp(active_character.as_ref(), &refreshed_stats)?,
-            "0x051F max hp/mp/sp after buff expiry",
-            logger,
-        )?;
-        send_encrypted(
-            stream,
-            send,
-            use_expanded_send_key,
-            build_current_hitpoints(&refreshed_stats)?,
-            "0x0521 current hp/mp/sp after buff expiry",
-            logger,
-        )?;
+    if !removed_ids.is_empty() {
+        if let Some(send) = aes_send.as_mut() {
+            for id in &removed_ids {
+                send_encrypted(stream, send, use_expanded_send_key, build_buff_remove(*id)?, "0x050E buff remove", logger)?;
+            }
+
+            let equipment_stats = equipment_stats_with_buffs(db::get_equipment_stats(db_conn, active_items)?, active_buffs);
+            let refreshed_stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
+            send_encrypted(
+                stream,
+                send,
+                use_expanded_send_key,
+                build_character_additional_stats(&refreshed_stats)?,
+                "0x0526 additional stats after buff expiry",
+                logger,
+            )?;
+            send_encrypted(
+                stream,
+                send,
+                use_expanded_send_key,
+                build_max_hp_mp_sp(active_character.as_ref(), &refreshed_stats)?,
+                "0x051F max hp/mp/sp after buff expiry",
+                logger,
+            )?;
+            send_encrypted(
+                stream,
+                send,
+                use_expanded_send_key,
+                build_current_hitpoints(&refreshed_stats)?,
+                "0x0521 current hp/mp/sp after buff expiry",
+                logger,
+            )?;
+        }
     }
 
     Ok(())
@@ -1560,10 +1598,14 @@ pub(crate) fn restore_active_buffs(
         let Some(definition) = db::get_skill_definition(db_conn, row.skill_id, row.skill_level)? else {
             continue;
         };
-        if definition.type_detail != TYPE_DETAIL_BUFF {
+        if definition.type_detail != TYPE_DETAIL_BUFF && definition.type_detail != TYPE_DETAIL_PERIODIC_HEAL {
             continue;
         }
 
+        let heal_hp = definition.time_heal_hp.max(0) as u32;
+        let heal_sp = definition.time_heal_sp.max(0) as u32;
+        let heal_mp = definition.time_heal_mp.max(0) as u32;
+        let has_heal_component = heal_hp > 0 || heal_sp > 0 || heal_mp > 0;
         let mut buff = ActiveBuff {
             id: active_buffs.len() as u32 + 1,
             skill_id: row.skill_id,
@@ -1578,6 +1620,10 @@ pub(crate) fn restore_active_buffs(
             max_hp: 0,
             max_mp: 0,
             max_sp: 0,
+            heal_hp,
+            heal_sp,
+            heal_mp,
+            next_tick_at: has_heal_component.then(|| now + PERIODIC_HEAL_TICK),
         };
         for index in 0..10 {
             apply_ability_to_buff(&mut buff, definition.ability_type[index], definition.ability_value[index], logger);

@@ -759,13 +759,22 @@ pub(crate) fn parse_cure_command(message: &str) -> Option<Result<Option<String>>
 /// Executes an already-parsed `mmake` command: scatters `count` mobs of
 /// `mob_id` within `radius` of the caller and broadcasts their spawn to
 /// nearby players. Returns the chat response text.
+///
+/// A manually-summoned mob is otherwise a REAL mob of that id -- same
+/// level/HP/money/exp/AI as one placed by a .svmap spawn area, looked up
+/// from PS_GameDefs.dbo.Mobs same as any other mob. The only actual
+/// difference is that it isn't tied to a spawn area and never respawns on
+/// its own after dying (see spawn_mob's doc comment) -- it otherwise lives
+/// indefinitely until killed or cleared with `mera`.
 pub(crate) fn execute_mmake(
     character: &DbCharacter,
     mob_id: u16,
     count: u8,
     radius: f32,
+    db_conn: &mut db::Db,
     logger: &Logger,
 ) -> Result<String> {
+    let definition = db::get_mob_definition(db_conn, mob_id)?;
     let mobs = spawn_mobs_scattered(
         character.map_id,
         mob_id,
@@ -773,6 +782,7 @@ pub(crate) fn execute_mmake(
         character.pos_x,
         character.pos_z,
         radius,
+        definition.as_ref(),
     );
     logger.line(format!(
         "Rapture World mmake character_id={} mob_id={} count={count} radius={radius:.1} map={}",

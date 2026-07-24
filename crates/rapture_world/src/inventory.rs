@@ -256,6 +256,10 @@ pub(crate) struct UseItemPackets {
     pub(crate) use_result: Vec<u8>,
     pub(crate) remove_item: Option<Vec<u8>>,
     pub(crate) current_hitpoints: Option<Vec<u8>>,
+    /// Additional self-packets to send, in order, after the three above.
+    /// Used by the reset-stats stone (0x0214 + max-energy + current-hp);
+    /// empty for every other item.
+    pub(crate) extra_before: Vec<(Vec<u8>, &'static str)>,
 }
 
 pub(crate) fn build_cannot_use_item(character_id: u32) -> Result<UseItemPackets> {
@@ -263,6 +267,7 @@ pub(crate) fn build_cannot_use_item(character_id: u32) -> Result<UseItemPackets>
         use_result: build_use_item_result(character_id, None)?,
         remove_item: None,
         current_hitpoints: None,
+        extra_before: Vec::new(),
     })
 }
 
@@ -369,6 +374,128 @@ pub(crate) fn handle_use_item(
         return build_cannot_use_item(character.id).map(Some);
     };
 
+    // Name-change stone (Special 51): unlike recovery/appearance items, this
+    // has no immediate visual/stat effect -- it just flags the character for a
+    // forced rename on next login (RenameCnt=1) and consumes one unit. The
+    // client shows nothing here; the rename happens at the next character
+    // login (0x010E). Handled before can_apply_consumable_effect, which only
+    // recognises recovery specials and would otherwise reject it.
+    if effect.special == SPECIAL_CHANGE_NAME {
+        if !CONSUMABLE_ITEM_TYPES.contains(&item.item_type) {
+            logger.line(format!(
+                "Rapture World rejected name-change item type={} type_id={} (not a consumable type)",
+                item.item_type, item.type_id
+            ));
+            return build_cannot_use_item(character.id).map(Some);
+        }
+
+        db::set_character_pending_rename(db_conn, character.id)?;
+        character.rename_pending = true;
+
+        let remaining_count = item.count.saturating_sub(1);
+        db::consume_character_item(db_conn, character.id, item.row_id, remaining_count)?;
+        if remaining_count == 0 {
+            items.remove(item_index);
+        } else if let Some(active_item) = items.get_mut(item_index) {
+            active_item.count = remaining_count;
+        }
+
+        let mut result_item = item;
+        result_item.count = remaining_count;
+        logger.line(format!(
+            "Rapture World name-change stone used character_id={} item_type={} type_id={} remaining_count={remaining_count} (RenameCnt=1)",
+            character.id, result_item.item_type, result_item.type_id
+        ));
+
+        // Only the item-consume packet, matching the capture (no 0x0206).
+        return Ok(Some(UseItemPackets {
+            use_result: build_use_item_result(character.id, Some(&result_item))?,
+            remove_item: None,
+            current_hitpoints: None,
+            extra_before: Vec::new(),
+        }));
+    }
+
+    // Reset-stats stone (Special 34): base stats back to BASE_STAT, all
+    // invested points refunded into the available pool. HP/MP/SP columns are
+    // untouched -- the stat-derived portion of the max is recomputed live and
+    // pushed via 0x050B/0x0521 below (REC/WIS/DEX feed max hp/mp/sp, so those
+    // drop). Handled before can_apply_consumable_effect, which would reject it.
+    if effect.special == SPECIAL_RESET_STATS {
+        if !CONSUMABLE_ITEM_TYPES.contains(&item.item_type) {
+            logger.line(format!(
+                "Rapture World rejected reset-stats item type={} type_id={} (not a consumable type)",
+                item.item_type, item.type_id
+            ));
+            return build_cannot_use_item(character.id).map(Some);
+        }
+
+        let base = BASE_STAT as u16;
+        // Reset grants a fresh level-based pool: STAT_POINTS_PER_LEVEL (5) per
+        // level (level 60 -> 300, level 10 -> 50), overwriting whatever was
+        // unspent -- base stats go to 10, so the whole pool is available.
+        let new_stat_point = character
+            .level
+            .saturating_mul(STAT_POINTS_PER_LEVEL);
+
+        character.strength = base;
+        character.reaction = base;
+        character.intelligence = base;
+        character.wisdom = base;
+        character.dexterity = base;
+        character.luck = base;
+        character.stat_point = new_stat_point;
+        db::set_character_reset_stats(db_conn, character.id, base, new_stat_point)?;
+
+        // Recompute derived maxes/current from the now-reset base stats.
+        let equipment_stats = db::get_equipment_stats(db_conn, items)?;
+        let stats = CharacterStats::from_character(Some(character), equipment_stats);
+
+        let remaining_count = item.count.saturating_sub(1);
+        db::consume_character_item(db_conn, character.id, item.row_id, remaining_count)?;
+        if remaining_count == 0 {
+            items.remove(item_index);
+        } else if let Some(active_item) = items.get_mut(item_index) {
+            active_item.count = remaining_count;
+        }
+        let mut result_item = item;
+        result_item.count = remaining_count;
+
+        logger.line(format!(
+            "Rapture World reset stats character_id={} level={} new_stat_point={new_stat_point} max_hp={} max_mp={} max_sp={} remaining_count={remaining_count}",
+            character.id, character.level, stats.max_hp, stats.max_mp, stats.max_sp
+        ));
+
+        // Reset ack, then the new maxes (0=hp,1=sp,2=mp), then the new
+        // current -- maxes before current so the client doesn't clamp current
+        // to the stale (higher) max.
+        let extra_before = vec![
+            (
+                build_stats_reset(
+                    new_stat_point,
+                    character.strength,
+                    character.reaction,
+                    character.intelligence,
+                    character.wisdom,
+                    character.dexterity,
+                    character.luck,
+                )?,
+                "0x0214 stats reset",
+            ),
+            (build_max_energy(Some(character), 0, stats.max_hp)?, "0x050B max hp (reset)"),
+            (build_max_energy(Some(character), 1, stats.max_sp)?, "0x050B max sp (reset)"),
+            (build_max_energy(Some(character), 2, stats.max_mp)?, "0x050B max mp (reset)"),
+            (build_current_hitpoints(&stats)?, "0x0521 current hp/mp/sp (reset)"),
+        ];
+
+        return Ok(Some(UseItemPackets {
+            use_result: build_use_item_result(character.id, Some(&result_item))?,
+            remove_item: None,
+            current_hitpoints: None,
+            extra_before,
+        }));
+    }
+
     if !can_apply_consumable_effect(&item, &effect) {
         logger.line(format!(
             "Rapture World rejected use item type={} type_id={} special={} hp={} mp={} sp={}",
@@ -428,6 +555,119 @@ pub(crate) fn handle_use_item(
         use_result: build_use_item_result(character.id, Some(&result_item))?,
         remove_item: Some(build_remove_item(&result_item, remaining_count == 0)?),
         current_hitpoints: Some(build_current_hitpoints(&recovered_stats)?),
+        extra_before: Vec::new(),
+    }))
+}
+
+pub(crate) struct ChangeAppearancePackets {
+    /// 0x050A item-consume (self only) -- carries the decremented stack.
+    pub(crate) use_result: Vec<u8>,
+    /// 0x0226 appearance broadcast (self + nearby).
+    pub(crate) broadcast: Vec<u8>,
+}
+
+/// Handles 0x0226 ChangeAppearance: validates that (bag, slot) holds a
+/// change-appearance (Special 44) or change-sex (Special 45) consumable,
+/// applies the chosen hair/face/height (and sex, only for a Special-45 item)
+/// to `character`, persists it, and consumes one unit. The sex byte from a
+/// Special-44 item is ignored (an appearance item can never change sex, even
+/// from a modified client). Returns the self item-consume packet and the
+/// appearance broadcast, or None if the request is invalid.
+pub(crate) fn handle_change_appearance(
+    db_conn: &mut db::Db,
+    character: &mut DbCharacter,
+    items: &mut Vec<DbCharacterItem>,
+    payload: &[u8],
+    logger: &Logger,
+) -> Result<Option<ChangeAppearancePackets>> {
+    // [0..2] opcode, then bag, slot, hair, face, height, sex.
+    if payload.len() < 8 {
+        logger.line(format!(
+            "Rapture World change appearance packet too short len={}",
+            payload.len()
+        ));
+        return Ok(None);
+    }
+    let (bag, slot) = (payload[2], payload[3]);
+    let (hair, face, height, sex) = (payload[4], payload[5], payload[6], payload[7]);
+
+    if !is_valid_item_position(bag, slot) {
+        logger.line("Rapture World rejected change appearance with invalid item position");
+        return Ok(None);
+    }
+    let Some(item_index) = find_item_index(items, bag, slot) else {
+        logger.line("Rapture World rejected change appearance because slot is empty");
+        return Ok(None);
+    };
+    let item = items[item_index].clone();
+    if item.count == 0 {
+        logger.line("Rapture World rejected change appearance because item count is zero");
+        return Ok(None);
+    }
+
+    let Some(effect) = db::get_consumable_effect(db_conn, item.item_type, item.type_id)? else {
+        logger.line(format!(
+            "Rapture World rejected change appearance type={} type_id={} (no item definition)",
+            item.item_type, item.type_id
+        ));
+        return Ok(None);
+    };
+
+    let changes_sex = match effect.special {
+        SPECIAL_CHANGE_APPEARANCE => false,
+        SPECIAL_CHANGE_SEX => true,
+        _ => {
+            logger.line(format!(
+                "Rapture World rejected change appearance type={} type_id={} special={} (not an appearance item)",
+                item.item_type, item.type_id, effect.special
+            ));
+            return Ok(None);
+        }
+    };
+    if !CONSUMABLE_ITEM_TYPES.contains(&item.item_type) {
+        logger.line(format!(
+            "Rapture World rejected change appearance type={} type_id={} (not a consumable type)",
+            item.item_type, item.type_id
+        ));
+        return Ok(None);
+    }
+
+    // A Special-44 item never changes sex, regardless of the sex byte sent.
+    // For a Special-45 item, only 0 (male) / 1 (female) are valid.
+    let new_sex = if changes_sex {
+        if sex > 1 {
+            logger.line(format!("Rapture World rejected change sex with invalid sex value {sex}"));
+            return Ok(None);
+        }
+        sex
+    } else {
+        character.gender
+    };
+
+    character.hair = hair;
+    character.face = face;
+    character.height = height;
+    character.gender = new_sex;
+    db::set_character_appearance(db_conn, character.id, hair, face, height, new_sex)?;
+
+    let remaining_count = item.count.saturating_sub(1);
+    db::consume_character_item(db_conn, character.id, item.row_id, remaining_count)?;
+    if remaining_count == 0 {
+        items.remove(item_index);
+    } else if let Some(active_item) = items.get_mut(item_index) {
+        active_item.count = remaining_count;
+    }
+
+    let mut result_item = item;
+    result_item.count = remaining_count;
+    logger.line(format!(
+        "Rapture World change appearance character_id={} special={} hair={hair} face={face} height={height} sex={new_sex} item_type={} type_id={} remaining_count={remaining_count}",
+        character.id, effect.special, result_item.item_type, result_item.type_id
+    ));
+
+    Ok(Some(ChangeAppearancePackets {
+        use_result: build_use_item_result(character.id, Some(&result_item))?,
+        broadcast: build_change_appearance(character.id, hair, face, height, new_sex)?,
     }))
 }
 

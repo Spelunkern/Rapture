@@ -9,6 +9,7 @@ anyhow = "1"
 cipher = "0.4"
 hmac = "0.12"
 num-bigint = "0.4"
+rust-ini = "0.21"
 sha2 = "0.10"
 tiberius = { version = "0.12.3", features = ["tokio", "tokio-util"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }

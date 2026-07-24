@@ -16,11 +16,15 @@ mod character;
 mod chat;
 mod combat;
 mod commands;
+mod compose;
+mod enchant;
+mod gems;
 mod drops;
 mod experience;
 mod inventory;
 mod itemmall;
 mod map_items;
+mod mount;
 mod movement;
 mod protocol;
 mod session;
@@ -39,11 +43,15 @@ use character::*;
 use chat::*;
 use combat::*;
 use commands::*;
+use compose::*;
+use enchant::*;
+use gems::*;
 use drops::*;
 use experience::*;
 use inventory::*;
 use itemmall::*;
 use map_items::*;
+use mount::*;
 use movement::*;
 use protocol::*;
 use session::*;
@@ -193,15 +201,17 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
     // Skill cooldowns (ResetTime), keyed by SkillID -- same reset-on-relog
     // scoping as item_cooldowns above.
     let mut skill_cooldowns: HashMap<u16, Instant> = HashMap::new();
-    // Active periodic heal-over-time effects on this connection's own
-    // character (self-only, see skillcast.rs) -- same reset-on-relog
-    // scoping as the cooldown maps above; ticked every loop iteration by
-    // `process_active_heals`.
-    let mut active_heals: Vec<ActiveHeal> = Vec::new();
-    // Active stat buffs on this connection's own character (self-only,
-    // see skillcast.rs) -- same reset-on-relog scoping as the cooldown
-    // maps above; expired by `process_active_buffs` every loop iteration.
+    // Active buffs on this connection's own character (self-only, see
+    // skillcast.rs) -- covers both stat buffs and periodic heal-over-time
+    // effects (the same kind of object, see ActiveBuff's doc). Same
+    // reset-on-relog scoping as the cooldown maps above; ticked/expired
+    // every loop iteration by `process_active_buffs`.
     let mut active_buffs: Vec<ActiveBuff> = Vec::new();
+    // Whether this connection's character is currently mounted (see
+    // mount.rs) -- ephemeral, session-only state, not persisted: the
+    // underlying mount item stays equipped in slot 13 regardless, same
+    // reset-on-relog scoping as the cooldown maps above.
+    let mut mounted = false;
     // A skill cast currently in progress (`ReadyTime` > 0), if any --
     // resolved by `process_pending_cast` once its delay elapses, and
     // cancelled by movement (see the `CharacterMove` handling below).
@@ -225,6 +235,12 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
     let mut last_chat_at: Option<Instant> = None;
     let mut last_auto_attack_at: Option<Instant> = None;
     let mut active_auto_attack: Option<AutoAttackState> = None;
+    // Set true when a mob's blow kills this character; gates movement/attack/
+    // skill input until a resurrection clears it (see the death-gating
+    // checks below and the `/town` revive escape hatch). Mirrored to the
+    // shared ConnectedPlayer::alive flag so the combat sweep also stops
+    // targeting this player.
+    let mut player_dead = false;
 
     logger.line("Rapture World client connected");
 
@@ -330,28 +346,76 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
             }
         }
 
-        // Periodic heal-over-time ticks (see skillcast.rs) -- checked every
-        // loop wakeup, same reasoning as the pending-teleport/trade-refresh
-        // checks above, so a 3-second cadence is kept even while the client
-        // is actively sending other packets, not just during an idle
-        // read-timeout wakeup.
-        process_active_heals(
-            &mut active_heals,
-            &mut active_character,
-            &connected_player,
-            &active_items,
-            &mut db_conn,
-            &mut stream,
-            &mut aes_send,
-            use_expanded_send_key,
-            logger,
-        )?;
+        // Cross-thread mob-kill EXP grant: a DoT tick (background sweep,
+        // see sweeps::run_mob_dot_sweep) that finished off a mob this
+        // character DoT'd queues the kill here instead of touching
+        // active_character directly from that thread -- same mailbox
+        // pattern as pending_teleport/pending_trade_refresh above.
+        let pending_mob_kills = connected_player
+            .as_ref()
+            .map(|player| player.take_pending_mob_kills())
+            .unwrap_or_default();
+        for (mob_id, mob_level, mob_exp) in pending_mob_kills {
+            grant_mob_kill_exp(
+                mob_id,
+                mob_level,
+                mob_exp,
+                &mut active_character,
+                &connected_player,
+                &active_items,
+                &mut db_conn,
+                &mut stream,
+                &mut aes_send,
+                use_expanded_send_key,
+                logger,
+            )?;
+        }
 
-        // Active stat buff expiry -- same per-iteration cadence reasoning
-        // as the heal ticks above.
+        // Cross-thread incoming mob melee damage: the combat sweep
+        // (sweeps::run_mob_combat_sweep) decided a mob hit this character but
+        // can't touch its HP -- it queues each hit here and this, the owning
+        // thread, applies it (combat::apply_incoming_mob_damage), keeping HP
+        // authority on one thread. Same mailbox pattern as the kills above.
+        let pending_damage = connected_player
+            .as_ref()
+            .map(|player| player.take_pending_damage())
+            .unwrap_or_default();
+        for (mob_global_id, mob_id, raw_attack) in pending_damage {
+            if player_dead {
+                break;
+            }
+            if apply_incoming_mob_damage(
+                mob_global_id,
+                mob_id,
+                raw_attack,
+                &mut active_character,
+                &connected_player,
+                &active_items,
+                &mut db_conn,
+                &mut stream,
+                &mut aes_send,
+                use_expanded_send_key,
+                logger,
+            )? {
+                // Died: stop any in-progress auto-attack and enter the
+                // dead-input-gated state until resurrection.
+                player_dead = true;
+                active_auto_attack = None;
+                last_auto_attack_at = None;
+                pending_cast = None;
+            }
+        }
+
+        // Active buff maintenance (stat buffs + periodic heal-over-time
+        // ticks, see skillcast.rs) -- checked every loop wakeup, same
+        // reasoning as the pending-teleport/trade-refresh checks above, so
+        // a 3-second heal cadence is kept even while the client is
+        // actively sending other packets, not just during an idle
+        // read-timeout wakeup.
         process_active_buffs(
             &mut active_buffs,
             &mut active_character,
+            &connected_player,
             &active_items,
             &mut db_conn,
             &mut stream,
@@ -361,7 +425,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
         )?;
 
         // A delayed skill cast (`ReadyTime` > 0) whose time has come --
-        // same per-iteration cadence reasoning as the heal ticks above.
+        // same per-iteration cadence reasoning as the buff ticks above.
         process_pending_cast(
             &mut pending_cast,
             &mut active_character,
@@ -369,7 +433,6 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
             &active_items,
             &active_skills,
             &mut skill_cooldowns,
-            &mut active_heals,
             &mut active_buffs,
             &mut db_conn,
             &mut stream,
@@ -382,6 +445,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
             if let Some(auto_attack) = active_auto_attack {
                 if !process_auto_attack_swing(
                     auto_attack.target_mob_id,
+                    mounted,
                     &mut active_character,
                     &connected_player,
                     &active_items,
@@ -588,6 +652,32 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     ));
                 }
 
+                // While dead, ignore world-interaction input (movement,
+                // attacks, skills, item/vehicle use) until the player revives
+                // via 0x0553 ResurrectRequest (handled below, never gated,
+                // which clears `player_dead`). The client is expected to stop
+                // sending the gated packets once it processes the death
+                // packets, but a few in-flight ones can still arrive, and a
+                // modified client shouldn't be able to act from the grave.
+                if player_dead
+                    && matches!(
+                        decrypted_opcode,
+                        x if x == Opcode::CharacterMove as u16
+                            || x == Opcode::CharacterMobAutoAttack as u16
+                            || x == Opcode::SkillUse as u16
+                            || x == Opcode::SkillUseNoTarget as u16
+                            || x == Opcode::UseItem as u16
+                            || x == Opcode::ChangeAppearance as u16
+                            || x == Opcode::UseVehicle as u16,
+                    )
+                {
+                    logger.line(format!(
+                        "Rapture World ignored opcode=0x{decrypted_opcode:04X} while dead character_id={}",
+                        active_character.as_ref().map_or(0, |c| c.id)
+                    ));
+                    continue;
+                }
+
                 if decrypted_opcode == Opcode::AccountFaction as u16 && decrypted_payload.len() >= 3
                 {
                     let requested_faction = decrypted_payload[2];
@@ -683,6 +773,29 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         continue;
                     }
 
+                    // Reject a duplicate name. This client has no explicit
+                    // name-check packet (unlike EP8/Imgeneus) -- the create
+                    // simply fails with result 1, which the client shows as an
+                    // in-game "name already in use" notice (confirmed via
+                    // capture: `02 01 01`).
+                    if db::character_name_taken(&mut db_conn, &new_character.name)? {
+                        logger.line(format!(
+                            "Rapture World rejected create character: name '{}' already in use",
+                            new_character.name
+                        ));
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                build_create_character_result(false)?,
+                                "0x0102 create character rejected (name in use)",
+                                logger,
+                            )?;
+                        }
+                        continue;
+                    }
+
                     active_character = Some(db::create_character(
                         &mut db_conn,
                         account_id,
@@ -729,6 +842,78 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             send,
                             use_expanded_send_key,
                             &active_characters,
+                            logger,
+                        )?;
+                    }
+                } else if decrypted_opcode == Opcode::DeleteCharacter as u16
+                    && decrypted_payload.len() >= 6
+                {
+                    // Soft-delete into the 2h pending-deletion window. Purely
+                    // a selection-screen operation (no active character to
+                    // touch): the character stays listed but flagged, and the
+                    // client greys it out from the ok result alone -- the real
+                    // server sends no re-list here (per capture), so neither do
+                    // we.
+                    let character_id = read_le_u32(&decrypted_payload[2..6])?;
+                    let ok = db::set_character_pending_delete(&mut db_conn, account_id, character_id)?;
+                    logger.line(format!("Rapture World delete character id={character_id} ok={ok}"));
+                    if let Some(send) = aes_send.as_mut() {
+                        send_encrypted(
+                            &mut stream,
+                            send,
+                            use_expanded_send_key,
+                            build_delete_character_result(ok, character_id)?,
+                            "0x0103 delete character",
+                            logger,
+                        )?;
+                    }
+                } else if decrypted_opcode == Opcode::RestoreCharacter as u16
+                    && decrypted_payload.len() >= 6
+                {
+                    // Restore from the pending-deletion window (fails if the
+                    // 2h window already elapsed -- the DB update matches no row
+                    // and `ok` is false).
+                    let character_id = read_le_u32(&decrypted_payload[2..6])?;
+                    let ok = db::restore_character(&mut db_conn, account_id, character_id)?;
+                    logger.line(format!("Rapture World restore character id={character_id} ok={ok}"));
+                    if let Some(send) = aes_send.as_mut() {
+                        send_encrypted(
+                            &mut stream,
+                            send,
+                            use_expanded_send_key,
+                            build_restore_character_result(ok, character_id)?,
+                            "0x010F restore character",
+                            logger,
+                        )?;
+                    }
+                } else if decrypted_opcode == Opcode::RenameCharacter as u16
+                    && decrypted_payload.len() >= 6
+                {
+                    // Commit a forced rename at login. The name field is a
+                    // null-padded fixed string after the charId.
+                    let character_id = read_le_u32(&decrypted_payload[2..6])?;
+                    let new_name = read_fixed_ascii(&decrypted_payload[6..]);
+                    // Reject an empty name or one already in use (active or
+                    // reserved by a pending-delete character). rename_character
+                    // additionally enforces account ownership + that the rename
+                    // was actually pending, so a client can't rename for free.
+                    let ok = if new_name.trim().is_empty()
+                        || db::character_name_taken(&mut db_conn, &new_name)?
+                    {
+                        false
+                    } else {
+                        db::rename_character(&mut db_conn, account_id, character_id, &new_name)?
+                    };
+                    logger.line(format!(
+                        "Rapture World rename character id={character_id} name='{new_name}' ok={ok}"
+                    ));
+                    if let Some(send) = aes_send.as_mut() {
+                        send_encrypted(
+                            &mut stream,
+                            send,
+                            use_expanded_send_key,
+                            build_rename_character_result(ok)?,
+                            "0x010E rename character",
                             logger,
                         )?;
                     }
@@ -780,6 +965,9 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     } else {
                         Vec::new()
                     };
+                    // Ephemeral, not persisted -- always starts unmounted on
+                    // select, same as pending_cast's reset-on-relog scoping.
+                    mounted = false;
                     active_stored_items = match active_character.as_ref() {
                         Some(character) => db::get_stored_items(&mut db_conn, character.account_id)?,
                         None => Vec::new(),
@@ -856,6 +1044,21 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             &active_buffs,
                             logger,
                         )?;
+                        // Item-mall gift box (0x2606) -- pushed with the rest
+                        // of the initial state; the client has no request
+                        // opcode for it. Delivered gifts sent while this
+                        // account was offline show up here.
+                        if let Some(character) = active_character.as_ref() {
+                            let list = build_gift_box_list(&mut db_conn, character.account_id)?;
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                list,
+                                "0x2606 gift box list",
+                                logger,
+                            )?;
+                        }
                     }
                 } else if decrypted_opcode == Opcode::GmCommandGetItem as u16 {
                     if !require_admin(
@@ -1140,7 +1343,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
 
                         let response = match command {
                             Ok((mob_id, count, radius)) => {
-                                execute_mmake(&character, mob_id, count, radius, logger)?
+                                execute_mmake(&character, mob_id, count, radius, &mut db_conn, logger)?
                             }
                             Err(error) => error.to_string(),
                         };
@@ -1731,6 +1934,379 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                                     logger,
                                 )?;
                             }
+                            // Extra ordered packets (reset-stats stone: 0x0214
+                            // + max-energy + current-hp).
+                            for (packet, label) in packets.extra_before {
+                                send_encrypted(
+                                    &mut stream,
+                                    send,
+                                    use_expanded_send_key,
+                                    packet,
+                                    label,
+                                    logger,
+                                )?;
+                            }
+                        }
+                    }
+                } else if decrypted_opcode == Opcode::ChangeAppearance as u16 {
+                    let Some(character) = active_character.as_mut() else {
+                        logger.line("Rapture World rejected change appearance without active character");
+                        continue;
+                    };
+
+                    if let Some(packets) = handle_change_appearance(
+                        &mut db_conn,
+                        character,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        // Refresh the live snapshot so a later-arriving viewer's
+                        // 0x0303 shape reflects the new look/sex.
+                        if let Some(player) = connected_player.as_ref() {
+                            player.update_character(character.clone());
+                        }
+                        // Item consume goes to self only.
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                packets.use_result,
+                                "0x050A use item (change appearance)",
+                                logger,
+                            )?;
+                        }
+                        // Appearance broadcast reaches self + everyone nearby so
+                        // the model updates live (self is included in the loop,
+                        // matching the motion-broadcast pattern).
+                        let my_gm_visible =
+                            connected_player.as_ref().is_some_and(|p| p.gm_visible());
+                        for player in players_on_map_near(
+                            character.map_id,
+                            character.pos_x,
+                            character.pos_z,
+                            VIEWPORT_RADIUS,
+                        ) {
+                            if player.character_id != character.id
+                                && !can_see_character(player.is_admin, is_admin, my_gm_visible)
+                            {
+                                continue;
+                            }
+                            player.send_packet(&packets.broadcast, "0x0226 change appearance", logger)?;
+                        }
+                    }
+                } else if decrypted_opcode == Opcode::EnchantAdd as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected enchant add without active character");
+                        continue;
+                    };
+                    let character = character.clone();
+
+                    if let Some(outcome) = handle_enchant_add(
+                        &mut db_conn,
+                        &character,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        // Sync the deducted-money field on the working
+                        // character copy so later packets in this same
+                        // connection (e.g. a subsequent enchant) see the
+                        // right balance.
+                        if let Some(active) = active_character.as_mut() {
+                            active.money = outcome.new_money;
+                            if let Some(player) = connected_player.as_ref() {
+                                player.update_character(active.clone());
+                            }
+                        }
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                outcome.response,
+                                "0x0805 enchant add result",
+                                logger,
+                            )?;
+                            if outcome.item_equipped {
+                                let slot = decrypted_payload.get(8).copied().unwrap_or(0);
+                                send_encrypted(
+                                    &mut stream,
+                                    send,
+                                    use_expanded_send_key,
+                                    build_character_equipment(&character, &active_items, slot)?,
+                                    &format!("0x0507 character equipment slot {slot} (enchant)"),
+                                    logger,
+                                )?;
+                                if let Some(player) = connected_player.as_ref() {
+                                    player.update_items(active_items.clone());
+                                    let equipment_packet = player.equipment_packet(slot)?;
+                                    for other in players_on_map_excluding_near(
+                                        character.map_id,
+                                        character.id,
+                                        character.pos_x,
+                                        character.pos_z,
+                                        VIEWPORT_RADIUS,
+                                    ) {
+                                        if !can_see_character(other.is_admin, is_admin, player.gm_visible()) {
+                                            continue;
+                                        }
+                                        other.send_packet(
+                                            &equipment_packet,
+                                            &format!("0x0507 character equipment slot {slot} (enchant broadcast)"),
+                                            logger,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if decrypted_opcode == Opcode::GemAddPossibility as u16 {
+                    if let Some(response) = handle_gem_add_possibility(&decrypted_payload, logger)?
+                        && let Some(send) = aes_send.as_mut()
+                    {
+                        send_encrypted(
+                            &mut stream,
+                            send,
+                            use_expanded_send_key,
+                            response,
+                            "0x0809 gem add possibility",
+                            logger,
+                        )?;
+                    }
+                } else if decrypted_opcode == Opcode::GemRemovePossibility as u16 {
+                    if let Some(response) = handle_gem_remove_possibility(&decrypted_payload, logger)?
+                        && let Some(send) = aes_send.as_mut()
+                    {
+                        send_encrypted(
+                            &mut stream,
+                            send,
+                            use_expanded_send_key,
+                            response,
+                            "0x080A gem remove possibility",
+                            logger,
+                        )?;
+                    }
+                } else if decrypted_opcode == Opcode::GemAdd as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected gem add without active character");
+                        continue;
+                    };
+                    let character = character.clone();
+
+                    // Effective stats BEFORE the link, to diff afterwards --
+                    // mirrors ItemCompose's confirmed-safe pattern (a full
+                    // stat-bundle resend crashed the client there; selective
+                    // 0x050B updates for changed pools didn't). Not
+                    // independently confirmed for gems specifically (no
+                    // capture of the client's post-link expectations), but
+                    // it's the same "item mutation changes live stats" class
+                    // of operation, so reusing the known-safe approach here
+                    // is the lower-risk choice.
+                    let old_stats = CharacterStats::from_character(
+                        active_character.as_ref(),
+                        equipment_stats_with_buffs(
+                            db::get_equipment_stats(&mut db_conn, &active_items)?,
+                            &active_buffs,
+                        ),
+                    );
+
+                    if let Some(outcome) = handle_gem_add(
+                        &mut db_conn,
+                        &character,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                outcome.response,
+                                "0x0801 gem add result",
+                                logger,
+                            )?;
+                            if outcome.item_equipped {
+                                let new_stats = CharacterStats::from_character(
+                                    active_character.as_ref(),
+                                    equipment_stats_with_buffs(
+                                        db::get_equipment_stats(&mut db_conn, &active_items)?,
+                                        &active_buffs,
+                                    ),
+                                );
+                                for (hitpoint_type, old_max, new_max) in [
+                                    (0u8, old_stats.max_hp, new_stats.max_hp),
+                                    (1u8, old_stats.max_sp, new_stats.max_sp),
+                                    (2u8, old_stats.max_mp, new_stats.max_mp),
+                                ] {
+                                    if old_max != new_max {
+                                        send_encrypted(
+                                            &mut stream,
+                                            send,
+                                            use_expanded_send_key,
+                                            build_max_energy(active_character.as_ref(), hitpoint_type, new_max)?,
+                                            "0x050B max energy (gem add)",
+                                            logger,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(player) = connected_player.as_ref() {
+                            player.update_items(active_items.clone());
+                        }
+                    }
+                } else if decrypted_opcode == Opcode::GemRemove as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected gem remove without active character");
+                        continue;
+                    };
+                    let character = character.clone();
+
+                    let old_stats = CharacterStats::from_character(
+                        active_character.as_ref(),
+                        equipment_stats_with_buffs(
+                            db::get_equipment_stats(&mut db_conn, &active_items)?,
+                            &active_buffs,
+                        ),
+                    );
+
+                    if let Some(outcome) = handle_gem_remove(
+                        &mut db_conn,
+                        &character,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        if let Some(send) = aes_send.as_mut() {
+                            for (index, packet) in outcome.add_item_packets.into_iter().enumerate() {
+                                send_encrypted(
+                                    &mut stream,
+                                    send,
+                                    use_expanded_send_key,
+                                    packet,
+                                    &format!("0x0205 gem remove add item {}", index + 1),
+                                    logger,
+                                )?;
+                            }
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                outcome.response,
+                                "0x0802 gem remove result",
+                                logger,
+                            )?;
+                            if outcome.item_equipped {
+                                let new_stats = CharacterStats::from_character(
+                                    active_character.as_ref(),
+                                    equipment_stats_with_buffs(
+                                        db::get_equipment_stats(&mut db_conn, &active_items)?,
+                                        &active_buffs,
+                                    ),
+                                );
+                                for (hitpoint_type, old_max, new_max) in [
+                                    (0u8, old_stats.max_hp, new_stats.max_hp),
+                                    (1u8, old_stats.max_sp, new_stats.max_sp),
+                                    (2u8, old_stats.max_mp, new_stats.max_mp),
+                                ] {
+                                    if old_max != new_max {
+                                        send_encrypted(
+                                            &mut stream,
+                                            send,
+                                            use_expanded_send_key,
+                                            build_max_energy(active_character.as_ref(), hitpoint_type, new_max)?,
+                                            "0x050B max energy (gem remove)",
+                                            logger,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(player) = connected_player.as_ref() {
+                            player.update_items(active_items.clone());
+                        }
+                    }
+                } else if decrypted_opcode == Opcode::ItemCompose as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected item compose without active character");
+                        continue;
+                    };
+                    let character_id = character.id;
+
+                    // Max pools BEFORE the reroll, to diff afterwards -- the
+                    // real server (per capture) sends one 0x050B max-energy
+                    // update per pool that changed, NOT the full stat bundle
+                    // (which crashed the client here).
+                    let old_stats = CharacterStats::from_character(
+                        active_character.as_ref(),
+                        equipment_stats_with_buffs(
+                            db::get_equipment_stats(&mut db_conn, &active_items)?,
+                            &active_buffs,
+                        ),
+                    );
+
+                    if let Some(outcome) = handle_item_compose(
+                        &mut db_conn,
+                        character_id,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        if let Some(send) = aes_send.as_mut() {
+                            // Confirmed sequence from a real capture:
+                            // 0x050B (changed pools) -> 0x0806 -> 0x050A.
+                            if outcome.item_equipped {
+                                let new_stats = CharacterStats::from_character(
+                                    active_character.as_ref(),
+                                    equipment_stats_with_buffs(
+                                        db::get_equipment_stats(&mut db_conn, &active_items)?,
+                                        &active_buffs,
+                                    ),
+                                );
+                                // Same hitpoint_type mapping as statpoints.rs:
+                                // 0 = hp, 1 = sp, 2 = mp.
+                                for (hitpoint_type, old_max, new_max) in [
+                                    (0u8, old_stats.max_hp, new_stats.max_hp),
+                                    (1u8, old_stats.max_sp, new_stats.max_sp),
+                                    (2u8, old_stats.max_mp, new_stats.max_mp),
+                                ] {
+                                    if old_max != new_max {
+                                        send_encrypted(
+                                            &mut stream,
+                                            send,
+                                            use_expanded_send_key,
+                                            build_max_energy(
+                                                active_character.as_ref(),
+                                                hitpoint_type,
+                                                new_max,
+                                            )?,
+                                            "0x050B max energy (compose)",
+                                            logger,
+                                        )?;
+                                    }
+                                }
+                            }
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                outcome.response,
+                                "0x0806 item compose result",
+                                logger,
+                            )?;
+                            if let Some(rune_consume) = outcome.rune_consume {
+                                send_encrypted(
+                                    &mut stream,
+                                    send,
+                                    use_expanded_send_key,
+                                    rune_consume,
+                                    "0x050A rune consume (compose)",
+                                    logger,
+                                )?;
+                            }
                         }
                     }
                 } else if decrypted_opcode == Opcode::RemoveItem as u16 {
@@ -2115,6 +2691,16 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     if pending_cast.take().is_some() {
                         logger.line("Rapture World cancelled pending skill cast due to movement");
                     }
+                    // Same for an in-progress auto-attack: without this, the
+                    // 100ms read-timeout retry loop (see the `let Some(read)
+                    // = read else` branch above) kept re-swinging forever
+                    // regardless of the character having walked away, since
+                    // nothing ever cleared `active_auto_attack` on move. A
+                    // character that stays put is still meant to keep
+                    // swinging (untouched), only actual movement cancels it.
+                    if active_auto_attack.take().is_some() {
+                        logger.line("Rapture World cancelled active auto attack due to movement");
+                    }
                     handle_character_move(
                         &decrypted_payload,
                         &mut active_character,
@@ -2486,6 +3072,45 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                 } else if decrypted_opcode == Opcode::AutoAttackStop as u16 {
                     active_auto_attack = None;
                     logger.line("Rapture World auto attack stop");
+                } else if decrypted_opcode == Opcode::ResurrectRequest as u16 {
+                    if player_dead {
+                        if resurrect_character(
+                            &mut active_character,
+                            &connected_player,
+                            &active_items,
+                            is_admin,
+                            selected_faction,
+                            &mut entity_visibility,
+                            &mut db_conn,
+                            &mut stream,
+                            &mut aes_send,
+                            use_expanded_send_key,
+                            &mut position_dirty,
+                            &mut last_position_save,
+                            logger,
+                        )? {
+                            player_dead = false;
+                        }
+                    } else {
+                        logger.line("Rapture World ignored resurrect request while alive");
+                    }
+                } else if decrypted_opcode == Opcode::UseVehicle as u16 {
+                    if let Some(character) = active_character.as_ref() {
+                        handle_use_vehicle(
+                            character.id,
+                            character.map_id,
+                            character.pos_x,
+                            character.pos_z,
+                            &active_items,
+                            &mut mounted,
+                            &mut stream,
+                            &mut aes_send,
+                            use_expanded_send_key,
+                            logger,
+                        )?;
+                    } else {
+                        logger.line("Rapture World rejected mount toggle without active character");
+                    }
                 } else if decrypted_opcode == Opcode::CharacterMobAutoAttack as u16
                     && decrypted_payload.len() >= 6
                 {
@@ -2498,6 +3123,7 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                     ));
                     if !process_auto_attack_swing(
                         mob_global_id,
+                        mounted,
                         &mut active_character,
                         &connected_player,
                         &active_items,
@@ -2534,13 +3160,13 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         target_mob_id,
                         number,
                         request_opcode,
+                        mounted,
                         &mut pending_cast,
                         &mut active_character,
                         &connected_player,
                         &active_items,
                         &active_skills,
                         &mut skill_cooldowns,
-                        &mut active_heals,
                         &mut active_buffs,
                         &mut db_conn,
                         &mut stream,
@@ -2649,6 +3275,68 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                             logger,
                         )?;
                     }
+                } else if decrypted_opcode == Opcode::PointGiftSend as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected gift send without active character");
+                        continue;
+                    };
+                    let sender_account_id = character.account_id;
+
+                    if let Some(outcome) = handle_gift_send(
+                        &mut db_conn,
+                        sender_account_id,
+                        active_account_points,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        active_account_points = outcome.new_points;
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                outcome.response,
+                                "0x2603 gift send result",
+                                logger,
+                            )?;
+                        }
+                        // If the recipient happens to be online, push their
+                        // refreshed gift-box list live so the gift shows up
+                        // without a relog (offline recipients get it with the
+                        // initial 0x2606 at their next character select).
+                        if let Some((recipient_name, recipient_account_id)) = outcome.recipient {
+                            if let Some(player) = find_player_by_name(&recipient_name) {
+                                let list = build_gift_box_list(&mut db_conn, recipient_account_id)?;
+                                let _ = player.send_packet(&list, "0x2606 gift box push", logger);
+                            }
+                        }
+                    }
+                } else if decrypted_opcode == Opcode::PointStoredItemGet as u16 {
+                    let Some(character) = active_character.as_ref() else {
+                        logger.line("Rapture World rejected gift claim without active character");
+                        continue;
+                    };
+                    let (character_id, account_id) = (character.id, character.account_id);
+
+                    if let Some(response) = handle_stored_item_get(
+                        &mut db_conn,
+                        character_id,
+                        account_id,
+                        &mut active_items,
+                        &decrypted_payload,
+                        logger,
+                    )? {
+                        if let Some(send) = aes_send.as_mut() {
+                            send_encrypted(
+                                &mut stream,
+                                send,
+                                use_expanded_send_key,
+                                response,
+                                "0x2607 gift claim result",
+                                logger,
+                            )?;
+                        }
+                    }
                 } else if decrypted_opcode == Opcode::CashPoint as u16 {
                     // Empty-body request: the client is asking to refresh
                     // its displayed point balance (e.g. opening the cash
@@ -2697,15 +3385,16 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
                         persist_active_buffs(&mut db_conn, character.id, &active_buffs)?;
                     }
                     active_buffs.clear();
-                    // Unlike active_buffs (persisted above) and skill_cooldowns
-                    // (persisted continuously via CharSkills, rebuilt fresh at
-                    // the next SelectCharacter), active_heals/pending_cast have
-                    // no per-character persistence at all -- leaving them set
-                    // here would let a heal-over-time tick or a delayed cast
-                    // started by THIS character keep firing against whichever
-                    // character is selected next on this same connection.
-                    active_heals.clear();
+                    // Unlike active_buffs (persisted just above) and
+                    // skill_cooldowns (persisted continuously via
+                    // CharSkills, rebuilt fresh at the next
+                    // SelectCharacter), pending_cast has no per-character
+                    // persistence at all -- leaving it set here would let a
+                    // delayed cast started by THIS character resolve
+                    // against whichever character is selected next on this
+                    // same connection.
                     pending_cast = None;
+                    mounted = false;
                     logger.line("Rapture World logout requested (relog to character select)");
                     let character_id = active_character.as_ref().map_or(0, |c| c.id);
                     if let Some(send) = aes_send.as_mut() {
@@ -2790,6 +3479,14 @@ fn main() -> Result<()> {
         let logger = Arc::clone(&logger);
         thread::spawn(move || run_npc_patrol_sweep(logger));
     }
+    {
+        let logger = Arc::clone(&logger);
+        thread::spawn(move || run_mob_dot_sweep(logger));
+    }
+    {
+        let logger = Arc::clone(&logger);
+        thread::spawn(move || run_mob_combat_sweep(logger));
+    }
 
     ensure_map_data_dir()?;
     logger.line(format!(
@@ -2798,7 +3495,6 @@ fn main() -> Result<()> {
     load_svmap_entities(&logger)?;
     load_drop_tables(&logger)?;
     load_exp_table(&logger)?;
-    load_status_table(&logger)?;
 
     let listener = TcpListener::bind("127.0.0.1:30810").context("failed to bind world port")?;
     for stream in listener.incoming() {
@@ -2808,6 +3504,7 @@ fn main() -> Result<()> {
                     continue;
                 };
                 apply_keepalive(&stream, &logger);
+                apply_nodelay(&stream, &logger);
                 let logger = Arc::clone(&logger);
                 thread::spawn(move || {
                     let _guard = guard;

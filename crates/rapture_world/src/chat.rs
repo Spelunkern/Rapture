@@ -5,6 +5,7 @@ use rapture_common::packet::Opcode;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,28 @@ pub(crate) struct ConnectedPlayer {
     // resync -- resending the whole list didn't actually clear the traded
     // item from either client's view (confirmed empirically, 2026-07-08).
     pending_trade_refresh: Mutex<Option<Vec<Vec<u8>>>>,
+    // Same mailbox pattern again, for a DoT tick that kills a mob from the
+    // background sweep thread (see world_entities::tick_all_mob_dots /
+    // sweeps::run_mob_dot_sweep): that thread has no per-connection
+    // active_character to safely mutate, so it queues (mob_id, mob_level,
+    // mob_exp) here and the owning connection grants the EXP itself, same
+    // as a live kill would (see combat::grant_mob_kill_exp). A Vec, not a
+    // single Option -- multiple DoT kills could land before this player's
+    // thread gets a chance to drain it.
+    pending_mob_kills: Mutex<Vec<(u16, u16, u32)>>,
+    // Same mailbox pattern once more, for incoming mob melee damage: the
+    // combat sweep thread (sweeps::run_mob_combat_sweep) decides a mob hit
+    // this player but cannot safely touch its active_character/current_hp,
+    // so it queues (mob_global_id, mob_id, raw_attack) here and the owning
+    // thread applies the damage/death (combat::apply_incoming_mob_damage),
+    // keeping HP authority in one place. A Vec since several mobs could hit
+    // in the same window.
+    pending_damage: Mutex<Vec<(u32, u16, u32)>>,
+    // Whether this player is currently alive. Read by the combat sweep so it
+    // never targets or keeps attacking a dead player, and by the owning
+    // thread to gate movement/attack/skill input while dead. Starts true;
+    // set false on death, true again on resurrection.
+    alive: AtomicBool,
 }
 
 impl ConnectedPlayer {
@@ -169,6 +192,41 @@ impl ConnectedPlayer {
     /// Takes and clears the pending trade-refresh packets, if any.
     pub(crate) fn take_pending_trade_refresh(&self) -> Option<Vec<Vec<u8>>> {
         lock_or_recover(&self.pending_trade_refresh).take()
+    }
+
+    /// Queues a mob kill (mob_id, mob_level, mob_exp) for this player's own
+    /// connection thread to grant EXP for, from a thread other than their
+    /// own (the DoT-tick sweep).
+    pub(crate) fn queue_mob_kill(&self, mob_id: u16, mob_level: u16, mob_exp: u32) {
+        lock_or_recover(&self.pending_mob_kills).push((mob_id, mob_level, mob_exp));
+    }
+
+    /// Takes and clears every pending mob kill queued since this was last
+    /// called.
+    pub(crate) fn take_pending_mob_kills(&self) -> Vec<(u16, u16, u32)> {
+        std::mem::take(&mut lock_or_recover(&self.pending_mob_kills))
+    }
+
+    /// Queues an incoming mob melee hit (mob_global_id, mob_id, raw_attack)
+    /// for this player's own connection thread to apply, from the combat
+    /// sweep thread.
+    pub(crate) fn queue_damage(&self, mob_global_id: u32, mob_id: u16, attack: u32) {
+        lock_or_recover(&self.pending_damage)
+            .push((mob_global_id, mob_id, attack));
+    }
+
+    /// Takes and clears every pending incoming-damage event queued since this
+    /// was last called.
+    pub(crate) fn take_pending_damage(&self) -> Vec<(u32, u16, u32)> {
+        std::mem::take(&mut lock_or_recover(&self.pending_damage))
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_alive(&self, alive: bool) {
+        self.alive.store(alive, Ordering::Relaxed);
     }
 
     pub(crate) fn update_items(&self, items: Vec<DbCharacterItem>) {
@@ -377,6 +435,9 @@ pub(crate) fn register_player(
         stream: Mutex::new(cloned_stream),
         pending_teleport: Mutex::new(None),
         pending_trade_refresh: Mutex::new(None),
+        pending_mob_kills: Mutex::new(Vec::new()),
+        pending_damage: Mutex::new(Vec::new()),
+        alive: AtomicBool::new(true),
     });
     lock_or_recover(&map_bucket(map_id)).insert(character_id, Arc::clone(&player));
     Ok((

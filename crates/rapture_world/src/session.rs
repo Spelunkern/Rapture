@@ -37,6 +37,23 @@ pub(crate) fn apply_keepalive(stream: &TcpStream, logger: &Logger) {
     }
 }
 
+/// Disables Nagle's algorithm on a client socket. Without this, the OS can
+/// hold small outgoing packets (a skill ack, an SP/MP update, a mob damage
+/// broadcast -- most of what this protocol sends) in the kernel send
+/// buffer for tens to a couple hundred milliseconds waiting to coalesce
+/// them with more data or a delayed ACK, even though the server resolved
+/// the underlying game logic instantly. Confirmed as the likely cause of a
+/// reported "the spell works immediately but the visual effect appears
+/// late" bug: nothing in this project's own skill-resolution logic (nor in
+/// Imgeneus's, for instant-cast skills) introduces any deliberate delay,
+/// so the lag was happening below the application layer, in the socket
+/// itself.
+pub(crate) fn apply_nodelay(stream: &TcpStream, logger: &Logger) {
+    if let Err(error) = stream.set_nodelay(true) {
+        logger.line(format!("Rapture World failed to disable Nagle's algorithm: {error:?}"));
+    }
+}
+
 pub(crate) static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) struct ConnectionGuard;

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rapture_common::crypto::AesCtr;
-use rapture_common::db::{DbCharacter, DbCharacterItem, DbConsumableEffect, DbEquipmentStats};
+use rapture_common::db::{self, DbCharacter, DbCharacterItem, DbConsumableEffect, DbEquipmentStats};
 use rapture_common::packet::{Opcode, PacketWriter};
 use std::net::TcpStream;
 
@@ -10,6 +10,19 @@ pub(crate) const CHARACTER_ID: u32 = 1;
 pub(crate) const MAX_HP: u32 = 100;
 pub(crate) const MAX_MP: u32 = 100;
 pub(crate) const MAX_SP: u32 = 100;
+/// Base max HP/MP/SP granted per character level, hardcoded and identical
+/// for every class -- replaces the old per-(level, job) PS_GameDefs.dbo.
+/// StatusDefs lookup. See `base_pool_for_level`.
+pub(crate) const BASE_POOL_PER_LEVEL: u32 = 100;
+
+/// Hardcoded base max HP (= base max MP = base max SP) for a character of the
+/// given level: a flat `BASE_POOL_PER_LEVEL` (100) per level, the same for
+/// all classes (level 1 = 100, level 60 = 6000). The stat-derived bonus
+/// (REC/WIS/DEX) is added on top in `CharacterStats::from_character`. No DB
+/// involved -- deliberately hardcoded per the project's design.
+pub(crate) fn base_pool_for_level(level: u16) -> u32 {
+    u32::from(level.max(1)).saturating_mul(BASE_POOL_PER_LEVEL)
+}
 pub(crate) const BASE_STAT: u32 = 10;
 pub(crate) const BASE_MIN_ATTACK: u32 = 15;
 pub(crate) const BASE_MAX_ATTACK: u32 = 15;
@@ -28,6 +41,28 @@ pub(crate) const RESISTANCE_PER_WISDOM: u32 = 1;
 pub(crate) const CONSUMABLE_ITEM_TYPES: [u8; 4] = [25, 100, 101, 102];
 pub(crate) const SPECIAL_NONE: u8 = 0;
 pub(crate) const SPECIAL_PERCENT_HEALING_POTION: u8 = 17;
+/// `Items.Special` for the change-appearance consumable: lets the player
+/// restyle hair/face/height (see `Opcode::ChangeAppearance`).
+pub(crate) const SPECIAL_CHANGE_APPEARANCE: u8 = 44;
+/// `Items.Special` for the change-sex consumable: hair/face/height AND sex.
+pub(crate) const SPECIAL_CHANGE_SEX: u8 = 45;
+/// `Items.Special` for the name-change stone: flags the character for a
+/// forced rename on next login (`Chars.RenameCnt = 1`), no immediate effect.
+pub(crate) const SPECIAL_CHANGE_NAME: u8 = 51;
+/// `Items.Special` for the reset-stats (respec) stone: base STR/REC/INT/WIS/
+/// DEX/LUC return to `BASE_STAT` (10) and the available pool is set to a
+/// fresh level-based grant (`STAT_POINTS_PER_LEVEL` per level).
+pub(crate) const SPECIAL_RESET_STATS: u8 = 34;
+/// Stat points granted per character level on a stat reset (level 60 -> 300,
+/// level 10 -> 50).
+pub(crate) const STAT_POINTS_PER_LEVEL: u16 = 5;
+/// `Items.Special` for the simple recreation rune: rerolls an eligible
+/// item's orange (craftname) bonus stats (see `Opcode::ItemCompose`).
+pub(crate) const SPECIAL_RECREATION_RUNE: u8 = 62;
+
+// is_weapon_item_type / is_armor_item_type moved to rapture_common::db --
+// get_equipment_stats needs them too (weapon/armor enchant bonuses), so the
+// single canonical definition lives there now. See db::is_weapon_item_type.
 pub(crate) const INVENTORY_FIRST_BAG: u8 = 1;
 pub(crate) const INVENTORY_LAST_BAG: u8 = 5;
 pub(crate) const INVENTORY_SLOT_COUNT: u8 = 24;
@@ -65,6 +100,11 @@ pub(crate) struct CharacterStats {
     pub(crate) max_magic: u32,
     pub(crate) defense: u32,
     pub(crate) resistance: u32,
+    /// Flat, universal damage reduction from enchanted armor (see
+    /// `db::ARMOR_ENCHANT_ABSORPTION`) -- sourced straight from
+    /// `equipment.absorption`, not scaled by any player stat. Applied in
+    /// `combat::apply_incoming_mob_damage`'s final damage formula.
+    pub(crate) absorption: u32,
 }
 
 impl CharacterStats {
@@ -79,9 +119,11 @@ impl CharacterStats {
         let base_wisdom = character.map_or(BASE_STAT, |character| character.wisdom as u32);
         let base_dexterity = character.map_or(BASE_STAT, |character| character.dexterity as u32);
         let base_luck = character.map_or(BASE_STAT, |character| character.luck as u32);
-        let base_max_hp = character.map_or(MAX_HP, |character| character.max_hp);
-        let base_max_mp = character.map_or(MAX_MP, |character| character.max_mp);
-        let base_max_sp = character.map_or(MAX_SP, |character| character.max_sp);
+        // Base max is a hardcoded flat 100/level for every class (see
+        // base_pool_for_level), NOT the character's stored Chars.HP/MP/SP.
+        let base_max_hp = character.map_or(MAX_HP, |character| base_pool_for_level(character.level));
+        let base_max_mp = character.map_or(MAX_MP, |character| base_pool_for_level(character.level));
+        let base_max_sp = character.map_or(MAX_SP, |character| base_pool_for_level(character.level));
         let strength = base_strength.saturating_add(equipment.strength);
         let reaction = base_reaction.saturating_add(equipment.reaction);
         let intelligence = base_intelligence.saturating_add(equipment.intelligence);
@@ -176,6 +218,7 @@ impl CharacterStats {
             resistance: BASE_RESISTANCE
                 .saturating_add(equipment.resistance)
                 .saturating_add(wisdom.saturating_mul(RESISTANCE_PER_WISDOM)),
+            absorption: equipment.absorption,
         }
     }
 
@@ -260,6 +303,32 @@ pub(crate) fn build_character_additional_stats(stats: &CharacterStats) -> Result
     packet.write_u32(stats.max_magic);
     packet.write_u32(stats.defense);
     packet.write_u32(stats.resistance);
+    packet.into_bytes()
+}
+
+/// Builds the 0x0214 StatsReset result. Carries the refunded stat-point pool
+/// and the six base stats (10 each after a reset), matching Imgeneus's
+/// SendResetStats field order (StatPoint, Str, Rec, Int, Wis, Dex, Luc) --
+/// the same order our own character list uses, so the stat sheet updates
+/// correctly.
+pub(crate) fn build_stats_reset(
+    stat_point: u16,
+    strength: u16,
+    reaction: u16,
+    intelligence: u16,
+    wisdom: u16,
+    dexterity: u16,
+    luck: u16,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::StatsReset);
+    packet.write_u8(1); // success
+    packet.write_u16(stat_point);
+    packet.write_u16(strength);
+    packet.write_u16(reaction);
+    packet.write_u16(intelligence);
+    packet.write_u16(wisdom);
+    packet.write_u16(dexterity);
+    packet.write_u16(luck);
     packet.into_bytes()
 }
 
@@ -423,7 +492,15 @@ pub(crate) fn build_character_equipment(
     if let Some(item) = item {
         packet.write_u8(item.item_type);
         packet.write_u8(item.type_id);
-        packet.write_u8(0); // enchant step
+        // Enchant step: the last craftname pair (see db::DbCraftStats),
+        // confirmed via a real capture of a successful enchant -- the
+        // server re-sends this same 0x0507 with the new step right after
+        // the enchant result, so the client's weapon glow updates live.
+        packet.write_u8(
+            db::parse_craft_name(&item.craft_name)
+                .map(|craft| craft.enchant_level)
+                .unwrap_or(0),
+        );
         if slot == 7 {
             for gem in item.gems {
                 packet.write_u8(gem);
@@ -462,6 +539,27 @@ pub(crate) fn build_character_equipment(
 /// worked -- sitting down live in front of an already-known viewer, which
 /// is exactly a standalone 0x0506 against an object the client already has
 /// -- instead of fighting it.
+/// Builds the 0x0226 ChangeAppearance broadcast: the character's id plus its
+/// new hair/face/height/sex, so nearby clients (and the acting client) update
+/// the model live. New viewers arriving later get the same look from the
+/// regular 0x0303 CharacterShape, since the change is also persisted and the
+/// live snapshot updated.
+pub(crate) fn build_change_appearance(
+    character_id: u32,
+    hair: u8,
+    face: u8,
+    height: u8,
+    sex: u8,
+) -> Result<Vec<u8>> {
+    let mut packet = PacketWriter::new(Opcode::ChangeAppearance);
+    packet.write_u32(character_id);
+    packet.write_u8(hair);
+    packet.write_u8(face);
+    packet.write_u8(height);
+    packet.write_u8(sex);
+    packet.into_bytes()
+}
+
 pub(crate) fn build_character_shape(
     character: Option<&DbCharacter>,
     selected_faction: u8,
@@ -632,8 +730,8 @@ pub(crate) fn build_character_list_slot(
     }
 
     packet.write_fixed_string(&character.name, 19)?;
-    packet.write_u8(0); // pending_deletion -- not implemented, always "not pending"
-    packet.write_u8(0); // pending_rename -- not implemented, always "not pending"
+    packet.write_u8(u8::from(character.pending_delete)); // 1 = pending deletion (restorable, greyed out)
+    packet.write_u8(u8::from(character.rename_pending)); // 1 = forced rename on login (name-change stone used)
 
     for _ in 0..6 {
         packet.write_u8(0);
