@@ -219,6 +219,10 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
     let mut entity_visibility = EntityVisibility::default();
     let mut position_dirty = false;
     let mut last_position_save = Instant::now();
+    // Passive HP/MP/SP regen cadence (see character::process_passive_regen)
+    // -- one tracker per connection, same reset-on-connect scoping as
+    // last_position_save.
+    let mut last_regen_at = Instant::now();
     let mut recv_buffer = Vec::<u8>::new();
     // Held once the handshake identifies the account; dropped automatically
     // when this function returns (any exit path), releasing the account for
@@ -414,6 +418,22 @@ fn handle_client(mut stream: TcpStream, logger_arc: Arc<Logger>) -> Result<()> {
         // read-timeout wakeup.
         process_active_buffs(
             &mut active_buffs,
+            &mut active_character,
+            &connected_player,
+            &active_items,
+            &mut db_conn,
+            &mut stream,
+            &mut aes_send,
+            use_expanded_send_key,
+            logger,
+        )?;
+
+        // Passive HP/MP/SP regen (5% of max every 10s, unconditional --
+        // see character::process_passive_regen) -- same per-iteration
+        // cadence reasoning as the buff ticks above.
+        process_passive_regen(
+            &mut last_regen_at,
+            player_dead,
             &mut active_character,
             &connected_player,
             &active_items,

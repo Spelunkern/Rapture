@@ -3,7 +3,10 @@ use rapture_common::crypto::AesCtr;
 use rapture_common::db::{self, DbCharacter, DbCharacterItem, DbConsumableEffect, DbEquipmentStats};
 use rapture_common::packet::{Opcode, PacketWriter};
 use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::chat::ConnectedPlayer;
 use crate::session::*;
 
 pub(crate) const CHARACTER_ID: u32 = 1;
@@ -674,6 +677,107 @@ pub(crate) fn send_character_stat_packets(
     for (packet, label) in packets {
         send_encrypted(stream, aes, use_expanded_send_key, packet, label, logger)?;
     }
+
+    Ok(())
+}
+
+/// How often passive regen ticks, and how much of max HP/MP/SP it restores
+/// per tick -- 5% every 10 seconds, per the project's explicit design (a
+/// flat, unconditional rate: not reduced or paused during combat). This is
+/// the server's own authoritative regen; without it the client had nothing
+/// to reconcile its own display against, which is what let a character
+/// survive combat indefinitely.
+pub(crate) const PASSIVE_REGEN_TICK: Duration = Duration::from_secs(10);
+const PASSIVE_REGEN_PERCENT: u32 = 5;
+
+/// Passive HP/MP/SP regeneration, ticked once per connection-loop
+/// iteration (same cadence pattern as `skillcast::process_active_buffs`) so
+/// it keeps firing every `PASSIVE_REGEN_TICK` even while the client is busy
+/// sending other packets. `last_regen_at` is owned by the caller (one per
+/// connection, like `last_position_save`) and advances by exactly one tick
+/// per call so a slow loop iteration catches up on the next wakeup instead
+/// of losing a tick.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_passive_regen(
+    last_regen_at: &mut Instant,
+    player_dead: bool,
+    active_character: &mut Option<DbCharacter>,
+    connected_player: &Option<Arc<ConnectedPlayer>>,
+    active_items: &[DbCharacterItem],
+    db_conn: &mut db::Db,
+    stream: &mut TcpStream,
+    aes_send: &mut Option<AesCtr>,
+    use_expanded_send_key: bool,
+    logger: &Logger,
+) -> Result<()> {
+    let now = Instant::now();
+    if now < *last_regen_at + PASSIVE_REGEN_TICK {
+        return Ok(());
+    }
+    *last_regen_at += PASSIVE_REGEN_TICK;
+
+    if player_dead {
+        return Ok(());
+    }
+    let Some(character) = active_character.as_mut() else {
+        return Ok(());
+    };
+
+    let equipment_stats = db::get_equipment_stats(db_conn, active_items)?;
+    let stats = CharacterStats::from_character(Some(character), equipment_stats);
+    if stats.current_hp == 0 {
+        // Dead by HP but not yet gated (a queued death that hasn't been
+        // processed this loop iteration) -- don't heal past it.
+        return Ok(());
+    }
+
+    let heal_hp = stats.max_hp.saturating_mul(PASSIVE_REGEN_PERCENT) / 100;
+    let heal_mp = stats.max_mp.saturating_mul(PASSIVE_REGEN_PERCENT) / 100;
+    let heal_sp = stats.max_sp.saturating_mul(PASSIVE_REGEN_PERCENT) / 100;
+
+    // Same delta-on-the-raw-field pattern as apply_heal_skill/
+    // apply_incoming_mob_damage -- never assign an effective value directly
+    // to current_hp/mp/sp (see CharacterStats::from_character's invariant).
+    let new_effective_hp = stats.current_hp.saturating_add(heal_hp).min(stats.max_hp);
+    let new_effective_mp = stats.current_mp.saturating_add(heal_mp).min(stats.max_mp);
+    let new_effective_sp = stats.current_sp.saturating_add(heal_sp).min(stats.max_sp);
+    let actual_hp = new_effective_hp - stats.current_hp;
+    let actual_mp = new_effective_mp - stats.current_mp;
+    let actual_sp = new_effective_sp - stats.current_sp;
+
+    if actual_hp == 0 && actual_mp == 0 && actual_sp == 0 {
+        return Ok(()); // already full, nothing to persist or resync
+    }
+
+    let new_hp = character.current_hp.saturating_add(actual_hp);
+    let new_mp = character.current_mp.saturating_add(actual_mp);
+    let new_sp = character.current_sp.saturating_add(actual_sp);
+
+    character.current_hp = new_hp;
+    character.current_mp = new_mp;
+    character.current_sp = new_sp;
+    db::set_character_status(db_conn, character.id, new_hp, new_mp, new_sp)?;
+
+    if let Some(player) = connected_player.as_ref() {
+        player.update_character(character.clone());
+    }
+
+    if let Some(send) = aes_send.as_mut() {
+        let refreshed_stats = CharacterStats::from_character(active_character.as_ref(), equipment_stats);
+        send_encrypted(
+            stream,
+            send,
+            use_expanded_send_key,
+            build_current_hitpoints(&refreshed_stats)?,
+            "0x0521 passive regen tick",
+            logger,
+        )?;
+    }
+
+    logger.line(format!(
+        "Rapture World passive regen tick character_id={} hp={actual_hp} mp={actual_mp} sp={actual_sp}",
+        active_character.as_ref().map_or(0, |character| character.id)
+    ));
 
     Ok(())
 }

@@ -1,0 +1,5 @@
+# Shell scripts must stay LF -- a CRLF shebang line breaks execution on
+# Linux ("bad interpreter"). Windows checkouts with core.autocrlf=true
+# would otherwise convert these on checkout.
+*.sh text eol=lf
+Start\ Rapture.sh text eol=lf

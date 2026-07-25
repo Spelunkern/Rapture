@@ -1,29 +1,17 @@
-#[cfg(not(windows))]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use rusqlite::{Connection, ToSql};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Recovers from a poisoned lock instead of panicking, so one thread's
 /// panic while holding this lock can't cascade into every other thread
-/// that needs the connection pool.
+/// that needs the connection.
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-use tiberius::{AuthMethod, Client, Config, Row, ToSql};
-use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
-use tokio::sync::Semaphore;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-const DEFAULT_SQL_SERVER_HOST: &str = "localhost";
-const DEFAULT_SQL_SERVER_PORT: u16 = 1433;
-/// Default pool size; override with the RAPTURE_SQLSERVER_POOL_SIZE env var.
-const POOL_MAX_CONNECTIONS: usize = 16;
-
-type SqlClient = Client<Compat<TcpStream>>;
 const SERVER_ID: u8 = 1;
 const FACTION_NONE: u8 = 2;
 const MAX_GROW_ULTIMATE: u8 = 3;
@@ -229,9 +217,9 @@ pub struct DbCharacterSkill {
     pub number: u8,
     /// Seconds remaining on this skill's cooldown, as of when it was
     /// loaded (`get_character_skills` computes this live from
-    /// `Delay`/`CreateTime` via `DATEDIFF`, so it's always fresh at load
-    /// time -- see `set_character_skill_cooldown` for how those two
-    /// columns are actually used).
+    /// `Delay`/`CreateTime`, so it's always fresh at load time -- see
+    /// `set_character_skill_cooldown` for how those two columns are
+    /// actually used).
     pub delay: i32,
 }
 
@@ -364,192 +352,219 @@ pub struct NewCharacter {
     pub pos_z: f32,
 }
 
-/// A lightweight handle to the process-wide SQL Server connection pool.
+/// A lightweight handle to the process-wide SQLite connections.
 ///
-/// Actual TCP/TDS connections are owned by the global `Pool`, not by this
+/// Actual `rusqlite::Connection`s are owned by the two global, lazily
+/// initialized connections (`gamedata_conn`/`world_conn`), not by this
 /// struct, so `Db` is cheap to create per client session and never opens a
 /// fresh connection per query.
 pub struct Db;
 
 pub fn connect() -> Result<Db> {
-    // Touch the global runtime/pool eagerly so configuration errors (bad
-    // host/port env vars) surface immediately instead of on first query.
-    let _ = runtime();
-    let _ = pool();
+    // Touch both global connections eagerly so path/permission errors
+    // surface immediately instead of on first query.
+    let _ = gamedata_conn()?;
+    let _ = world_conn()?;
     Ok(Db)
 }
 
-struct Pool {
-    host: String,
-    port: u16,
-    credentials: Option<crate::config::SqlServerCredentials>,
-    idle: Mutex<Vec<SqlClient>>,
-    permits: Semaphore,
-}
+/// Tables `gamedata.db` is expected to already have. Checked against
+/// `sqlite_master` on open -- see `open_existing_db`'s doc for why this
+/// project deliberately never creates or migrates schema at runtime.
+const GAMEDATA_TABLES: &[&str] = &["Items", "MobItems", "Mobs", "ExpDefs", "Skills", "ProductList"];
 
-impl Pool {
-    fn new() -> Self {
-        // config.ini (if present) takes priority; falling back to the
-        // existing RAPTURE_SQLSERVER_* env vars, then hardcoded defaults,
-        // keeps today's zero-config behavior unchanged for a machine with
-        // no config.ini at all.
-        let ini_config = crate::config::load_sql_server_config();
+/// Tables `world.db` is expected to already have. See `GAMEDATA_TABLES`.
+const WORLD_TABLES: &[&str] = &[
+    "Users_Master",
+    "UserMaxGrow",
+    "Chars",
+    "CharItems",
+    "UserStoredItems",
+    "CharQuickSlots",
+    "CharSkills",
+    "CharApplySkills",
+    "Users_Product3",
+];
 
-        let host = ini_config.host.unwrap_or_else(|| {
-            std::env::var("RAPTURE_SQLSERVER_HOST").unwrap_or_else(|_| DEFAULT_SQL_SERVER_HOST.to_string())
-        });
-        let port = ini_config.port.unwrap_or_else(|| {
-            std::env::var("RAPTURE_SQLSERVER_PORT")
-                .ok()
-                .and_then(|port| port.parse().ok())
-                .unwrap_or(DEFAULT_SQL_SERVER_PORT)
-        });
-        let max_connections = ini_config.pool_size.filter(|&value| value > 0).unwrap_or_else(|| {
-            std::env::var("RAPTURE_SQLSERVER_POOL_SIZE")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .filter(|&value| value > 0)
-                .unwrap_or(POOL_MAX_CONNECTIONS)
-        });
+/// Opens an already-existing SQLite file and checks it has every table in
+/// `expected_tables`. Rapture ships `gamedata.db`/`world.db` as canonical,
+/// pre-built data files (see `crates/rapture_common/schema/*.sql` for the
+/// exact DDL they were built from) -- the running server never creates,
+/// bootstraps, or migrates a database on its own. A missing file or a
+/// missing table is a hard, clearly-reported startup error instead of
+/// something this code silently papers over.
+fn open_existing_db(path: &std::path::Path, expected_tables: &[&str], label: &str) -> Result<Connection> {
+    if !path.exists() {
+        bail!(
+            "{label} not found at {} -- Rapture does not create this file at runtime; \
+             copy the canonical {label} into place before starting the server \
+             (see docs/INSTALLATION.md's Database section)",
+            path.display()
+        );
+    }
+    let conn = Connection::open(path).with_context(|| format!("failed to open {label} at {}", path.display()))?;
 
-        Pool {
-            host,
-            port,
-            credentials: ini_config.credentials,
-            idle: Mutex::new(Vec::new()),
-            permits: Semaphore::new(max_connections),
+    let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .with_context(|| format!("failed to inspect schema of {label} at {}", path.display()))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            existing.insert(row.get::<_, String>(0)?);
         }
     }
 
-    async fn open_connection(&self) -> Result<SqlClient> {
-        let mut config = Config::new();
-        config.host(&self.host);
-        config.port(self.port);
-        // Every query in this module fully qualifies tables as
-        // `<Database>.dbo.<Table>`, so the initial catalog below is only a
-        // connection default and never restricts which database is reached.
-        config.database("PS_GameData");
-        // SQL Server Authentication only kicks in when config.ini has real
-        // (non-placeholder) credentials -- see config.rs's doc. Otherwise
-        // this keeps using Windows Integrated Authentication on Windows,
-        // this project's original and still-default behavior there.
-        // `AuthMethod::Integrated` doesn't exist as a variant at all on a
-        // non-Windows target (tiberius gates it behind `cfg(windows)` --
-        // Windows SSPI has no non-Windows equivalent short of a full
-        // Kerberos/GSSAPI setup), so a Linux build has no fallback: it
-        // requires real config.ini credentials and fails loudly at connect
-        // time if they're missing, rather than failing to compile.
-        match &self.credentials {
-            Some(credentials) => {
-                config.authentication(AuthMethod::sql_server(&credentials.user, &credentials.password));
-            }
-            #[cfg(windows)]
-            None => config.authentication(AuthMethod::Integrated),
-            #[cfg(not(windows))]
-            None => {
-                bail!(
-                    "no SQL Server credentials configured -- Windows Integrated Authentication is unavailable on this platform; fill in config.ini's [SqlServer] User/Password (see config.ini.example)"
-                );
-            }
-        }
-        config.trust_cert();
-
-        let tcp = TcpStream::connect(config.get_addr())
-            .await
-            .context("failed to open SQL Server TCP connection")?;
-        tcp.set_nodelay(true)?;
-
-        Client::connect(config, tcp.compat_write())
-            .await
-            .context("failed to connect to SQL Server")
+    let missing: Vec<&str> = expected_tables
+        .iter()
+        .filter(|table| !existing.contains(**table))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "{label} at {} is missing expected table(s): {} -- this file doesn't match the \
+             schema this server expects (see crates/rapture_common/schema/*.sql); it may be an \
+             old/partial copy",
+            path.display(),
+            missing.join(", ")
+        );
     }
 
-    async fn acquire(&'static self) -> Result<PooledConn> {
-        let permit = self
-            .permits
-            .acquire()
-            .await
-            .context("SQL Server connection pool semaphore closed unexpectedly")?;
-        permit.forget();
-
-        let existing = lock_or_recover(&self.idle).pop();
-        let client = match existing {
-            Some(client) => client,
-            None => match self.open_connection().await {
-                Ok(client) => client,
-                Err(error) => {
-                    self.permits.add_permits(1);
-                    return Err(error);
-                }
-            },
-        };
-
-        Ok(PooledConn {
-            pool: self,
-            client: Some(client),
-            healthy: false,
-        })
-    }
-
-    fn release(&'static self, client: SqlClient, healthy: bool) {
-        if healthy {
-            lock_or_recover(&self.idle).push(client);
-        }
-        self.permits.add_permits(1);
-    }
+    Ok(conn)
 }
 
-struct PooledConn {
-    pool: &'static Pool,
-    client: Option<SqlClient>,
-    healthy: bool,
-}
-
-impl PooledConn {
-    fn client_mut(&mut self) -> &mut SqlClient {
-        self.client
-            .as_mut()
-            .expect("pooled connection already released")
+/// Global connection to `gamedata.db` (static, read-only game content).
+/// Initialized on first use; a failed open is retried on the next call
+/// rather than cached, since `OnceLock` has no fallible `get_or_init` on
+/// stable Rust.
+fn gamedata_conn() -> Result<&'static Mutex<Connection>> {
+    static CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
+    if let Some(conn) = CONN.get() {
+        return Ok(conn);
     }
+    let path = crate::config::gamedata_db_path();
+    let conn = open_existing_db(&path, GAMEDATA_TABLES, "gamedata.db")?;
+    let _ = CONN.set(Mutex::new(conn));
+    Ok(CONN.get().expect("gamedata connection was just set"))
+}
 
-    fn mark_healthy(&mut self) {
-        self.healthy = true;
+/// Global connection to `world.db` (live account/character/inventory
+/// state). See `gamedata_conn` for the initialization strategy.
+fn world_conn() -> Result<&'static Mutex<Connection>> {
+    static CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
+    if let Some(conn) = CONN.get() {
+        return Ok(conn);
     }
+    let path = crate::config::world_db_path();
+    let conn = open_existing_db(&path, WORLD_TABLES, "world.db")?;
+    let _ = CONN.set(Mutex::new(conn));
+    Ok(CONN.get().expect("world connection was just set"))
 }
 
-impl Drop for PooledConn {
-    fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            self.pool.release(client, self.healthy);
-        }
+/// Routes the old SQL-Server "database" name to the right SQLite file:
+/// `"PS_GameDefs"` (Items/MobItems/Mobs/ExpDefs/Skills/ProductList) lives in
+/// `gamedata.db`; everything else (`PS_GameData`/`PS_UserData`/`PS_Billing`)
+/// now lives together in `world.db`.
+fn conn_for(database: &str) -> Result<&'static Mutex<Connection>> {
+    if database == "PS_GameDefs" {
+        gamedata_conn()
+    } else {
+        world_conn()
     }
-}
-
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| Runtime::new().expect("failed to create SQL Server runtime"))
-}
-
-fn pool() -> &'static Pool {
-    static POOL: OnceLock<Pool> = OnceLock::new();
-    POOL.get_or_init(Pool::new)
-}
-
-/// Runs `f` against a pooled connection, returning the connection to the
-/// pool only if `f` completed successfully. A connection that errored
-/// (e.g. dropped by the server) is discarded so the next acquisition opens
-/// a fresh one instead of reusing a possibly broken socket.
-async fn with_pooled_client<T>(f: impl AsyncFnOnce(&mut SqlClient) -> Result<T>) -> Result<T> {
-    let mut conn = pool().acquire().await?;
-    let result = f(conn.client_mut()).await;
-    if result.is_ok() {
-        conn.mark_healthy();
-    }
-    result
 }
 
 pub fn init_schema(_conn: &mut Db) -> Result<()> {
+    // Eagerly touches both global connections so a missing/malformed
+    // gamedata.db or world.db (see `open_existing_db`) is a clear startup
+    // error instead of surfacing on the first query a client happens to
+    // trigger.
+    let _ = gamedata_conn()?;
+    let _ = world_conn()?;
     Ok(())
+}
+
+/// Runs `sql` against the routed connection and maps the first returned
+/// row with `map`, or `None` if the query returned no rows.
+fn query_one<T>(
+    conn: &mut Db,
+    database: &str,
+    sql: &str,
+    params: &[&dyn ToSql],
+    map: impl FnOnce(&rusqlite::Row<'_>) -> T,
+) -> Result<Option<T>> {
+    let _ = conn;
+    let guard = lock_or_recover(conn_for(database)?);
+    let mut stmt = guard.prepare(sql).context("failed to prepare SQL query")?;
+    let mut rows = stmt.query(params).context("failed to execute SQL query")?;
+    match rows.next().context("failed to read SQL row")? {
+        Some(row) => Ok(Some(map(row))),
+        None => Ok(None),
+    }
+}
+
+/// Like `query_one`, but collects every returned row.
+fn query_many<T>(
+    conn: &mut Db,
+    database: &str,
+    sql: &str,
+    params: &[&dyn ToSql],
+    mut map: impl FnMut(&rusqlite::Row<'_>) -> T,
+) -> Result<Vec<T>> {
+    let _ = conn;
+    let guard = lock_or_recover(conn_for(database)?);
+    let mut stmt = guard.prepare(sql).context("failed to prepare SQL query")?;
+    let mut rows = stmt.query(params).context("failed to execute SQL query")?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().context("failed to read SQL row")? {
+        results.push(map(row));
+    }
+    Ok(results)
+}
+
+fn execute(conn: &mut Db, database: &str, sql: &str, params: &[&dyn ToSql]) -> Result<()> {
+    let _ = conn;
+    let guard = lock_or_recover(conn_for(database)?);
+    guard
+        .execute(sql, params)
+        .context("failed to execute SQL command")?;
+    Ok(())
+}
+
+/// Like `execute`, but returns the total number of rows the statement
+/// affected -- used where "did this actually change a row?" is the result
+/// (e.g. soft-delete/restore, which report ok/fail based on whether the
+/// scoped WHERE matched a row).
+fn execute_rows(conn: &mut Db, database: &str, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
+    let _ = conn;
+    let guard = lock_or_recover(conn_for(database)?);
+    let rows = guard
+        .execute(sql, params)
+        .context("failed to execute SQL command")?;
+    Ok(rows as u64)
+}
+
+/// Like `execute`, but returns `rowid` of the row just inserted (SQLite's
+/// `last_insert_rowid()`, the equivalent of SQL Server's `OUTPUT
+/// INSERTED.<identity column>`).
+fn insert_and_last_row_id(
+    conn: &mut Db,
+    database: &str,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> Result<i64> {
+    let _ = conn;
+    let guard = lock_or_recover(conn_for(database)?);
+    guard
+        .execute(sql, params)
+        .context("failed to execute SQL insert")?;
+    Ok(guard.last_insert_rowid())
+}
+
+/// A fresh, effectively-unique 63-bit item UID (the SQLite replacement for
+/// the old `CHECKSUM(NEWID())`-based random bigint). Masked to stay
+/// non-negative for a slightly tidier `ItemUID` column.
+fn random_item_uid() -> i64 {
+    (rand::random::<u64>() & 0x7FFF_FFFF_FFFF_FFFF) as i64
 }
 
 pub fn authenticate_account(
@@ -558,22 +573,23 @@ pub fn authenticate_account(
     password: &str,
 ) -> Result<Option<DbAccount>> {
     let sql = r#"
-        SELECT TOP (1)
+        SELECT
             u.UserUID,
             u.UserID,
             u.Admin,
             u.AdminLevel,
             u.Point,
-            ISNULL(g.Country, 2) AS Country,
-            ISNULL(g.MaxGrow, 3) AS MaxGrow
-        FROM PS_UserData.dbo.Users_Master AS u
-        LEFT JOIN PS_GameData.dbo.UserMaxGrow AS g
-            ON g.ServerID = @P1
+            COALESCE(g.Country, 2) AS Country,
+            COALESCE(g.MaxGrow, 3) AS MaxGrow
+        FROM Users_Master AS u
+        LEFT JOIN UserMaxGrow AS g
+            ON g.ServerID = ?1
             AND g.UserUID = u.UserUID
             AND g.Del = 0
-        WHERE u.UserID = @P2
-            AND u.Pw = @P3
+        WHERE u.UserID = ?2
+            AND u.Pw = ?3
             AND u.Leave = 0
+        LIMIT 1
     "#;
 
     let server_id = i32::from(SERVER_ID);
@@ -582,46 +598,54 @@ pub fn authenticate_account(
         "PS_UserData",
         sql,
         &[&server_id, &username, &password],
+        account_from_row,
     )?;
-    Ok(row.map(account_from_row))
+    Ok(row)
 }
 
 pub fn get_account_by_id(conn: &mut Db, account_id: u32) -> Result<Option<DbAccount>> {
     let sql = r#"
-        SELECT TOP (1)
+        SELECT
             u.UserUID,
             u.UserID,
             u.Admin,
             u.AdminLevel,
             u.Point,
-            ISNULL(g.Country, 2) AS Country,
-            ISNULL(g.MaxGrow, 3) AS MaxGrow
-        FROM PS_UserData.dbo.Users_Master AS u
-        LEFT JOIN PS_GameData.dbo.UserMaxGrow AS g
-            ON g.ServerID = @P1
+            COALESCE(g.Country, 2) AS Country,
+            COALESCE(g.MaxGrow, 3) AS MaxGrow
+        FROM Users_Master AS u
+        LEFT JOIN UserMaxGrow AS g
+            ON g.ServerID = ?1
             AND g.UserUID = u.UserUID
             AND g.Del = 0
-        WHERE u.UserUID = @P2
+        WHERE u.UserUID = ?2
             AND u.Leave = 0
+        LIMIT 1
     "#;
 
     let server_id = i32::from(SERVER_ID);
     let account_id = account_id as i32;
-    let row = query_one(conn, "PS_UserData", sql, &[&server_id, &account_id])?;
-    Ok(row.map(account_from_row))
+    let row = query_one(
+        conn,
+        "PS_UserData",
+        sql,
+        &[&server_id, &account_id],
+        account_from_row,
+    )?;
+    Ok(row)
 }
 
 pub fn update_account_faction(conn: &mut Db, account_id: u32, faction: u8) -> Result<()> {
     let sql = r#"
-        MERGE PS_GameData.dbo.UserMaxGrow WITH (HOLDLOCK) AS target
-        USING (SELECT @P1 AS ServerID, @P2 AS UserUID) AS source
-            ON target.ServerID = source.ServerID
-            AND target.UserUID = source.UserUID
-        WHEN MATCHED THEN
-            UPDATE SET Country = @P3, MaxGrow = CASE WHEN target.MaxGrow < @P4 THEN @P4 ELSE target.MaxGrow END, Del = 0
-        WHEN NOT MATCHED THEN
-            INSERT (ServerID, UserUID, Country, MaxGrow, Del)
-            VALUES (@P1, @P2, @P3, @P4, 0);
+        INSERT INTO UserMaxGrow (ServerID, UserUID, Country, MaxGrow, Del)
+        VALUES (?1, ?2, ?3, ?4, 0)
+        ON CONFLICT(ServerID, UserUID) DO UPDATE SET
+            Country = excluded.Country,
+            MaxGrow = CASE
+                WHEN UserMaxGrow.MaxGrow < excluded.MaxGrow THEN excluded.MaxGrow
+                ELSE UserMaxGrow.MaxGrow
+            END,
+            Del = 0
     "#;
 
     let server_id = i32::from(SERVER_ID);
@@ -656,36 +680,22 @@ pub fn get_characters_for_account(conn: &mut Db, account_id: u32) -> Result<Vec<
         r#"
         SELECT
             {CHARACTER_COLUMNS}, Del
-        FROM PS_GameData.dbo.Chars
-        WHERE UserUID = @P1
+        FROM Chars
+        WHERE UserUID = ?1
           AND (
             Del = 0
-            OR (Del = 1 AND DeleteDate IS NOT NULL AND DeleteDate >= DATEADD(hour, -{CHARACTER_DELETE_WINDOW_HOURS}, GETDATE()))
+            OR (Del = 1 AND DeleteDate IS NOT NULL AND DeleteDate >= datetime('now', '-{CHARACTER_DELETE_WINDOW_HOURS} hours'))
           )
         ORDER BY Slot
     "#
     );
     let account_id_param = account_id as i32;
-    let _ = conn;
-    let rows = runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        client
-            .query(&sql, &[&account_id_param])
-            .await
-            .context("failed to load account characters")?
-            .into_results()
-            .await
-            .context("failed to read account characters")
-    }))?;
-
-    Ok(rows
-        .into_iter()
-        .flatten()
-        .map(|row| {
-            let mut character = row_to_character(&row);
-            character.pending_delete = flexible_u32(&row, "Del", 0) == 1;
-            character
-        })
-        .collect())
+    let rows = query_many(conn, "PS_GameData", &sql, &[&account_id_param], |row| {
+        let mut character = row_to_character(row);
+        character.pending_delete = flexible_u32(row, "Del", 0) == 1;
+        character
+    })?;
+    Ok(rows)
 }
 
 /// Soft-deletes a character into the pending-deletion window: sets Del = 1
@@ -698,9 +708,9 @@ pub fn set_character_pending_delete(
     character_id: u32,
 ) -> Result<bool> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.Chars
-        SET Del = 1, DeleteDate = GETDATE()
-        WHERE CharID = @P1 AND UserUID = @P2 AND Del = 0
+        UPDATE Chars
+        SET Del = 1, DeleteDate = datetime('now')
+        WHERE CharID = ?1 AND UserUID = ?2 AND Del = 0
     "#;
     let character_id_param = character_id as i32;
     let account_id_param = account_id as i32;
@@ -717,11 +727,11 @@ pub fn set_character_pending_delete(
 pub fn restore_character(conn: &mut Db, account_id: u32, character_id: u32) -> Result<bool> {
     let sql = format!(
         r#"
-        UPDATE PS_GameData.dbo.Chars
+        UPDATE Chars
         SET Del = 0, DeleteDate = NULL
-        WHERE CharID = @P1 AND UserUID = @P2 AND Del = 1
+        WHERE CharID = ?1 AND UserUID = ?2 AND Del = 1
           AND DeleteDate IS NOT NULL
-          AND DeleteDate >= DATEADD(hour, -{CHARACTER_DELETE_WINDOW_HOURS}, GETDATE())
+          AND DeleteDate >= datetime('now', '-{CHARACTER_DELETE_WINDOW_HOURS} hours')
     "#
     );
     let character_id_param = character_id as i32;
@@ -740,7 +750,7 @@ pub fn set_character_pending_rename(conn: &mut Db, character_id: u32) -> Result<
     let rows = execute_rows(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET RenameCnt = 1 WHERE CharID = @P1 AND Del = 0",
+        "UPDATE Chars SET RenameCnt = 1 WHERE CharID = ?1 AND Del = 0",
         &[&character_id_param],
     )
     .context("failed to flag character for rename")?;
@@ -764,8 +774,8 @@ pub fn rename_character(
     let rows = execute_rows(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET CharName = @P1, RenameCnt = 0 \
-         WHERE CharID = @P2 AND UserUID = @P3 AND Del = 0 AND RenameCnt >= 1",
+        "UPDATE Chars SET CharName = ?1, RenameCnt = 0 \
+         WHERE CharID = ?2 AND UserUID = ?3 AND Del = 0 AND RenameCnt >= 1",
         &[&new_name, &character_id_param, &account_id_param],
     )
     .context("failed to rename character")?;
@@ -778,13 +788,13 @@ pub fn get_character_by_slot(
     slot: u8,
 ) -> Result<Option<DbCharacter>> {
     let sql = format!(
-        "{} WHERE UserUID = @P1 AND Slot = @P2 AND Del = 0",
+        "{} WHERE UserUID = ?1 AND Slot = ?2 AND Del = 0 LIMIT 1",
         character_select_sql()
     );
     let account_id = account_id as i32;
     let slot = i32::from(slot);
-    let row = query_one(conn, "PS_GameData", &sql, &[&account_id, &slot])?;
-    Ok(row.as_ref().map(row_to_character))
+    let row = query_one(conn, "PS_GameData", &sql, &[&account_id, &slot], row_to_character)?;
+    Ok(row)
 }
 
 pub fn get_character_by_id(
@@ -793,13 +803,13 @@ pub fn get_character_by_id(
     character_id: u32,
 ) -> Result<Option<DbCharacter>> {
     let sql = format!(
-        "{} WHERE UserUID = @P1 AND CharID = @P2 AND Del = 0",
+        "{} WHERE UserUID = ?1 AND CharID = ?2 AND Del = 0 LIMIT 1",
         character_select_sql()
     );
     let account_id = account_id as i32;
     let character_id = character_id as i32;
-    let row = query_one(conn, "PS_GameData", &sql, &[&account_id, &character_id])?;
-    Ok(row.as_ref().map(row_to_character))
+    let row = query_one(conn, "PS_GameData", &sql, &[&account_id, &character_id], row_to_character)?;
+    Ok(row)
 }
 
 /// Looks up a character by name regardless of which account owns it --
@@ -807,11 +817,11 @@ pub fn get_character_by_id(
 /// another player by name.
 pub fn get_character_by_name(conn: &mut Db, name: &str) -> Result<Option<DbCharacter>> {
     let sql = format!(
-        "{} WHERE CharName = @P1 AND Del = 0",
+        "{} WHERE CharName = ?1 AND Del = 0 LIMIT 1",
         character_select_sql()
     );
-    let row = query_one(conn, "PS_GameData", &sql, &[&name])?;
-    Ok(row.as_ref().map(row_to_character))
+    let row = query_one(conn, "PS_GameData", &sql, &[&name], row_to_character)?;
+    Ok(row)
 }
 
 /// Whether `name` is already taken by a live character on any account, or by
@@ -823,16 +833,17 @@ pub fn get_character_by_name(conn: &mut Db, name: &str) -> Result<Option<DbChara
 pub fn character_name_taken(conn: &mut Db, name: &str) -> Result<bool> {
     let sql = format!(
         r#"
-        SELECT TOP (1) 1 AS Taken
-        FROM PS_GameData.dbo.Chars
-        WHERE CharName = @P1
+        SELECT 1 AS Taken
+        FROM Chars
+        WHERE CharName = ?1
           AND (
             Del = 0
-            OR (Del = 1 AND DeleteDate IS NOT NULL AND DeleteDate >= DATEADD(hour, -{CHARACTER_DELETE_WINDOW_HOURS}, GETDATE()))
+            OR (Del = 1 AND DeleteDate IS NOT NULL AND DeleteDate >= datetime('now', '-{CHARACTER_DELETE_WINDOW_HOURS} hours'))
           )
+        LIMIT 1
     "#
     );
-    let row = query_one(conn, "PS_GameData", &sql, &[&name])?;
+    let row = query_one(conn, "PS_GameData", &sql, &[&name], |_row| ())?;
     Ok(row.is_some())
 }
 
@@ -843,12 +854,12 @@ pub fn character_name_taken(conn: &mut Db, name: &str) -> Result<bool> {
 /// account_id (a live session's own lookup pattern).
 pub fn get_character_by_char_id(conn: &mut Db, character_id: u32) -> Result<Option<DbCharacter>> {
     let sql = format!(
-        "{} WHERE CharID = @P1 AND Del = 0",
+        "{} WHERE CharID = ?1 AND Del = 0 LIMIT 1",
         character_select_sql()
     );
     let character_id_param = character_id as i32;
-    let row = query_one(conn, "PS_GameData", &sql, &[&character_id_param])?;
-    Ok(row.as_ref().map(row_to_character))
+    let row = query_one(conn, "PS_GameData", &sql, &[&character_id_param], row_to_character)?;
+    Ok(row)
 }
 
 /// Character stat columns settable via the GM `set` command. The column
@@ -926,7 +937,7 @@ pub fn set_character_attribute(
         CharAttribute::Deaths => ("K2", 0, i32::MAX as i64),
     };
     let clamped = value.clamp(min, max) as i32;
-    let sql = format!("UPDATE PS_GameData.dbo.Chars SET {column} = @P1 WHERE CharID = @P2");
+    let sql = format!("UPDATE Chars SET {column} = ?1 WHERE CharID = ?2");
     let character_id_param = character_id as i32;
     execute(conn, "PS_GameData", &sql, &[&clamped, &character_id_param])
         .context("failed to update character attribute")?;
@@ -936,26 +947,23 @@ pub fn set_character_attribute(
 /// Adds `amount` gold, clamped to MONEY_CAP. Money is stored in a signed
 /// 32-bit SQL column but treated as unsigned up to MONEY_CAP, so this reads
 /// the current value with a bit-reinterpretation cast (not a clamp-to-0),
-/// does the add/clamp in Rust, then writes back the same way -- doing this
-/// arithmetic in T-SQL directly isn't viable because assigning a bigint
-/// above i32::MAX to an int column raises an overflow error instead of
-/// wrapping, so the sign-bit trick has to happen on this side instead.
+/// does the add/clamp in Rust, then writes back the same way.
 pub fn add_character_money(conn: &mut Db, character_id: u32, amount: u32) -> Result<u32> {
     let character_id_param = character_id as i32;
-    let row = query_one(
+    let current = query_one(
         conn,
         "PS_GameData",
-        "SELECT Money FROM PS_GameData.dbo.Chars WHERE CharID = @P1",
+        "SELECT Money FROM Chars WHERE CharID = ?1",
         &[&character_id_param],
+        |row| row.get::<_, i64>(0).unwrap_or_default() as i32,
     )?
-    .context("character not found while adding money")?;
-    let current = row.get::<i32, _>(0).unwrap_or_default() as u32;
+    .context("character not found while adding money")? as u32;
     let new_money = current.saturating_add(amount).min(MONEY_CAP);
     let stored = new_money as i32;
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET Money = @P1 WHERE CharID = @P2",
+        "UPDATE Chars SET Money = ?1 WHERE CharID = ?2",
         &[&stored, &character_id_param],
     )?;
     Ok(new_money)
@@ -971,16 +979,17 @@ pub fn set_character_money(conn: &mut Db, character_id: u32, money: u32) -> Resu
 /// clear_character_items, for reporting purposes before the clear happens.
 pub fn count_character_items(conn: &mut Db, character_id: u32, equipped_only: bool) -> Result<u32> {
     let sql = if equipped_only {
-        "SELECT COUNT(*) AS Cnt FROM PS_GameData.dbo.CharItems WHERE CharID = @P1 AND Bag = 0 AND Del = 0 AND Count > 0"
+        "SELECT COUNT(*) AS Cnt FROM CharItems WHERE CharID = ?1 AND Bag = 0 AND Del = 0 AND Count > 0"
     } else {
-        "SELECT COUNT(*) AS Cnt FROM PS_GameData.dbo.CharItems WHERE CharID = @P1 AND Bag <> 0 AND Del = 0 AND Count > 0"
+        "SELECT COUNT(*) AS Cnt FROM CharItems WHERE CharID = ?1 AND Bag <> 0 AND Del = 0 AND Count > 0"
     };
     let character_id_param = character_id as i32;
-    let row = query_one(conn, "PS_GameData", sql, &[&character_id_param])?;
-    Ok(row
-        .and_then(|row| row.get::<i32, _>("Cnt"))
-        .unwrap_or(0)
-        .max(0) as u32)
+    let count = query_one(conn, "PS_GameData", sql, &[&character_id_param], |row| {
+        row.get::<_, i64>("Cnt").unwrap_or(0)
+    })?
+    .unwrap_or(0)
+    .max(0) as u32;
+    Ok(count)
 }
 
 /// Soft-deletes every item in bag 0 (equipped, `equipped_only = true`) or
@@ -989,20 +998,46 @@ pub fn count_character_items(conn: &mut Db, character_id: u32, equipped_only: bo
 pub fn clear_character_items(conn: &mut Db, character_id: u32, equipped_only: bool) -> Result<()> {
     let sql = if equipped_only {
         r#"
-            UPDATE PS_GameData.dbo.CharItems
+            UPDATE CharItems
             SET Count = 0, Del = 1
-            WHERE CharID = @P1 AND Bag = 0 AND Del = 0
+            WHERE CharID = ?1 AND Bag = 0 AND Del = 0
         "#
     } else {
         r#"
-            UPDATE PS_GameData.dbo.CharItems
+            UPDATE CharItems
             SET Count = 0, Del = 1
-            WHERE CharID = @P1 AND Bag <> 0 AND Del = 0
+            WHERE CharID = ?1 AND Bag <> 0 AND Del = 0
         "#
     };
     let character_id_param = character_id as i32;
     execute(conn, "PS_GameData", sql, &[&character_id_param])
         .context("failed to clear character items")
+}
+
+fn row_to_character_item(row: &rusqlite::Row<'_>, bag_override: Option<u8>) -> DbCharacterItem {
+    DbCharacterItem {
+        row_id: row.get::<_, i64>("RowID").unwrap_or_default().max(0) as u32,
+        bag: bag_override.unwrap_or_else(|| tinyint_or_default(row, "Bag", 0)),
+        slot: tinyint_or_default(row, "Slot", 0),
+        item_type: tinyint_or_default(row, "Type", 0),
+        type_id: tinyint_or_default(row, "TypeID", 0),
+        quality: positive_smallint_as_u16(row, "Quality", 0),
+        gems: [
+            tinyint_or_default(row, "Gem1", 0),
+            tinyint_or_default(row, "Gem2", 0),
+            tinyint_or_default(row, "Gem3", 0),
+            tinyint_or_default(row, "Gem4", 0),
+            tinyint_or_default(row, "Gem5", 0),
+            tinyint_or_default(row, "Gem6", 0),
+        ],
+        count: tinyint_or_default(row, "Count", 1),
+        craft_name: row
+            .get::<_, String>("Craftname")
+            .unwrap_or_default()
+            .trim_end()
+            .to_string(),
+        dyed: false,
+    }
 }
 
 pub fn get_character_items(conn: &mut Db, character_id: u32) -> Result<Vec<DbCharacterItem>> {
@@ -1011,52 +1046,17 @@ pub fn get_character_items(conn: &mut Db, character_id: u32) -> Result<Vec<DbCha
             RowID, Bag, Slot, Type, TypeID, Quality,
             Gem1, Gem2, Gem3, Gem4, Gem5, Gem6,
             Count, Craftname
-        FROM PS_GameData.dbo.CharItems
-        WHERE CharID = @P1
+        FROM CharItems
+        WHERE CharID = ?1
             AND Del = 0
             AND Count > 0
         ORDER BY Bag, Slot
     "#;
 
     let character_id = character_id as i32;
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[&character_id])
-            .await
-            .context("failed to load character items")?
-            .into_results()
-            .await
-            .context("failed to read character items")?;
-
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .map(|row| DbCharacterItem {
-                row_id: row.get::<i32, _>("RowID").unwrap_or_default().max(0) as u32,
-                bag: tinyint_or_default(&row, "Bag", 0),
-                slot: tinyint_or_default(&row, "Slot", 0),
-                item_type: tinyint_or_default(&row, "Type", 0),
-                type_id: tinyint_or_default(&row, "TypeID", 0),
-                quality: positive_smallint_as_u16(&row, "Quality", 0),
-                gems: [
-                    tinyint_or_default(&row, "Gem1", 0),
-                    tinyint_or_default(&row, "Gem2", 0),
-                    tinyint_or_default(&row, "Gem3", 0),
-                    tinyint_or_default(&row, "Gem4", 0),
-                    tinyint_or_default(&row, "Gem5", 0),
-                    tinyint_or_default(&row, "Gem6", 0),
-                ],
-                count: tinyint_or_default(&row, "Count", 1),
-                craft_name: row
-                    .get::<&str, _>("Craftname")
-                    .unwrap_or_default()
-                    .trim_end()
-                    .to_string(),
-                dyed: false,
-            })
-            .collect())
-    }))
+    query_many(conn, "PS_GameData", sql, &[&character_id], |row| {
+        row_to_character_item(row, None)
+    })
 }
 
 /// The orange (recreated) bonus stats decoded from an item's 20-digit
@@ -1124,92 +1124,82 @@ pub fn get_equipment_stats(conn: &mut Db, items: &[DbCharacterItem]) -> Result<D
     }
 
     let sql = r#"
-        SELECT TOP (1)
+        SELECT
             Effect1, Effect2, Effect3, Effect4,
             ConstHP, ConstSP, ConstMP,
             ConstStr, ConstDex, ConstRec, ConstInt, ConstWis, ConstLuc
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let mut stats = DbEquipmentStats::default();
+    let mut stats = DbEquipmentStats::default();
 
-        for (item_type, type_id, craft_name, gems) in equipped_items {
-            let row = client
-                .query(sql, &[&item_type, &type_id])
-                .await
-                .context("failed to load item definition")?
-                .into_row()
-                .await
-                .context("failed to read item definition")?;
+    for (item_type, type_id, craft_name, gems) in equipped_items {
+        query_one(conn, "PS_GameDefs", sql, &[&item_type, &type_id], |row| {
+            stats.add_item_row(item_type as u8, row);
+        })?;
 
-            if let Some(row) = row {
-                stats.add_item_row(item_type as u8, &row);
+        // Socketed gems (see Opcode::GemAdd) contribute the exact same
+        // Effect1-4/Const* columns as the item itself, read off each
+        // gem's own GEM_ITEM_TYPE/TypeID row -- reuses add_item_row
+        // rather than a separate aggregation path.
+        for &gem_type_id in gems.iter() {
+            if gem_type_id == 0 {
+                continue;
             }
+            let gem_type_param = i32::from(GEM_ITEM_TYPE);
+            let gem_type_id_param = i32::from(gem_type_id);
+            query_one(
+                conn,
+                "PS_GameDefs",
+                sql,
+                &[&gem_type_param, &gem_type_id_param],
+                |row| {
+                    stats.add_item_row(GEM_ITEM_TYPE, row);
+                },
+            )?;
+        }
 
-            // Socketed gems (see Opcode::GemAdd) contribute the exact same
-            // Effect1-4/Const* columns as the item itself, read off each
-            // gem's own GEM_ITEM_TYPE/TypeID row -- reuses add_item_row
-            // rather than a separate aggregation path.
-            for &gem_type_id in gems.iter() {
-                if gem_type_id == 0 {
-                    continue;
-                }
-                let gem_type_id_param = i32::from(GEM_ITEM_TYPE);
-                let gem_row = client
-                    .query(sql, &[&gem_type_id_param, &i32::from(gem_type_id)])
-                    .await
-                    .context("failed to load gem definition")?
-                    .into_row()
-                    .await
-                    .context("failed to read gem definition")?;
-                if let Some(gem_row) = gem_row {
-                    stats.add_item_row(GEM_ITEM_TYPE, &gem_row);
-                }
-            }
+        // Orange (recreated) bonus stats ride on top of the item's own
+        // constants -- an equipped recreated item contributes both.
+        if let Some(craft) = parse_craft_name(&craft_name) {
+            stats.strength = stats.strength.saturating_add(craft.strength);
+            stats.dexterity = stats.dexterity.saturating_add(craft.dexterity);
+            stats.reaction = stats.reaction.saturating_add(craft.reaction);
+            stats.intelligence = stats.intelligence.saturating_add(craft.intelligence);
+            stats.wisdom = stats.wisdom.saturating_add(craft.wisdom);
+            stats.luck = stats.luck.saturating_add(craft.luck);
+            stats.max_hp = stats.max_hp.saturating_add(craft.max_hp);
+            stats.max_mp = stats.max_mp.saturating_add(craft.max_mp);
+            stats.max_sp = stats.max_sp.saturating_add(craft.max_sp);
 
-            // Orange (recreated) bonus stats ride on top of the item's own
-            // constants -- an equipped recreated item contributes both.
-            if let Some(craft) = parse_craft_name(&craft_name) {
-                stats.strength = stats.strength.saturating_add(craft.strength);
-                stats.dexterity = stats.dexterity.saturating_add(craft.dexterity);
-                stats.reaction = stats.reaction.saturating_add(craft.reaction);
-                stats.intelligence = stats.intelligence.saturating_add(craft.intelligence);
-                stats.wisdom = stats.wisdom.saturating_add(craft.wisdom);
-                stats.luck = stats.luck.saturating_add(craft.luck);
-                stats.max_hp = stats.max_hp.saturating_add(craft.max_hp);
-                stats.max_mp = stats.max_mp.saturating_add(craft.max_mp);
-                stats.max_sp = stats.max_sp.saturating_add(craft.max_sp);
-
-                // Enchant bonus (see Opcode::EnchantAdd): a weapon's step
-                // adds flat attack to BOTH physical and magic min/max (per
-                // the user's explicit design); an armor piece's step adds
-                // flat universal damage reduction ("absorption", applied in
-                // combat::apply_incoming_mob_damage's final formula, not a
-                // separate stat/packet). Index clamped to 20 (the design
-                // max) in case a craftname somehow holds a stray value
-                // above that.
-                if craft.enchant_level > 0 {
-                    let step = usize::from(craft.enchant_level.min(20));
-                    if is_weapon_item_type(item_type as u8) {
-                        let bonus = WEAPON_ENCHANT_ATTACK_BONUS[step];
-                        stats.min_attack = stats.min_attack.saturating_add(bonus);
-                        stats.max_attack = stats.max_attack.saturating_add(bonus);
-                        stats.min_magic = stats.min_magic.saturating_add(bonus);
-                        stats.max_magic = stats.max_magic.saturating_add(bonus);
-                    } else if is_armor_item_type(item_type as u8) {
-                        stats.absorption =
-                            stats.absorption.saturating_add(ARMOR_ENCHANT_ABSORPTION[step]);
-                    }
+            // Enchant bonus (see Opcode::EnchantAdd): a weapon's step
+            // adds flat attack to BOTH physical and magic min/max (per
+            // the user's explicit design); an armor piece's step adds
+            // flat universal damage reduction ("absorption", applied in
+            // combat::apply_incoming_mob_damage's final formula, not a
+            // separate stat/packet). Index clamped to 20 (the design
+            // max) in case a craftname somehow holds a stray value
+            // above that.
+            if craft.enchant_level > 0 {
+                let step = usize::from(craft.enchant_level.min(20));
+                if is_weapon_item_type(item_type as u8) {
+                    let bonus = WEAPON_ENCHANT_ATTACK_BONUS[step];
+                    stats.min_attack = stats.min_attack.saturating_add(bonus);
+                    stats.max_attack = stats.max_attack.saturating_add(bonus);
+                    stats.min_magic = stats.min_magic.saturating_add(bonus);
+                    stats.max_magic = stats.max_magic.saturating_add(bonus);
+                } else if is_armor_item_type(item_type as u8) {
+                    stats.absorption =
+                        stats.absorption.saturating_add(ARMOR_ENCHANT_ABSORPTION[step]);
                 }
             }
         }
+    }
 
-        Ok(stats)
-    }))
+    Ok(stats)
 }
 
 /// Per-item recreation parameters from PS_GameDefs.dbo.Items (see
@@ -1232,19 +1222,22 @@ pub fn get_item_compose_info(
     type_id: u8,
 ) -> Result<Option<DbComposeInfo>> {
     let sql = r#"
-        SELECT TOP (1) ReqWis, [Server]
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        SELECT ReqWis, Server
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let item_type_param = i32::from(item_type);
     let type_id_param = i32::from(type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_param, &type_id_param])?;
-    Ok(row.map(|row| DbComposeInfo {
-        req_wis: flexible_u32(&row, "ReqWis", 0).min(99) as u8,
-        recreation_count: flexible_u32(&row, "Server", 0).min(9) as u8,
-    }))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_param, &type_id_param], |row| {
+        DbComposeInfo {
+            req_wis: flexible_u32(row, "ReqWis", 0).min(99) as u8,
+            recreation_count: flexible_u32(row, "Server", 0).min(9) as u8,
+        }
+    })?;
+    Ok(row)
 }
 
 /// `Items.Type` for a gem/lapis, confirmed by the user against the retail
@@ -1271,19 +1264,22 @@ pub fn get_item_gem_target_info(
     type_id: u8,
 ) -> Result<Option<DbGemTargetInfo>> {
     let sql = r#"
-        SELECT TOP (1) Slot, ReqLevel
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        SELECT Slot, ReqLevel
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let item_type_param = i32::from(item_type);
     let type_id_param = i32::from(type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_param, &type_id_param])?;
-    Ok(row.map(|row| DbGemTargetInfo {
-        slots: flexible_u32(&row, "Slot", 0).min(6) as u8,
-        level: positive_smallint_as_u16(&row, "ReqLevel", 0),
-    }))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_param, &type_id_param], |row| {
+        DbGemTargetInfo {
+            slots: flexible_u32(row, "Slot", 0).min(6) as u8,
+            level: positive_smallint_as_u16(row, "ReqLevel", 0),
+        }
+    })?;
+    Ok(row)
 }
 
 /// A gem's own `Items.ReqInt` (see `DbGemTargetInfo`'s doc): the minimum
@@ -1291,16 +1287,19 @@ pub fn get_item_gem_target_info(
 /// if the gem's item definition doesn't exist.
 pub fn get_gem_req_level(conn: &mut Db, gem_type_id: u8) -> Result<Option<u16>> {
     let sql = r#"
-        SELECT TOP (1) ReqInt
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        SELECT ReqInt
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let gem_type_param = i32::from(GEM_ITEM_TYPE);
     let type_id_param = i32::from(gem_type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&gem_type_param, &type_id_param])?;
-    Ok(row.map(|row| positive_smallint_as_u16(&row, "ReqInt", 0)))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&gem_type_param, &type_id_param], |row| {
+        positive_smallint_as_u16(row, "ReqInt", 0)
+    })?;
+    Ok(row)
 }
 
 /// Writes one gem socket (`position` 0-5, mapping to `Gem1`..`Gem6`) on a
@@ -1322,9 +1321,7 @@ pub fn set_character_item_gem(
         4 => "Gem5",
         _ => "Gem6",
     };
-    let sql = format!(
-        "UPDATE PS_GameData.dbo.CharItems SET {column} = @P1 WHERE CharID = @P2 AND RowID = @P3 AND Del = 0"
-    );
+    let sql = format!("UPDATE CharItems SET {column} = ?1 WHERE CharID = ?2 AND RowID = ?3 AND Del = 0");
     let gem_type_id_param = i32::from(gem_type_id);
     let character_id_param = character_id as i32;
     let row_id_param = row_id as i32;
@@ -1346,16 +1343,19 @@ pub fn set_character_item_gem(
 /// exist.
 pub fn get_item_req_luc(conn: &mut Db, item_type: u8, type_id: u8) -> Result<Option<u32>> {
     let sql = r#"
-        SELECT TOP (1) ReqLuc
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        SELECT ReqLuc
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let item_type_param = i32::from(item_type);
     let type_id_param = i32::from(type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_param, &type_id_param])?;
-    Ok(row.map(|row| flexible_u32(&row, "ReqLuc", 0)))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_param, &type_id_param], |row| {
+        flexible_u32(row, "ReqLuc", 0)
+    })?;
+    Ok(row)
 }
 
 /// Deducts `amount` gold if the character has enough, atomically (read then
@@ -1365,14 +1365,14 @@ pub fn get_item_req_luc(conn: &mut Db, item_type: u8, type_id: u8) -> Result<Opt
 /// case nothing is written.
 pub fn deduct_character_money(conn: &mut Db, character_id: u32, amount: u32) -> Result<Option<u32>> {
     let character_id_param = character_id as i32;
-    let row = query_one(
+    let current = query_one(
         conn,
         "PS_GameData",
-        "SELECT Money FROM PS_GameData.dbo.Chars WHERE CharID = @P1",
+        "SELECT Money FROM Chars WHERE CharID = ?1",
         &[&character_id_param],
+        |row| row.get::<_, i64>(0).unwrap_or_default() as i32,
     )?
-    .context("character not found while deducting money")?;
-    let current = row.get::<i32, _>(0).unwrap_or_default() as u32;
+    .context("character not found while deducting money")? as u32;
     if current < amount {
         return Ok(None);
     }
@@ -1381,7 +1381,7 @@ pub fn deduct_character_money(conn: &mut Db, character_id: u32, amount: u32) -> 
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET Money = @P1 WHERE CharID = @P2",
+        "UPDATE Chars SET Money = ?1 WHERE CharID = ?2",
         &[&stored, &character_id_param],
     )?;
     Ok(Some(new_money))
@@ -1400,7 +1400,7 @@ pub fn set_character_item_craftname(
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.CharItems SET Craftname = @P1 WHERE CharID = @P2 AND RowID = @P3 AND Del = 0",
+        "UPDATE CharItems SET Craftname = ?1 WHERE CharID = ?2 AND RowID = ?3 AND Del = 0",
         &[&craft_name, &character_id_param, &row_id_param],
     )
     .context("failed to update item craftname")?;
@@ -1413,23 +1413,26 @@ pub fn get_consumable_effect(
     type_id: u8,
 ) -> Result<Option<DbConsumableEffect>> {
     let sql = r#"
-        SELECT TOP (1)
+        SELECT
             Special, ConstHP, ConstSP, ConstMP, ReqIg
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let item_type = i32::from(item_type);
     let type_id = i32::from(type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type, &type_id])?;
-    Ok(row.map(|row| DbConsumableEffect {
-        special: tinyint_or_default(&row, "Special", 0),
-        hp: positive_smallint_as_u32(&row, "ConstHP"),
-        sp: positive_smallint_as_u32(&row, "ConstSP"),
-        mp: positive_smallint_as_u32(&row, "ConstMP"),
-        req_ig: tinyint_or_default(&row, "ReqIg", 0),
-    }))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type, &type_id], |row| {
+        DbConsumableEffect {
+            special: tinyint_or_default(row, "Special", 0),
+            hp: positive_smallint_as_u32(row, "ConstHP"),
+            sp: positive_smallint_as_u32(row, "ConstSP"),
+            mp: positive_smallint_as_u32(row, "ConstMP"),
+            req_ig: tinyint_or_default(row, "ReqIg", 0),
+        }
+    })?;
+    Ok(row)
 }
 
 pub fn weapon_attack_delay_ms(attack_time: u8) -> Option<(u64, u64)> {
@@ -1458,31 +1461,32 @@ pub fn get_weapon_combat(
     type_id: u8,
 ) -> Result<Option<DbWeaponCombat>> {
     let sql = r#"
-        SELECT TOP (1)
-            Type, TypeID, AttackTime, [Range]
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        SELECT
+            Type, TypeID, AttackTime, Range
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let item_type_i32 = i32::from(item_type);
     let type_id_i32 = i32::from(type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_i32, &type_id_i32])?;
-    Ok(row.and_then(|row| {
-        let attack_time = tinyint_or_default(&row, "AttackTime", 0).min(10);
+    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_i32, &type_id_i32], |row| {
+        let attack_time = tinyint_or_default(row, "AttackTime", 0).min(10);
         let (original_delay_ms, test_delay_ms) = weapon_attack_delay_ms(attack_time)?;
-        let range = f32::from(numeric_u16(&row, "Range", 2));
+        let range = flexible_f32(row, "Range", 2.0);
         let range = if range <= 0.0 { 2.0 } else { range };
 
         Some(DbWeaponCombat {
-            item_type: tinyint_or_default(&row, "Type", item_type),
-            type_id: tinyint_or_default(&row, "TypeID", type_id),
+            item_type: tinyint_or_default(row, "Type", item_type),
+            type_id: tinyint_or_default(row, "TypeID", type_id),
             attack_time,
             range,
             original_delay_ms,
             test_delay_ms,
         })
-    }))
+    })?;
+    Ok(row.flatten())
 }
 
 pub fn get_item_definition(
@@ -1491,134 +1495,111 @@ pub fn get_item_definition(
     type_id: u8,
 ) -> Result<Option<DbItemDefinition>> {
     let sql = r#"
-        SELECT TOP (1)
+        SELECT
             Type, TypeID, Quality, Count, Sell
-        FROM PS_GameDefs.dbo.Items
-        WHERE Type = @P1
-            AND TypeID = @P2
+        FROM Items
+        WHERE Type = ?1
+            AND TypeID = ?2
+        LIMIT 1
     "#;
 
     let item_type_i32 = i32::from(item_type);
     let type_id_i32 = i32::from(type_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_i32, &type_id_i32])?;
-    Ok(row.map(|row| DbItemDefinition {
-        item_type: tinyint_or_default(&row, "Type", item_type),
-        type_id: tinyint_or_default(&row, "TypeID", type_id),
-        quality: positive_smallint_as_u16(&row, "Quality", 0),
-        max_stack: tinyint_or_default(&row, "Count", 1).max(1),
-        sell_price: row.get::<i32, _>("Sell").unwrap_or_default().max(0) as u32,
-    }))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&item_type_i32, &type_id_i32], |row| {
+        DbItemDefinition {
+            item_type: tinyint_or_default(row, "Type", item_type),
+            type_id: tinyint_or_default(row, "TypeID", type_id),
+            quality: positive_smallint_as_u16(row, "Quality", 0),
+            max_stack: tinyint_or_default(row, "Count", 1).max(1),
+            sell_price: row.get::<_, i64>("Sell").unwrap_or_default().max(0) as u32,
+        }
+    })?;
+    Ok(row)
 }
 
 pub fn get_mob_drops(conn: &mut Db) -> Result<HashMap<u16, Vec<DbMobDrop>>> {
     let sql = r#"
         SELECT MobID, ItemOrder, Grade, DropRate
-        FROM PS_GameDefs.dbo.MobItems
+        FROM MobItems
         WHERE Grade > 0
             AND DropRate > 0
         ORDER BY MobID, ItemOrder
     "#;
 
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[])
-            .await
-            .context("failed to load mob drops")?
-            .into_results()
-            .await
-            .context("failed to read mob drops")?;
+    let rows = query_many(conn, "PS_GameDefs", sql, &[], |row| {
+        (
+            numeric_u16(row, "MobID", 0),
+            tinyint_or_default(row, "ItemOrder", 0),
+            numeric_u16(row, "Grade", 0),
+            numeric_u32(row, "DropRate", 0),
+        )
+    })?;
 
-        let mut drops = HashMap::<u16, Vec<DbMobDrop>>::new();
-        for row in rows.into_iter().flatten() {
-            let mob_id = numeric_u16(&row, "MobID", 0);
-            let grade = numeric_u16(&row, "Grade", 0);
-            let drop_rate = numeric_u32(&row, "DropRate", 0);
-            if mob_id == 0 || grade == 0 || drop_rate == 0 {
-                continue;
-            }
-            drops.entry(mob_id).or_default().push(DbMobDrop {
-                mob_id,
-                item_order: tinyint_or_default(&row, "ItemOrder", 0),
-                grade,
-                drop_rate,
-            });
+    let mut drops = HashMap::<u16, Vec<DbMobDrop>>::new();
+    for (mob_id, item_order, grade, drop_rate) in rows {
+        if mob_id == 0 || grade == 0 || drop_rate == 0 {
+            continue;
         }
+        drops.entry(mob_id).or_default().push(DbMobDrop {
+            mob_id,
+            item_order,
+            grade,
+            drop_rate,
+        });
+    }
 
-        Ok(drops)
-    }))
+    Ok(drops)
 }
 
 pub fn get_item_definitions_by_grade(conn: &mut Db) -> Result<HashMap<u16, Vec<DbItemDefinition>>> {
     let sql = r#"
         SELECT Type, TypeID, Quality, Count, Grade
-        FROM PS_GameDefs.dbo.Items
+        FROM Items
         WHERE Grade > 0
             AND Type > 0
             AND TypeID > 0
         ORDER BY Grade, Type, TypeID
     "#;
 
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[])
-            .await
-            .context("failed to load grade item definitions")?
-            .into_results()
-            .await
-            .context("failed to read grade item definitions")?;
+    let rows = query_many(conn, "PS_GameDefs", sql, &[], |row| {
+        (
+            numeric_u16(row, "Grade", 0),
+            DbItemDefinition {
+                item_type: tinyint_or_default(row, "Type", 0),
+                type_id: tinyint_or_default(row, "TypeID", 0),
+                quality: positive_smallint_as_u16(row, "Quality", 0),
+                max_stack: tinyint_or_default(row, "Count", 1).max(1),
+                sell_price: 0,
+            },
+        )
+    })?;
 
-        let mut definitions = HashMap::<u16, Vec<DbItemDefinition>>::new();
-        for row in rows.into_iter().flatten() {
-            let grade = numeric_u16(&row, "Grade", 0);
-            if grade == 0 {
-                continue;
-            }
-            definitions
-                .entry(grade)
-                .or_default()
-                .push(DbItemDefinition {
-                    item_type: tinyint_or_default(&row, "Type", 0),
-                    type_id: tinyint_or_default(&row, "TypeID", 0),
-                    quality: positive_smallint_as_u16(&row, "Quality", 0),
-                    max_stack: tinyint_or_default(&row, "Count", 1).max(1),
-                    sell_price: 0,
-                });
+    let mut definitions = HashMap::<u16, Vec<DbItemDefinition>>::new();
+    for (grade, definition) in rows {
+        if grade == 0 {
+            continue;
         }
+        definitions.entry(grade).or_default().push(definition);
+    }
 
-        Ok(definitions)
-    }))
+    Ok(definitions)
 }
 
 pub fn get_mob_definitions(conn: &mut Db) -> Result<HashMap<u16, DbMobDefinition>> {
     let sql = r#"
         SELECT MobID, Level, HP, Money1, Money2, AttackSpecial3, Exp, Attack1, AI, ChaseRange
-        FROM PS_GameDefs.dbo.Mobs
+        FROM Mobs
     "#;
 
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[])
-            .await
-            .context("failed to load mob definitions")?
-            .into_results()
-            .await
-            .context("failed to read mob definitions")?;
+    let rows = query_many(conn, "PS_GameDefs", sql, &[], |row| {
+        let mob_id = numeric_u16(row, "MobID", 0);
+        (mob_id, mob_definition_from_row(row, mob_id))
+    })?;
 
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let mob_id = numeric_u16(&row, "MobID", 0);
-                if mob_id == 0 {
-                    return None;
-                }
-                Some((mob_id, mob_definition_from_row(&row, mob_id)))
-            })
-            .collect())
-    }))
+    Ok(rows
+        .into_iter()
+        .filter(|(mob_id, _)| *mob_id != 0)
+        .collect())
 }
 
 /// Single-mob-id lookup, same columns/fallbacks as `get_mob_definitions`
@@ -1627,19 +1608,22 @@ pub fn get_mob_definitions(conn: &mut Db) -> Result<HashMap<u16, DbMobDefinition
 /// placeholder.
 pub fn get_mob_definition(conn: &mut Db, mob_id: u16) -> Result<Option<DbMobDefinition>> {
     let sql = r#"
-        SELECT TOP (1) MobID, Level, HP, Money1, Money2, AttackSpecial3, Exp, Attack1, AI, ChaseRange
-        FROM PS_GameDefs.dbo.Mobs
-        WHERE MobID = @P1
+        SELECT MobID, Level, HP, Money1, Money2, AttackSpecial3, Exp, Attack1, AI, ChaseRange
+        FROM Mobs
+        WHERE MobID = ?1
+        LIMIT 1
     "#;
 
     let mob_id_param = i32::from(mob_id);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&mob_id_param])?;
-    Ok(row.map(|row| mob_definition_from_row(&row, mob_id)))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&mob_id_param], |row| {
+        mob_definition_from_row(row, mob_id)
+    })?;
+    Ok(row)
 }
 
 /// Builds a `DbMobDefinition` from a `Mobs` row, shared by the load-all and
 /// single-id lookups so both apply the exact same columns and fallbacks.
-fn mob_definition_from_row(row: &Row, mob_id: u16) -> DbMobDefinition {
+fn mob_definition_from_row(row: &rusqlite::Row<'_>, mob_id: u16) -> DbMobDefinition {
     DbMobDefinition {
         mob_id,
         level: numeric_u16(row, "Level", 1).max(1),
@@ -1661,30 +1645,17 @@ fn mob_definition_from_row(row: &Row, mob_id: u16) -> DbMobDefinition {
 pub fn get_exp_definitions(conn: &mut Db) -> Result<HashMap<(u16, u8), u32>> {
     let sql = r#"
         SELECT Level, Grow, Exp
-        FROM PS_GameDefs.dbo.ExpDefs
+        FROM ExpDefs
     "#;
 
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[])
-            .await
-            .context("failed to load exp definitions")?
-            .into_results()
-            .await
-            .context("failed to read exp definitions")?;
+    let rows = query_many(conn, "PS_GameDefs", sql, &[], |row| {
+        let level = positive_smallint_as_u16(row, "Level", 0);
+        let grow = tinyint_or_default(row, "Grow", 1);
+        let exp = numeric_u32(row, "Exp", 0);
+        ((level, grow), exp)
+    })?;
 
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .map(|row| {
-                let level = positive_smallint_as_u16(&row, "Level", 0);
-                let grow = tinyint_or_default(&row, "Grow", 1);
-                let exp = numeric_u32(&row, "Exp", 0);
-                ((level, grow), exp)
-            })
-            .collect())
-    }))
+    Ok(rows.into_iter().collect())
 }
 
 /// Persists a character's appearance (and, for the change-sex item, sex).
@@ -1707,7 +1678,7 @@ pub fn set_character_appearance(
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET Hair = @P1, Face = @P2, Size = @P3, Sex = @P4 WHERE CharID = @P5",
+        "UPDATE Chars SET Hair = ?1, Face = ?2, Size = ?3, Sex = ?4 WHERE CharID = ?5",
         &[&hair_param, &face_param, &size_param, &sex_param, &character_id_param],
     )
     .context("failed to update character appearance")?;
@@ -1731,9 +1702,9 @@ pub fn set_character_reset_stats(
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars \
-         SET Str = @P1, Dex = @P1, Rec = @P1, Int = @P1, Wis = @P1, Luc = @P1, StatPoint = @P2 \
-         WHERE CharID = @P3",
+        "UPDATE Chars \
+         SET Str = ?1, Dex = ?1, Rec = ?1, Int = ?1, Wis = ?1, Luc = ?1, StatPoint = ?2 \
+         WHERE CharID = ?3",
         &[&base_param, &stat_point_param, &character_id_param],
     )
     .context("failed to reset character stats")?;
@@ -1756,7 +1727,7 @@ pub fn set_character_status(
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET HP = @P1, MP = @P2, SP = @P3 WHERE CharID = @P4",
+        "UPDATE Chars SET HP = ?1, MP = ?2, SP = ?3 WHERE CharID = ?4",
         &[&hp_param, &mp_param, &sp_param, &character_id_param],
     )
     .context("failed to update character status")?;
@@ -1778,7 +1749,7 @@ pub fn set_character_level_exp(
     execute(
         conn,
         "PS_GameData",
-        "UPDATE PS_GameData.dbo.Chars SET Level = @P1, Exp = @P2 WHERE CharID = @P3",
+        "UPDATE Chars SET Level = ?1, Exp = ?2 WHERE CharID = ?3",
         &[&level_param, &exp_param, &character_id_param],
     )
     .context("failed to update character level/exp")?;
@@ -1816,34 +1787,33 @@ pub fn create_character_item(
     count: u8,
 ) -> Result<DbCharacterItem> {
     let sql = r#"
-        INSERT INTO PS_GameData.dbo.CharItems (
+        INSERT INTO CharItems (
             CharID, ItemID, ItemUID, Type, TypeID, Bag, Slot, Quality,
             Gem1, Gem2, Gem3, Gem4, Gem5, Gem6, Craftname, Count, Maketime, Maketype, Del
         )
-        OUTPUT INSERTED.RowID
         VALUES (
-            @P1, @P2,
-            CAST(ABS(CHECKSUM(NEWID())) AS bigint) * 2147483648 + CAST(ABS(CHECKSUM(NEWID())) AS bigint),
-            @P3, @P4, @P5, @P6, @P7,
-            0, 0, 0, 0, 0, 0, '', @P8, GETDATE(), 'S', 0
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            0, 0, 0, 0, 0, 0, '', ?9, datetime('now'), 'S', 0
         )
     "#;
 
     let character_id_i32 = character_id as i32;
     let item_id = i32::from(item.item_type) * 1000 + i32::from(item.type_id);
+    let item_uid = random_item_uid();
     let item_type = i32::from(item.item_type);
     let type_id = i32::from(item.type_id);
     let bag_i32 = i32::from(bag);
     let slot_i32 = i32::from(slot);
     let quality = i32::from(item.quality);
     let count_i32 = i32::from(count.max(1));
-    let row = query_one(
+    let row_id = insert_and_last_row_id(
         conn,
         "PS_GameData",
         sql,
         &[
             &character_id_i32,
             &item_id,
+            &item_uid,
             &item_type,
             &type_id,
             &bag_i32,
@@ -1851,11 +1821,11 @@ pub fn create_character_item(
             &quality,
             &count_i32,
         ],
-    )?
-    .context("character item was not created")?;
+    )
+    .context("failed to create character item")?;
 
     Ok(DbCharacterItem {
-        row_id: row.get::<i32, _>(0).unwrap_or_default().max(0) as u32,
+        row_id: row_id.max(0) as u32,
         bag,
         slot,
         item_type: item.item_type,
@@ -1877,21 +1847,19 @@ pub fn create_character_item_from_template(
     count: u8,
 ) -> Result<DbCharacterItem> {
     let sql = r#"
-        INSERT INTO PS_GameData.dbo.CharItems (
+        INSERT INTO CharItems (
             CharID, ItemID, ItemUID, Type, TypeID, Bag, Slot, Quality,
             Gem1, Gem2, Gem3, Gem4, Gem5, Gem6, Craftname, Count, Maketime, Maketype, Del
         )
-        OUTPUT INSERTED.RowID
         VALUES (
-            @P1, @P2,
-            CAST(ABS(CHECKSUM(NEWID())) AS bigint) * 2147483648 + CAST(ABS(CHECKSUM(NEWID())) AS bigint),
-            @P3, @P4, @P5, @P6, @P7,
-            @P8, @P9, @P10, @P11, @P12, @P13, @P14, @P15, GETDATE(), 'S', 0
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime('now'), 'S', 0
         )
     "#;
 
     let character_id_i32 = character_id as i32;
     let item_id = i32::from(item.item_type) * 1000 + i32::from(item.type_id);
+    let item_uid = random_item_uid();
     let item_type = i32::from(item.item_type);
     let type_id = i32::from(item.type_id);
     let bag_i32 = i32::from(bag);
@@ -1904,13 +1872,14 @@ pub fn create_character_item_from_template(
     let gem5 = i32::from(item.gems[4]);
     let gem6 = i32::from(item.gems[5]);
     let count_i32 = i32::from(count.max(1));
-    let row = query_one(
+    let row_id = insert_and_last_row_id(
         conn,
         "PS_GameData",
         sql,
         &[
             &character_id_i32,
             &item_id,
+            &item_uid,
             &item_type,
             &type_id,
             &bag_i32,
@@ -1925,11 +1894,11 @@ pub fn create_character_item_from_template(
             &item.craft_name,
             &count_i32,
         ],
-    )?
-    .context("character item was not created from template")?;
+    )
+    .context("failed to create character item from template")?;
 
     let mut created = item.clone();
-    created.row_id = row.get::<i32, _>(0).unwrap_or_default().max(0) as u32;
+    created.row_id = row_id.max(0) as u32;
     created.bag = bag;
     created.slot = slot;
     created.count = count.max(1);
@@ -1944,10 +1913,10 @@ pub fn move_character_item(
     slot: u8,
 ) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.CharItems
-        SET Bag = @P3, Slot = @P4
-        WHERE CharID = @P1
-            AND RowID = @P2
+        UPDATE CharItems
+        SET Bag = ?3, Slot = ?4
+        WHERE CharID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -1975,10 +1944,10 @@ pub fn set_character_item_count(
     }
 
     let sql = r#"
-        UPDATE PS_GameData.dbo.CharItems
-        SET Count = @P3
-        WHERE CharID = @P1
-            AND RowID = @P2
+        UPDATE CharItems
+        SET Count = ?3
+        WHERE CharID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -1991,10 +1960,10 @@ pub fn set_character_item_count(
 
 pub fn delete_character_item(conn: &mut Db, character_id: u32, row_id: u32) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.CharItems
+        UPDATE CharItems
         SET Count = 0, Del = 1
-        WHERE CharID = @P1
-            AND RowID = @P2
+        WHERE CharID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -2012,10 +1981,10 @@ pub fn consume_character_item(
 ) -> Result<()> {
     if remaining_count == 0 {
         let sql = r#"
-            UPDATE PS_GameData.dbo.CharItems
+            UPDATE CharItems
             SET Count = 0, Del = 1
-            WHERE CharID = @P1
-                AND RowID = @P2
+            WHERE CharID = ?1
+                AND RowID = ?2
                 AND Del = 0
         "#;
 
@@ -2026,10 +1995,10 @@ pub fn consume_character_item(
     }
 
     let sql = r#"
-        UPDATE PS_GameData.dbo.CharItems
-        SET Count = @P3
-        WHERE CharID = @P1
-            AND RowID = @P2
+        UPDATE CharItems
+        SET Count = ?3
+        WHERE CharID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -2056,20 +2025,20 @@ pub fn swap_character_items(
     second_slot: u8,
 ) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.CharItems
+        UPDATE CharItems
         SET
             Bag = CASE RowID
-                WHEN @P2 THEN @P3
-                WHEN @P5 THEN @P6
+                WHEN ?2 THEN ?3
+                WHEN ?5 THEN ?6
                 ELSE Bag
             END,
             Slot = CASE RowID
-                WHEN @P2 THEN @P4
-                WHEN @P5 THEN @P7
+                WHEN ?2 THEN ?4
+                WHEN ?5 THEN ?7
                 ELSE Slot
             END
-        WHERE CharID = @P1
-            AND RowID IN (@P2, @P5)
+        WHERE CharID = ?1
+            AND RowID IN (?2, ?5)
             AND Del = 0
     "#;
 
@@ -2108,52 +2077,17 @@ pub fn get_stored_items(conn: &mut Db, account_id: u32) -> Result<Vec<DbCharacte
             RowID, Slot, Type, TypeID, Quality,
             Gem1, Gem2, Gem3, Gem4, Gem5, Gem6,
             Count, Craftname
-        FROM PS_GameData.dbo.UserStoredItems
-        WHERE UserUID = @P1
+        FROM UserStoredItems
+        WHERE UserUID = ?1
             AND Del = 0
             AND Count > 0
         ORDER BY Slot
     "#;
 
     let account_id = account_id as i32;
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[&account_id])
-            .await
-            .context("failed to load stored items")?
-            .into_results()
-            .await
-            .context("failed to read stored items")?;
-
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .map(|row| DbCharacterItem {
-                row_id: row.get::<i32, _>("RowID").unwrap_or_default().max(0) as u32,
-                bag: 0,
-                slot: row.get::<i32, _>("Slot").unwrap_or_default().max(0) as u8,
-                item_type: tinyint_or_default(&row, "Type", 0),
-                type_id: tinyint_or_default(&row, "TypeID", 0),
-                quality: positive_smallint_as_u16(&row, "Quality", 0),
-                gems: [
-                    tinyint_or_default(&row, "Gem1", 0),
-                    tinyint_or_default(&row, "Gem2", 0),
-                    tinyint_or_default(&row, "Gem3", 0),
-                    tinyint_or_default(&row, "Gem4", 0),
-                    tinyint_or_default(&row, "Gem5", 0),
-                    tinyint_or_default(&row, "Gem6", 0),
-                ],
-                count: tinyint_or_default(&row, "Count", 1),
-                craft_name: row
-                    .get::<&str, _>("Craftname")
-                    .unwrap_or_default()
-                    .trim_end()
-                    .to_string(),
-                dyed: false,
-            })
-            .collect())
-    }))
+    query_many(conn, "PS_GameData", sql, &[&account_id], |row| {
+        row_to_character_item(row, Some(0))
+    })
 }
 
 pub fn create_stored_item_from_template(
@@ -2164,17 +2098,13 @@ pub fn create_stored_item_from_template(
     count: u8,
 ) -> Result<DbCharacterItem> {
     let sql = r#"
-        INSERT INTO PS_GameData.dbo.UserStoredItems (
+        INSERT INTO UserStoredItems (
             ServerID, UserUID, ItemID, Type, TypeID, ItemUID, Slot, Quality,
             Gem1, Gem2, Gem3, Gem4, Gem5, Gem6, Craftname, Count, Maketime, Maketype, Del
         )
-        OUTPUT INSERTED.RowID
         VALUES (
-            @P1, @P2, @P3,
-            @P4, @P5,
-            CAST(ABS(CHECKSUM(NEWID())) AS bigint) * 2147483648 + CAST(ABS(CHECKSUM(NEWID())) AS bigint),
-            @P6, @P7,
-            @P8, @P9, @P10, @P11, @P12, @P13, @P14, @P15, GETDATE(), 'S', 0
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime('now'), 'S', 0
         )
     "#;
 
@@ -2183,6 +2113,7 @@ pub fn create_stored_item_from_template(
     let item_id = i32::from(item.item_type) * 1000 + i32::from(item.type_id);
     let item_type = i32::from(item.item_type);
     let type_id = i32::from(item.type_id);
+    let item_uid = random_item_uid();
     let slot_i32 = i32::from(slot);
     let quality = i32::from(item.quality);
     let gem1 = i32::from(item.gems[0]);
@@ -2192,7 +2123,7 @@ pub fn create_stored_item_from_template(
     let gem5 = i32::from(item.gems[4]);
     let gem6 = i32::from(item.gems[5]);
     let count_i32 = i32::from(count.max(1));
-    let row = query_one(
+    let row_id = insert_and_last_row_id(
         conn,
         "PS_GameData",
         sql,
@@ -2202,6 +2133,7 @@ pub fn create_stored_item_from_template(
             &item_id,
             &item_type,
             &type_id,
+            &item_uid,
             &slot_i32,
             &quality,
             &gem1,
@@ -2213,11 +2145,11 @@ pub fn create_stored_item_from_template(
             &item.craft_name,
             &count_i32,
         ],
-    )?
-    .context("stored item was not created")?;
+    )
+    .context("failed to create stored item")?;
 
     let mut created = item.clone();
-    created.row_id = row.get::<i32, _>(0).unwrap_or_default().max(0) as u32;
+    created.row_id = row_id.max(0) as u32;
     created.bag = 0;
     created.slot = slot;
     created.count = count.max(1);
@@ -2226,10 +2158,10 @@ pub fn create_stored_item_from_template(
 
 pub fn move_stored_item(conn: &mut Db, account_id: u32, row_id: u32, slot: u8) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.UserStoredItems
-        SET Slot = @P3
-        WHERE UserUID = @P1
-            AND RowID = @P2
+        UPDATE UserStoredItems
+        SET Slot = ?3
+        WHERE UserUID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -2249,14 +2181,14 @@ pub fn swap_stored_items(
     second_slot: u8,
 ) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.UserStoredItems
+        UPDATE UserStoredItems
         SET Slot = CASE RowID
-                WHEN @P2 THEN @P3
-                WHEN @P4 THEN @P5
+                WHEN ?2 THEN ?3
+                WHEN ?4 THEN ?5
                 ELSE Slot
             END
-        WHERE UserUID = @P1
-            AND RowID IN (@P2, @P4)
+        WHERE UserUID = ?1
+            AND RowID IN (?2, ?4)
             AND Del = 0
     "#;
 
@@ -2291,10 +2223,10 @@ pub fn set_stored_item_count(
     }
 
     let sql = r#"
-        UPDATE PS_GameData.dbo.UserStoredItems
-        SET Count = @P3
-        WHERE UserUID = @P1
-            AND RowID = @P2
+        UPDATE UserStoredItems
+        SET Count = ?3
+        WHERE UserUID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -2307,10 +2239,10 @@ pub fn set_stored_item_count(
 
 pub fn delete_stored_item(conn: &mut Db, account_id: u32, row_id: u32) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.UserStoredItems
+        UPDATE UserStoredItems
         SET Count = 0, Del = 1
-        WHERE UserUID = @P1
-            AND RowID = @P2
+        WHERE UserUID = ?1
+            AND RowID = ?2
             AND Del = 0
     "#;
 
@@ -2323,33 +2255,18 @@ pub fn delete_stored_item(conn: &mut Db, account_id: u32, row_id: u32) -> Result
 pub fn get_character_quick_slots(conn: &mut Db, character_id: u32) -> Result<Vec<DbQuickSlot>> {
     let sql = r#"
         SELECT QuickBar, QuickSlot, Bag, Number
-        FROM PS_GameData.dbo.CharQuickSlots
-        WHERE CharID = @P1
+        FROM CharQuickSlots
+        WHERE CharID = ?1
         ORDER BY QuickBar, QuickSlot
     "#;
 
     let character_id = character_id as i32;
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[&character_id])
-            .await
-            .context("failed to load character quick slots")?
-            .into_results()
-            .await
-            .context("failed to read character quick slots")?;
-
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .map(|row| DbQuickSlot {
-                quick_bar: tinyint_or_default(&row, "QuickBar", 0),
-                quick_slot: tinyint_or_default(&row, "QuickSlot", 0),
-                bag: tinyint_or_default(&row, "Bag", 0),
-                number: positive_smallint_as_u16(&row, "Number", 0),
-            })
-            .collect())
-    }))
+    query_many(conn, "PS_GameData", sql, &[&character_id], |row| DbQuickSlot {
+        quick_bar: tinyint_or_default(row, "QuickBar", 0),
+        quick_slot: tinyint_or_default(row, "QuickSlot", 0),
+        bag: tinyint_or_default(row, "Bag", 0),
+        number: positive_smallint_as_u16(row, "Number", 0),
+    })
 }
 
 pub fn save_character_quick_slots(
@@ -2357,21 +2274,21 @@ pub fn save_character_quick_slots(
     character_id: u32,
     quick_slots: &[DbQuickSlot],
 ) -> Result<()> {
-    let character_id = character_id as i32;
+    let character_id_param = character_id as i32;
     execute(
         conn,
         "PS_GameData",
-        "DELETE FROM PS_GameData.dbo.CharQuickSlots WHERE CharID = @P1",
-        &[&character_id],
+        "DELETE FROM CharQuickSlots WHERE CharID = ?1",
+        &[&character_id_param],
     )
     .context("failed to clear character quick slots")?;
 
     for quick_slot in quick_slots.iter().take(128) {
         let sql = r#"
-            INSERT INTO PS_GameData.dbo.CharQuickSlots (
+            INSERT INTO CharQuickSlots (
                 CharID, QuickBar, QuickSlot, Bag, Number
             )
-            VALUES (@P1, @P2, @P3, @P4, @P5)
+            VALUES (?1, ?2, ?3, ?4, ?5)
         "#;
 
         let quick_bar = i32::from(quick_slot.quick_bar);
@@ -2382,7 +2299,7 @@ pub fn save_character_quick_slots(
             conn,
             "PS_GameData",
             sql,
-            &[&character_id, &quick_bar, &quick_slot_index, &bag, &number],
+            &[&character_id_param, &quick_bar, &quick_slot_index, &bag, &number],
         )
         .context("failed to insert character quick slot")?;
     }
@@ -2391,48 +2308,33 @@ pub fn save_character_quick_slots(
 }
 
 pub fn get_character_skills(conn: &mut Db, character_id: u32) -> Result<Vec<DbCharacterSkill>> {
-    // `CreateTime` is `smalldatetime` (minute precision only), so the
-    // moment a cooldown started can be stored up to ~30s off from when it
-    // really started. A 30s safety margin is subtracted here so that
-    // worst-case rounding error can only make a skill appear ready a
+    // `CreateTime` was historically minute-precision (`smalldatetime`), so
+    // the moment a cooldown started could be stored up to ~30s off from
+    // when it really started. A 30s safety margin is subtracted here so
+    // that worst-case rounding error can only make a skill appear ready a
     // little EARLY, never stuck on cooldown longer than it really should
     // be -- the direction that matters, since "ready a bit early" is a
     // minor inconvenience but "stuck longer than real" would look broken.
     let sql = r#"
         SELECT SkillID, SkillLevel, Number,
             CASE
-                WHEN Delay - DATEDIFF(SECOND, CreateTime, GETDATE()) - 30 > 0
-                    THEN Delay - DATEDIFF(SECOND, CreateTime, GETDATE()) - 30
+                WHEN Delay - (strftime('%s','now') - strftime('%s', CreateTime)) - 30 > 0
+                    THEN Delay - (strftime('%s','now') - strftime('%s', CreateTime)) - 30
                 ELSE 0
             END AS RemainingCooldown
-        FROM PS_GameData.dbo.CharSkills
-        WHERE CharID = @P1
+        FROM CharSkills
+        WHERE CharID = ?1
             AND Del = 0
         ORDER BY Number
     "#;
 
     let character_id = character_id as i32;
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[&character_id])
-            .await
-            .context("failed to load character skills")?
-            .into_results()
-            .await
-            .context("failed to read character skills")?;
-
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .map(|row| DbCharacterSkill {
-                skill_id: positive_smallint_as_u16(&row, "SkillID", 0),
-                skill_level: tinyint_or_default(&row, "SkillLevel", 1),
-                number: tinyint_or_default(&row, "Number", 0),
-                delay: row.get::<i32, _>("RemainingCooldown").unwrap_or_default().max(0),
-            })
-            .collect())
-    }))
+    query_many(conn, "PS_GameData", sql, &[&character_id], |row| DbCharacterSkill {
+        skill_id: positive_smallint_as_u16(row, "SkillID", 0),
+        skill_level: tinyint_or_default(row, "SkillLevel", 1),
+        number: tinyint_or_default(row, "Number", 0),
+        delay: row.get::<_, i64>("RemainingCooldown").unwrap_or_default().max(0) as i32,
+    })
 }
 
 pub fn get_skill_definition(
@@ -2441,7 +2343,7 @@ pub fn get_skill_definition(
     skill_level: u8,
 ) -> Result<Option<DbSkillDefinition>> {
     let sql = r#"
-        SELECT TOP (1)
+        SELECT
             SkillID, SkillLevel, ReqLevel, SkillPoint, PrevSkillID,
             Attackfighter, Defensefighter, Patrolrogue, Shootrogue,
             Attackmage, Defensemage,
@@ -2454,89 +2356,89 @@ pub fn get_skill_definition(
             AbilityType9, AbilityValue9, AbilityType10, AbilityValue10,
             TimeDamageHP, TimeDamageSP, TimeDamageMP,
             AttackRange, TypeAttack, TargetType, ApplyRange, MultiAttack
-        FROM PS_GameDefs.dbo.Skills
-        WHERE SkillID = @P1
-            AND SkillLevel = @P2
+        FROM Skills
+        WHERE SkillID = ?1
+            AND SkillLevel = ?2
+        LIMIT 1
     "#;
 
     let skill_id_i32 = i32::from(skill_id);
     let skill_level_i32 = i32::from(skill_level);
-    let row = query_one(conn, "PS_GameDefs", sql, &[&skill_id_i32, &skill_level_i32])?;
-    Ok(row.map(|row| DbSkillDefinition {
-        skill_id: row
-            .get::<i32, _>("SkillID")
-            .map(|value| value.max(0) as u16)
-            .unwrap_or(skill_id),
-        skill_level: tinyint_or_default(&row, "SkillLevel", skill_level),
-        req_level: row.get::<i16, _>("ReqLevel").unwrap_or_default().max(0) as u16,
-        skill_point_cost: tinyint_or_default(&row, "SkillPoint", 0),
-        prev_skill_id: row.get::<i16, _>("PrevSkillID").unwrap_or_default().max(0) as u16,
-        class_eligible: [
-            tinyint_or_default(&row, "Attackfighter", 0) != 0,
-            tinyint_or_default(&row, "Defensefighter", 0) != 0,
-            tinyint_or_default(&row, "Patrolrogue", 0) != 0,
-            tinyint_or_default(&row, "Shootrogue", 0) != 0,
-            tinyint_or_default(&row, "Attackmage", 0) != 0,
-            tinyint_or_default(&row, "Defensemage", 0) != 0,
-        ],
-        mp_cost: row.get::<i16, _>("MP").unwrap_or_default().max(0) as u16,
-        sp_cost: row.get::<i16, _>("SP").unwrap_or_default().max(0) as u16,
-        reset_time_seconds: row.get::<i16, _>("ResetTime").unwrap_or_default().max(0) as u16,
-        damage_hp: i32::from(row.get::<i16, _>("DamageHP").unwrap_or_default()),
-        add_damage_hp: i32::from(row.get::<i16, _>("AddDamageHP").unwrap_or_default()),
-        heal_hp: i32::from(row.get::<i16, _>("HealHP").unwrap_or_default()),
-        heal_sp: i32::from(row.get::<i16, _>("HealSP").unwrap_or_default()),
-        heal_mp: i32::from(row.get::<i16, _>("HealMP").unwrap_or_default()),
-        type_detail: positive_smallint_as_u16(&row, "TypeDetail", 0),
-        keep_time: positive_smallint_as_u16(&row, "KeepTime", 0),
-        time_heal_hp: i32::from(row.get::<i16, _>("TimeHealHP").unwrap_or_default()),
-        time_heal_sp: i32::from(row.get::<i16, _>("TimeHealSP").unwrap_or_default()),
-        time_heal_mp: i32::from(row.get::<i16, _>("TimeHealMP").unwrap_or_default()),
-        ready_time: tinyint_or_default(&row, "ReadyTime", 0),
-        ability_type: [
-            tinyint_or_default(&row, "AbilityType1", 0),
-            tinyint_or_default(&row, "AbilityType2", 0),
-            tinyint_or_default(&row, "AbilityType3", 0),
-            tinyint_or_default(&row, "AbilityType4", 0),
-            tinyint_or_default(&row, "AbilityType5", 0),
-            tinyint_or_default(&row, "AbilityType6", 0),
-            tinyint_or_default(&row, "AbilityType7", 0),
-            tinyint_or_default(&row, "AbilityType8", 0),
-            tinyint_or_default(&row, "AbilityType9", 0),
-            tinyint_or_default(&row, "AbilityType10", 0),
-        ],
-        ability_value: [
-            row.get::<i16, _>("AbilityValue1").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue2").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue3").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue4").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue5").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue6").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue7").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue8").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue9").unwrap_or_default(),
-            row.get::<i16, _>("AbilityValue10").unwrap_or_default(),
-        ],
-        time_damage_hp: i32::from(row.get::<i16, _>("TimeDamageHP").unwrap_or_default()),
-        time_damage_sp: i32::from(row.get::<i16, _>("TimeDamageSP").unwrap_or_default()),
-        time_damage_mp: i32::from(row.get::<i16, _>("TimeDamageMP").unwrap_or_default()),
-        attack_range: tinyint_or_default(&row, "AttackRange", 0),
-        type_attack: tinyint_or_default(&row, "TypeAttack", 0),
-        target_type: tinyint_or_default(&row, "TargetType", 0),
-        apply_range: tinyint_or_default(&row, "ApplyRange", 0),
-        multi_attack: tinyint_or_default(&row, "MultiAttack", 0),
-    }))
+    let row = query_one(conn, "PS_GameDefs", sql, &[&skill_id_i32, &skill_level_i32], |row| {
+        DbSkillDefinition {
+            skill_id: row
+                .get::<_, i64>("SkillID")
+                .map(|value| value.max(0) as u16)
+                .unwrap_or(skill_id),
+            skill_level: tinyint_or_default(row, "SkillLevel", skill_level),
+            req_level: row.get::<_, i64>("ReqLevel").unwrap_or_default().max(0) as u16,
+            skill_point_cost: tinyint_or_default(row, "SkillPoint", 0),
+            prev_skill_id: row.get::<_, i64>("PrevSkillID").unwrap_or_default().max(0) as u16,
+            class_eligible: [
+                tinyint_or_default(row, "Attackfighter", 0) != 0,
+                tinyint_or_default(row, "Defensefighter", 0) != 0,
+                tinyint_or_default(row, "Patrolrogue", 0) != 0,
+                tinyint_or_default(row, "Shootrogue", 0) != 0,
+                tinyint_or_default(row, "Attackmage", 0) != 0,
+                tinyint_or_default(row, "Defensemage", 0) != 0,
+            ],
+            mp_cost: row.get::<_, i64>("MP").unwrap_or_default().max(0) as u16,
+            sp_cost: row.get::<_, i64>("SP").unwrap_or_default().max(0) as u16,
+            reset_time_seconds: row.get::<_, i64>("ResetTime").unwrap_or_default().max(0) as u16,
+            damage_hp: row.get::<_, i64>("DamageHP").unwrap_or_default() as i32,
+            add_damage_hp: row.get::<_, i64>("AddDamageHP").unwrap_or_default() as i32,
+            heal_hp: row.get::<_, i64>("HealHP").unwrap_or_default() as i32,
+            heal_sp: row.get::<_, i64>("HealSP").unwrap_or_default() as i32,
+            heal_mp: row.get::<_, i64>("HealMP").unwrap_or_default() as i32,
+            type_detail: positive_smallint_as_u16(row, "TypeDetail", 0),
+            keep_time: positive_smallint_as_u16(row, "KeepTime", 0),
+            time_heal_hp: row.get::<_, i64>("TimeHealHP").unwrap_or_default() as i32,
+            time_heal_sp: row.get::<_, i64>("TimeHealSP").unwrap_or_default() as i32,
+            time_heal_mp: row.get::<_, i64>("TimeHealMP").unwrap_or_default() as i32,
+            ready_time: tinyint_or_default(row, "ReadyTime", 0),
+            ability_type: [
+                tinyint_or_default(row, "AbilityType1", 0),
+                tinyint_or_default(row, "AbilityType2", 0),
+                tinyint_or_default(row, "AbilityType3", 0),
+                tinyint_or_default(row, "AbilityType4", 0),
+                tinyint_or_default(row, "AbilityType5", 0),
+                tinyint_or_default(row, "AbilityType6", 0),
+                tinyint_or_default(row, "AbilityType7", 0),
+                tinyint_or_default(row, "AbilityType8", 0),
+                tinyint_or_default(row, "AbilityType9", 0),
+                tinyint_or_default(row, "AbilityType10", 0),
+            ],
+            ability_value: [
+                row.get::<_, i64>("AbilityValue1").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue2").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue3").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue4").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue5").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue6").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue7").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue8").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue9").unwrap_or_default() as i16,
+                row.get::<_, i64>("AbilityValue10").unwrap_or_default() as i16,
+            ],
+            time_damage_hp: row.get::<_, i64>("TimeDamageHP").unwrap_or_default() as i32,
+            time_damage_sp: row.get::<_, i64>("TimeDamageSP").unwrap_or_default() as i32,
+            time_damage_mp: row.get::<_, i64>("TimeDamageMP").unwrap_or_default() as i32,
+            attack_range: tinyint_or_default(row, "AttackRange", 0),
+            type_attack: tinyint_or_default(row, "TypeAttack", 0),
+            target_type: tinyint_or_default(row, "TargetType", 0),
+            apply_range: tinyint_or_default(row, "ApplyRange", 0),
+            multi_attack: tinyint_or_default(row, "MultiAttack", 0),
+        }
+    })?;
+    Ok(row)
 }
 
-/// `CharSkills.Delay` is a `smallint` -- too small to hold an absolute unix
-/// timestamp, so it can't work like `UserStoredItems`-style "expiry" columns
-/// elsewhere in this project. Instead, `Delay` holds the cooldown's
-/// DURATION in seconds and `CreateTime` (otherwise unused after a skill is
-/// learned -- only written once at learn time and never read back) is
-/// repurposed as "cooldown started at", so `get_character_skills` can
-/// always recompute an accurate "seconds remaining" via `DATEDIFF`
-/// regardless of how much real time passed since this was set (including
-/// across a relog or a long time offline).
+/// `CharSkills.Delay` holds the cooldown's DURATION in seconds and
+/// `CreateTime` (otherwise unused after a skill is learned -- only written
+/// once at learn time and never read back) is repurposed as "cooldown
+/// started at", so `get_character_skills` can always recompute an accurate
+/// "seconds remaining" regardless of how much real time passed since this
+/// was set (including across a relog or a long time offline).
 pub fn set_character_skill_cooldown(
     conn: &mut Db,
     character_id: u32,
@@ -2544,10 +2446,10 @@ pub fn set_character_skill_cooldown(
     duration_seconds: u16,
 ) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.CharSkills
-        SET Delay = @P3, CreateTime = GETDATE()
-        WHERE CharID = @P1
-            AND SkillID = @P2
+        UPDATE CharSkills
+        SET Delay = ?3, CreateTime = datetime('now')
+        WHERE CharID = ?1
+            AND SkillID = ?2
     "#;
 
     let character_id_param = character_id as i32;
@@ -2572,39 +2474,26 @@ pub struct DbCharacterAppliedBuff {
 /// Reads every buff row persisted for this character in `CharApplySkills`.
 /// Unlike skill cooldowns, buffs freeze while offline rather than
 /// continuing to count down (confirmed by the user), so `LeftResetTime`
-/// is a plain snapshot of remaining seconds -- no timestamp/DATEDIFF
-/// trick is needed to recompute elapsed offline time.
+/// is a plain snapshot of remaining seconds -- no timestamp trick is
+/// needed to recompute elapsed offline time.
 pub fn get_character_apply_skills(conn: &mut Db, character_id: u32) -> Result<Vec<DbCharacterAppliedBuff>> {
     let sql = r#"
         SELECT SkillID, SkillLevel, LeftResetTime
-        FROM PS_GameData.dbo.CharApplySkills
-        WHERE CharID = @P1
+        FROM CharApplySkills
+        WHERE CharID = ?1
     "#;
 
     let character_id_param = character_id as i32;
-    let _ = conn;
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(sql, &[&character_id_param])
-            .await
-            .context("failed to query character apply skills")?
-            .into_results()
-            .await
-            .context("failed to read character apply skills rows")?;
-
-        Ok(rows
-            .into_iter()
-            .flatten()
-            .map(|row| DbCharacterAppliedBuff {
-                skill_id: positive_smallint_as_u16(&row, "SkillID", 0),
-                skill_level: tinyint_or_default(&row, "SkillLevel", 0),
-                left_reset_time_seconds: row
-                    .get::<i32, _>("LeftResetTime")
-                    .unwrap_or_default()
-                    .max(0) as u32,
-            })
-            .collect())
-    }))
+    query_many(conn, "PS_GameData", sql, &[&character_id_param], |row| {
+        DbCharacterAppliedBuff {
+            skill_id: positive_smallint_as_u16(row, "SkillID", 0),
+            skill_level: tinyint_or_default(row, "SkillLevel", 0),
+            left_reset_time_seconds: row
+                .get::<_, i64>("LeftResetTime")
+                .unwrap_or_default()
+                .max(0) as u32,
+        }
+    })
 }
 
 /// Upserts one buff's remaining seconds -- `CharApplySkills` has no unique
@@ -2621,8 +2510,8 @@ pub fn set_character_apply_skill(
     clear_character_apply_skill(conn, character_id, skill_id)?;
 
     let sql = r#"
-        INSERT INTO PS_GameData.dbo.CharApplySkills (CharID, SkillID, SkillLevel, LeftResetTime)
-        VALUES (@P1, @P2, @P3, @P4)
+        INSERT INTO CharApplySkills (CharID, SkillID, SkillLevel, LeftResetTime)
+        VALUES (?1, ?2, ?3, ?4)
     "#;
     let character_id_param = character_id as i32;
     let skill_id_param = i32::from(skill_id);
@@ -2643,7 +2532,7 @@ pub fn clear_character_apply_skill(conn: &mut Db, character_id: u32, skill_id: u
     execute(
         conn,
         "PS_GameData",
-        "DELETE FROM PS_GameData.dbo.CharApplySkills WHERE CharID = @P1 AND SkillID = @P2",
+        "DELETE FROM CharApplySkills WHERE CharID = ?1 AND SkillID = ?2",
         &[&character_id_param, &skill_id_param],
     )
     .context("failed to clear character apply skill")
@@ -2660,26 +2549,26 @@ pub fn learn_character_skill(
         .find(|skill| skill.skill_id == skill_id)
     {
         let sql = r#"
-            UPDATE PS_GameData.dbo.CharSkills
-            SET SkillLevel = @P3, Delay = 0, Del = 0
-            WHERE CharID = @P1
-                AND SkillID = @P2
+            UPDATE CharSkills
+            SET SkillLevel = ?3, Delay = 0, Del = 0
+            WHERE CharID = ?1
+                AND SkillID = ?2
         "#;
 
         let character_id = character_id as i32;
-        let skill_id = skill_id as i32;
-        let skill_level = i32::from(skill_level);
+        let skill_id_i32 = skill_id as i32;
+        let skill_level_i32 = i32::from(skill_level);
         execute(
             conn,
             "PS_GameData",
             sql,
-            &[&character_id, &skill_id, &skill_level],
+            &[&character_id, &skill_id_i32, &skill_level_i32],
         )
         .context("failed to update character skill")?;
 
         return Ok(DbCharacterSkill {
-            skill_id: skill_id as u16,
-            skill_level: skill_level as u8,
+            skill_id,
+            skill_level,
             number: existing.number,
             delay: 0,
         });
@@ -2687,10 +2576,10 @@ pub fn learn_character_skill(
 
     let next_number = next_character_skill_number(conn, character_id)?;
     let sql = r#"
-        INSERT INTO PS_GameData.dbo.CharSkills (
+        INSERT INTO CharSkills (
             CharID, SkillID, SkillLevel, Number, Delay, CreateTime, Del
         )
-        VALUES (@P1, @P2, @P3, @P4, 0, GETDATE(), 0)
+        VALUES (?1, ?2, ?3, ?4, 0, datetime('now'), 0)
     "#;
 
     let character_id_i32 = character_id as i32;
@@ -2719,26 +2608,25 @@ pub fn learn_character_skill(
 }
 
 fn next_character_skill_number(conn: &mut Db, character_id: u32) -> Result<u8> {
-    // ISNULL(MAX(Number), -1) crashes with "Arithmetic overflow ... tinyint,
-    // value = -1" whenever a character has zero rows (MAX returns NULL):
-    // ISNULL's replacement value gets type-matched to MAX(Number)'s own
-    // type (tinyint, unsigned 0-255) BEFORE the outer CAST to int ever
-    // runs, and -1 doesn't fit in a tinyint. Casting MAX(Number) to int
-    // FIRST avoids that -- NULL survives a CAST fine, and ISNULL then only
-    // ever deals with int-typed values.
+    // SQLite's MAX() over an empty set returns NULL cleanly (no tinyint-
+    // typing overflow gotcha like SQL Server had, where ISNULL's
+    // replacement value got type-matched to MAX(Number)'s own narrow
+    // column type before the outer cast ever ran) -- COALESCE(MAX(Number),
+    // -1) is a direct, safe base case: no skills yet means "start at 0"
+    // (next = -1 + 1).
     let sql = r#"
-        SELECT ISNULL(CAST(MAX(Number) AS int), -1) AS MaxNumber
-        FROM PS_GameData.dbo.CharSkills
-        WHERE CharID = @P1
+        SELECT COALESCE(MAX(Number), -1) AS MaxNumber
+        FROM CharSkills
+        WHERE CharID = ?1
     "#;
 
     let character_id_param = character_id as i32;
-    let row = query_one(conn, "PS_GameData", sql, &[&character_id_param])?;
-    let max_number = row
-        .and_then(|row| row.get::<i32, _>("MaxNumber"))
-        .unwrap_or(-1);
+    let max_number = query_one(conn, "PS_GameData", sql, &[&character_id_param], |row| {
+        row.get::<_, i64>("MaxNumber").unwrap_or(-1)
+    })?
+    .unwrap_or(-1);
     let next = max_number.saturating_add(1);
-    if next > i32::from(u8::MAX) {
+    if next > i64::from(u8::MAX) {
         anyhow::bail!(
             "character {character_id} already has the maximum of {} skill bar entries",
             u8::MAX as i32 + 1
@@ -2760,18 +2648,17 @@ pub fn create_character(
     let (start_hp, start_mp, start_sp) = (100u32, 100u32, 100u32);
 
     let sql = r#"
-        INSERT INTO PS_GameData.dbo.Chars (
+        INSERT INTO Chars (
             ServerID, UserID, UserUID, CharName, Slot, Family, Grow, Hair, Face, Size, Job, Sex,
             Level, StatPoint, SkillPoint, Str, Dex, Rec, Int, Luc, Wis, HP, MP, SP,
             Map, Dir, Exp, Money, PosX, PosY, Posz, Hg, Vg, Cg, Og, Ig,
             K1, K2, K3, K4, KillLevel, DeadLevel, RegDate, RenameCnt, RemainTime, LoginStatus
         )
-        OUTPUT INSERTED.CharID
         VALUES (
-            @P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, @P10, @P11, @P12,
-            1, 10, 0, 10, 10, 10, 10, 10, 10, @P17, @P18, @P19,
-            @P13, 0, 0, 0, @P14, @P15, @P16, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, GETDATE(), 0, 0, 0
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+            1, 10, 0, 10, 10, 10, 10, 10, 10, ?17, ?18, ?19,
+            ?13, 0, 0, 0, ?14, ?15, ?16, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, datetime('now'), 0, 0, 0
         )
     "#;
 
@@ -2786,10 +2673,13 @@ pub fn create_character(
     let character_class = i32::from(character.character_class);
     let gender = i32::from(character.gender);
     let map_id = i32::from(character.map_id);
+    let pos_x = f64::from(character.pos_x);
+    let pos_y = f64::from(character.pos_y);
+    let pos_z = f64::from(character.pos_z);
     let start_hp = start_hp as i32;
     let start_mp = start_mp as i32;
     let start_sp = start_sp as i32;
-    let row = query_one(
+    let character_id = insert_and_last_row_id(
         conn,
         "PS_GameData",
         sql,
@@ -2807,17 +2697,17 @@ pub fn create_character(
             &character_class,
             &gender,
             &map_id,
-            &character.pos_x,
-            &character.pos_y,
-            &character.pos_z,
+            &pos_x,
+            &pos_y,
+            &pos_z,
             &start_hp,
             &start_mp,
             &start_sp,
         ],
-    )?
-    .context("character was not created")?;
+    )
+    .context("failed to create character")?;
 
-    let character_id = row.get::<i32, _>(0).unwrap_or_default() as u32;
+    let character_id = character_id.max(0) as u32;
     get_character_by_id(conn, account_id, character_id)?.context("created character not found")
 }
 
@@ -2830,13 +2720,16 @@ pub fn save_character_position(
     z: f32,
 ) -> Result<()> {
     let sql = r#"
-        UPDATE PS_GameData.dbo.Chars
-        SET Map = @P2, PosX = @P3, PosY = @P4, Posz = @P5
-        WHERE CharID = @P1
+        UPDATE Chars
+        SET Map = ?2, PosX = ?3, PosY = ?4, Posz = ?5
+        WHERE CharID = ?1
     "#;
 
     let character_id = character_id as i32;
     let map_id = i32::from(map_id);
+    let x = f64::from(x);
+    let y = f64::from(y);
+    let z = f64::from(z);
     execute(
         conn,
         "PS_GameData",
@@ -2846,65 +2739,20 @@ pub fn save_character_position(
     .context("failed to save character position")
 }
 
-fn query_one(
-    conn: &mut Db,
-    database: &str,
-    sql: &str,
-    params: &[&dyn ToSql],
-) -> Result<Option<Row>> {
-    let _ = (conn, database);
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let row = client
-            .query(sql, params)
-            .await
-            .context("failed to execute SQL query")?
-            .into_row()
-            .await
-            .context("failed to read SQL row")?;
-        Ok(row)
-    }))
-}
-
-fn execute(conn: &mut Db, database: &str, sql: &str, params: &[&dyn ToSql]) -> Result<()> {
-    let _ = (conn, database);
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        client
-            .execute(sql, params)
-            .await
-            .context("failed to execute SQL command")?;
-        Ok(())
-    }))
-}
-
-/// Like `execute`, but returns the total number of rows the statement
-/// affected -- used where "did this actually change a row?" is the result
-/// (e.g. soft-delete/restore, which report ok/fail based on whether the
-/// scoped WHERE matched a row).
-fn execute_rows(conn: &mut Db, database: &str, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
-    let _ = (conn, database);
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let result = client
-            .execute(sql, params)
-            .await
-            .context("failed to execute SQL command")?;
-        Ok(result.rows_affected().iter().sum())
-    }))
-}
-
-fn account_from_row(row: Row) -> DbAccount {
+fn account_from_row(row: &rusqlite::Row<'_>) -> DbAccount {
     DbAccount {
-        id: row.get::<i32, _>("UserUID").unwrap_or_default() as u32,
+        id: row.get::<_, i64>("UserUID").unwrap_or_default() as u32,
         username: row
-            .get::<&str, _>("UserID")
+            .get::<_, String>("UserID")
             .unwrap_or_default()
             .trim_end()
             .to_string(),
-        faction: tinyint_or_default(&row, "Country", FACTION_NONE),
-        max_grow: tinyint_or_default(&row, "MaxGrow", MAX_GROW_ULTIMATE),
-        is_admin: bit_or_default(&row, "Admin", false)
-            || tinyint_or_default(&row, "AdminLevel", 0) > 0,
-        admin_level: tinyint_or_default(&row, "AdminLevel", 0),
-        point: row.get::<i32, _>("Point").unwrap_or_default().max(0) as u32,
+        faction: tinyint_or_default(row, "Country", FACTION_NONE),
+        max_grow: tinyint_or_default(row, "MaxGrow", MAX_GROW_ULTIMATE),
+        is_admin: bit_or_default(row, "Admin", false)
+            || tinyint_or_default(row, "AdminLevel", 0) > 0,
+        admin_level: tinyint_or_default(row, "AdminLevel", 0),
+        point: row.get::<_, i64>("Point").unwrap_or_default().max(0) as u32,
     }
 }
 
@@ -2914,7 +2762,7 @@ pub fn set_account_points(conn: &mut Db, account_id: u32, points: u32) -> Result
     execute(
         conn,
         "PS_UserData",
-        "UPDATE PS_UserData.dbo.Users_Master SET Point = @P1 WHERE UserUID = @P2",
+        "UPDATE Users_Master SET Point = ?1 WHERE UserUID = ?2",
         &[&points_param, &account_id_param],
     )?;
     Ok(points_param as u32)
@@ -2950,30 +2798,23 @@ pub struct DbGiftBoxEntry {
 pub fn get_gift_box(conn: &mut Db, account_id: u32) -> Result<Vec<DbGiftBoxEntry>> {
     let sql = r#"
         SELECT Slot, ItemID, ItemCount
-        FROM PS_Billing.dbo.Users_Product3
-        WHERE UserUID = @P1
+        FROM Users_Product3
+        WHERE UserUID = ?1
         ORDER BY Slot
     "#;
 
     let account_id_param = account_id as i32;
-    let _ = conn;
-    let rows = runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        client
-            .query(sql, &[&account_id_param])
-            .await
-            .context("failed to load gift box")?
-            .into_results()
-            .await
-            .context("failed to read gift box")
-    }))?;
+    let rows = query_many(conn, "PS_Billing", sql, &[&account_id_param], |row| {
+        (
+            flexible_u32(row, "Slot", 0),
+            flexible_u32(row, "ItemID", 0),
+            flexible_u32(row, "ItemCount", 0),
+        )
+    })?;
 
     Ok(rows
         .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            let slot = flexible_u32(&row, "Slot", 0);
-            let item_id = flexible_u32(&row, "ItemID", 0);
-            let count = flexible_u32(&row, "ItemCount", 0);
+        .filter_map(|(slot, item_id, count)| {
             if slot == 0 || slot > 240 || item_id == 0 || count == 0 {
                 return None;
             }
@@ -3005,8 +2846,8 @@ pub fn insert_gift(
     execute(
         conn,
         "PS_Billing",
-        "INSERT INTO PS_Billing.dbo.Users_Product3 (UserUID, Slot, ItemID, ItemCount, ProductCode, BuyDate) \
-         VALUES (@P1, @P2, @P3, @P4, @P5, GETDATE())",
+        "INSERT INTO Users_Product3 (UserUID, Slot, ItemID, ItemCount, ProductCode, BuyDate) \
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
         &[&account_id_param, &slot_param, &item_id_param, &count_param, &product_code],
     )
     .context("failed to insert gift")?;
@@ -3023,7 +2864,7 @@ pub fn delete_gift(conn: &mut Db, account_id: u32, slot: u8) -> Result<bool> {
     let rows = execute_rows(
         conn,
         "PS_Billing",
-        "DELETE FROM PS_Billing.dbo.Users_Product3 WHERE UserUID = @P1 AND Slot = @P2",
+        "DELETE FROM Users_Product3 WHERE UserUID = ?1 AND Slot = ?2",
         &[&account_id_param, &slot_param],
     )
     .context("failed to delete gift")?;
@@ -3036,56 +2877,42 @@ pub fn get_product_by_code(conn: &mut Db, product_code: &str) -> Result<Option<D
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT TOP (1) ProductCode, BuyCost, {item_columns} \
-         FROM PS_GameDefs.dbo.ProductList WHERE ProductCode = @P1"
+        "SELECT ProductCode, BuyCost, {item_columns} FROM ProductList WHERE ProductCode = ?1 LIMIT 1"
     );
 
-    let _ = conn;
-    let product_code = product_code.to_string();
-    runtime().block_on(with_pooled_client(async |client: &mut SqlClient| {
-        let rows = client
-            .query(&sql, &[&product_code])
-            .await
-            .context("failed to load product")?
-            .into_results()
-            .await
-            .context("failed to read product")?;
-
-        let Some(row) = rows.into_iter().flatten().next() else {
-            return Ok(None);
-        };
-
+    let row = query_one(conn, "PS_GameDefs", &sql, &[&product_code], |row| {
         let mut items = Vec::new();
         for i in 1..=24 {
-            let item_id = row.get::<i32, _>(format!("ItemID{i}").as_str()).unwrap_or(0);
-            let count = tinyint_or_default(&row, format!("ItemCount{i}").as_str(), 0);
+            let item_id: i64 = row.get(format!("ItemID{i}").as_str()).unwrap_or(0);
+            let count = tinyint_or_default(row, format!("ItemCount{i}").as_str(), 0);
             if item_id > 0 && count > 0 {
-                let item_type = (item_id / 1000).clamp(0, i32::from(u8::MAX)) as u8;
-                let type_id = (item_id % 1000).clamp(0, i32::from(u8::MAX)) as u8;
+                let item_type = (item_id / 1000).clamp(0, i64::from(u8::MAX)) as u8;
+                let type_id = (item_id % 1000).clamp(0, i64::from(u8::MAX)) as u8;
                 items.push((item_type, type_id, count));
             }
         }
 
-        Ok(Some(DbProduct {
+        DbProduct {
             product_code: row
-                .get::<&str, _>("ProductCode")
+                .get::<_, String>("ProductCode")
                 .unwrap_or_default()
                 .trim_end()
                 .to_string(),
-            buy_cost: row.get::<i32, _>("BuyCost").unwrap_or_default().max(0) as u32,
+            buy_cost: row.get::<_, i64>("BuyCost").unwrap_or_default().max(0) as u32,
             items,
-        }))
-    }))
+        }
+    })?;
+    Ok(row)
 }
 
 /// Single source of truth for every column row_to_character() reads.
 /// get_characters_for_account and character_select_sql both build their
 /// query from this instead of maintaining their own column list --
-/// row_to_character silently panics (via tiberius's Row::get) if a column
-/// it expects isn't in the result set at all, so any two queries that feed
-/// it MUST select exactly the same columns. This has already broken three
-/// times (StatPoint/SkillPoint, then Money) from the two queries drifting
-/// apart; this constant is what stops a fourth time.
+/// row_to_character silently falls back to defaults if a column it expects
+/// isn't in the result set at all, so any two queries that feed it should
+/// select exactly the same columns. This has already broken three times
+/// (StatPoint/SkillPoint, then Money) from the two queries drifting apart;
+/// this constant is what stops a fourth time.
 const CHARACTER_COLUMNS: &str = r#"
     CharID, UserUID, Slot, CharName, Level, Map, PosX, PosY, Posz,
     Family, Grow, Hair, Face, Size, Job, Sex,
@@ -3096,28 +2923,28 @@ const CHARACTER_COLUMNS: &str = r#"
 fn character_select_sql() -> String {
     format!(
         r#"
-        SELECT TOP (1)
+        SELECT
             {CHARACTER_COLUMNS}
-        FROM PS_GameData.dbo.Chars
+        FROM Chars
     "#
     )
 }
 
-fn row_to_character(row: &Row) -> DbCharacter {
+fn row_to_character(row: &rusqlite::Row<'_>) -> DbCharacter {
     DbCharacter {
-        id: row.get::<i32, _>("CharID").unwrap_or_default() as u32,
-        account_id: row.get::<i32, _>("UserUID").unwrap_or_default() as u32,
+        id: row.get::<_, i64>("CharID").unwrap_or_default() as u32,
+        account_id: row.get::<_, i64>("UserUID").unwrap_or_default() as u32,
         slot: tinyint_or_default(row, "Slot", 0),
         name: row
-            .get::<&str, _>("CharName")
+            .get::<_, String>("CharName")
             .unwrap_or_default()
             .trim_end()
             .to_string(),
         level: positive_smallint_as_u16(row, "Level", 1),
         map_id: positive_smallint_as_u16(row, "Map", 1),
-        pos_x: row.get::<f32, _>("PosX").unwrap_or(500.0),
-        pos_y: row.get::<f32, _>("PosY").unwrap_or(50.0),
-        pos_z: row.get::<f32, _>("Posz").unwrap_or(500.0),
+        pos_x: row.get::<_, f64>("PosX").unwrap_or(500.0) as f32,
+        pos_y: row.get::<_, f64>("PosY").unwrap_or(50.0) as f32,
+        pos_z: row.get::<_, f64>("Posz").unwrap_or(500.0) as f32,
         race: tinyint_or_default(row, "Family", 0),
         mode: tinyint_or_default(row, "Grow", 0),
         hair: tinyint_or_default(row, "Hair", 0),
@@ -3146,16 +2973,16 @@ fn row_to_character(row: &Row) -> DbCharacter {
         current_hp: numeric_u32(row, "HP", DEFAULT_HP),
         current_mp: numeric_u32(row, "MP", DEFAULT_MP),
         current_sp: numeric_u32(row, "SP", DEFAULT_SP),
-        exp: row.get::<i32, _>("Exp").unwrap_or_default().max(0) as u32,
+        exp: row.get::<_, i64>("Exp").unwrap_or_default().max(0) as u32,
         // Money is stored in a signed 32-bit SQL column but treated as an
         // unsigned quantity up to MONEY_CAP, so it's read back via a bit
         // reinterpretation cast rather than clamped -- clamping negative
         // i32 bit patterns to 0 would zero out any balance above i32::MAX.
-        money: row.get::<i32, _>("Money").unwrap_or_default() as u32,
-        kills: row.get::<i32, _>("K1").unwrap_or_default().max(0) as u32,
-        deaths: row.get::<i32, _>("K2").unwrap_or_default().max(0) as u32,
-        victories: row.get::<i32, _>("K3").unwrap_or_default().max(0) as u32,
-        defeats: row.get::<i32, _>("K4").unwrap_or_default().max(0) as u32,
+        money: row.get::<_, i64>("Money").unwrap_or_default() as i32 as u32,
+        kills: row.get::<_, i64>("K1").unwrap_or_default().max(0) as u32,
+        deaths: row.get::<_, i64>("K2").unwrap_or_default().max(0) as u32,
+        victories: row.get::<_, i64>("K3").unwrap_or_default().max(0) as u32,
+        defeats: row.get::<_, i64>("K4").unwrap_or_default().max(0) as u32,
         // Set true only by get_characters_for_account (which selects Del);
         // CHARACTER_COLUMNS itself doesn't include it, so it defaults false
         // for every playable-character query.
@@ -3166,82 +2993,60 @@ fn row_to_character(row: &Row) -> DbCharacter {
     }
 }
 
-fn tinyint_or_default(row: &Row, column: &str, default: u8) -> u8 {
-    row.get::<u8, _>(column).unwrap_or(default)
-}
-
-fn bit_or_default(row: &Row, column: &str, default: bool) -> bool {
-    row.get::<bool, _>(column).unwrap_or(default)
-}
-
-fn positive_smallint_as_u16(row: &Row, column: &str, default: u16) -> u16 {
-    row.get::<i16, _>(column)
-        .map(|value| value.max(0) as u16)
+fn tinyint_or_default(row: &rusqlite::Row<'_>, column: &str, default: u8) -> u8 {
+    row.get::<_, i64>(column)
+        .map(|value| value.clamp(0, i64::from(u8::MAX)) as u8)
         .unwrap_or(default)
 }
 
-fn positive_smallint_as_u32(row: &Row, column: &str) -> u32 {
-    row.get::<i16, _>(column)
+fn bit_or_default(row: &rusqlite::Row<'_>, column: &str, default: bool) -> bool {
+    row.get::<_, i64>(column)
+        .map(|value| value != 0)
+        .unwrap_or(default)
+}
+
+fn positive_smallint_as_u16(row: &rusqlite::Row<'_>, column: &str, default: u16) -> u16 {
+    row.get::<_, i64>(column)
+        .map(|value| value.clamp(0, i64::from(u16::MAX)) as u16)
+        .unwrap_or(default)
+}
+
+fn positive_smallint_as_u32(row: &rusqlite::Row<'_>, column: &str) -> u32 {
+    row.get::<_, i64>(column)
         .map(|value| value.max(0) as u32)
         .unwrap_or_default()
 }
 
-fn numeric_u16(row: &Row, column: &str, default: u16) -> u16 {
-    if let Some(value) = row.try_get::<i16, _>(column).ok().flatten() {
-        return value.max(0) as u16;
-    }
-    if let Some(value) = row.try_get::<i32, _>(column).ok().flatten() {
-        return value.max(0).min(i32::from(u16::MAX)) as u16;
-    }
-    default
+fn numeric_u16(row: &rusqlite::Row<'_>, column: &str, default: u16) -> u16 {
+    row.get::<_, i64>(column)
+        .map(|value| value.clamp(0, i64::from(u16::MAX)) as u16)
+        .unwrap_or(default)
 }
 
-fn numeric_u32(row: &Row, column: &str, default: u32) -> u32 {
-    if let Some(value) = row.try_get::<i32, _>(column).ok().flatten() {
-        return value.max(0) as u32;
-    }
-    if let Some(value) = row.try_get::<i16, _>(column).ok().flatten() {
-        return value.max(0) as u32;
-    }
-    default
+fn numeric_u32(row: &rusqlite::Row<'_>, column: &str, default: u32) -> u32 {
+    row.get::<_, i64>(column)
+        .map(|value| value.max(0) as u32)
+        .unwrap_or(default)
 }
 
-/// Reads an integer column without knowing its exact SQL width -- tries
-/// tinyint (u8), smallint (i16), and int (i32) in turn. Needed for columns
-/// like `Mobs.AI` whose storage type isn't pinned down; the fixed-width
-/// helpers above silently return their default on a type mismatch, which is
-/// how a genuinely nonzero column can read as 0.
-fn flexible_u32(row: &Row, column: &str, default: u32) -> u32 {
-    if let Some(value) = row.try_get::<u8, _>(column).ok().flatten() {
-        return u32::from(value);
-    }
-    if let Some(value) = row.try_get::<i16, _>(column).ok().flatten() {
-        return value.max(0) as u32;
-    }
-    if let Some(value) = row.try_get::<i32, _>(column).ok().flatten() {
-        return value.max(0) as u32;
-    }
-    default
+/// Reads an integer column, regardless of the value SQLite happens to have
+/// stored for it (SQLite is dynamically typed, so a single i64 read covers
+/// every integer width the old SQL Server schema used).
+fn flexible_u32(row: &rusqlite::Row<'_>, column: &str, default: u32) -> u32 {
+    row.get::<_, i64>(column)
+        .map(|value| value.max(0) as u32)
+        .unwrap_or(default)
 }
 
-/// Reads a numeric column as f32 without knowing its exact SQL type -- tries
-/// real (f32), float (f64), then the integer widths. Needed for columns like
-/// `Mobs.ChaseRange` (meters) which may be stored as a float OR an integer;
-/// reading a `real`/`float` column with an integer helper silently yields 0.
-fn flexible_f32(row: &Row, column: &str, default: f32) -> f32 {
-    if let Some(value) = row.try_get::<f32, _>(column).ok().flatten() {
-        return value;
-    }
-    if let Some(value) = row.try_get::<f64, _>(column).ok().flatten() {
+/// Reads a numeric column as f32, trying a float read first and falling
+/// back to an integer read (a column declared REAL that happens to hold a
+/// whole number can still come back through either path depending on
+/// how it was written).
+fn flexible_f32(row: &rusqlite::Row<'_>, column: &str, default: f32) -> f32 {
+    if let Ok(value) = row.get::<_, f64>(column) {
         return value as f32;
     }
-    if let Some(value) = row.try_get::<u8, _>(column).ok().flatten() {
-        return f32::from(value);
-    }
-    if let Some(value) = row.try_get::<i16, _>(column).ok().flatten() {
-        return f32::from(value.max(0));
-    }
-    if let Some(value) = row.try_get::<i32, _>(column).ok().flatten() {
+    if let Ok(value) = row.get::<_, i64>(column) {
         return value.max(0) as f32;
     }
     default
@@ -3252,7 +3057,7 @@ fn is_magic_weapon(item_type: u8) -> bool {
 }
 
 impl DbEquipmentStats {
-    fn add_item_row(&mut self, item_type: u8, row: &Row) {
+    fn add_item_row(&mut self, item_type: u8, row: &rusqlite::Row<'_>) {
         let max_effect = positive_smallint_as_u32(row, "Effect1");
         let min_effect = positive_smallint_as_u32(row, "Effect2");
 

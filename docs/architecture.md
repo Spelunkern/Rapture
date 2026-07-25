@@ -1,16 +1,19 @@
 # Architecture
 
-The emulator is split into headless server cores plus a separate graphical
-control panel.
+The emulator is split into headless server cores plus a separate terminal
+console.
 
 ## Processes
 
-- `rapture_panel.exe`: graphical operator UI ("Rapture Emulator").
-- `rapture_login.exe`: login/authentication TCP server.
-- `rapture_world.exe`: game/world TCP server.
+- `rapture_console`: terminal operator console ("Rapture Console") --
+  `start server` / `shutdown server`.
+- `rapture_login`: login/authentication TCP server.
+- `rapture_world`: game/world TCP server.
 
-The control panel owns process lifecycle and log viewing. The server cores own
-protocol, state, database access, and gameplay.
+(`.exe` on Windows, no extension on Linux -- otherwise identical binaries.)
+
+The console owns process lifecycle. The server cores own protocol, state,
+database access, and gameplay.
 
 ## First Milestone
 

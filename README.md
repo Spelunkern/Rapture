@@ -6,13 +6,14 @@ An open source Shaiya emulator targeting the 5.4 client, designed to be a
 community project to replace old server files with a modern, functional,
 and secure alternative.
 
-Rapture is written in Rust and runs on Windows, with a Linux build to come
-in the near future. Currently, Rapture uses SQL Server just like the
-original files — you can run it using any standard Shaiya database.
+Rapture is written in Rust and runs on both Windows and Linux. Rapture uses
+SQLite for storage — zero setup, no external database server to install or
+configure.
 
 **New here?** See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full
-installation and usage guide (prerequisites, database setup, running the
-servers, GM commands, trade/experience). This README is a quick reference.
+installation and usage guide (Windows and Linux, prerequisites, database,
+running the servers, GM commands, trade/experience). This README is a quick
+reference.
 
 ## Goals
 
@@ -34,48 +35,49 @@ servers, GM commands, trade/experience). This README is a quick reference.
 
 ## Rust
 
-Build:
+Build (Windows):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build-rust.ps1
 ```
 
-Open the Rapture panel:
+Build (Linux):
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\run-rust-panel.ps1
+```sh
+tools/build-rust.sh
 ```
 
-The Rapture Emulator panel starts and stops the headless Login and World processes.
+Open the Rapture console — Windows: `tools\run-rust-console.ps1` (or
+double-click `Start Rapture.bat` at the repo root); Linux:
+`tools/run-rust-console.sh` (or `./Start\ Rapture.sh`).
+
+The Rapture Console starts and stops the headless Login and World processes
+(`start server` / `shutdown server`).
 
 ## Database
 
-Rapture uses the original SQL Server databases:
+Rapture stores everything in two SQLite files under `data/`, tracked
+directly in this repo as the canonical, ready-to-run data:
 
-- `PS_UserData.dbo.Users_Master` for login accounts.
-- `PS_GameData.dbo.UserMaxGrow` for account faction and max mode.
-- `PS_GameData.dbo.Chars` for character selection, creation, and position saves.
-- `PS_GameDefs` for static definitions (items, mobs, exp/status tables, drops).
+- `gamedata.db` — static definitions (items, mobs, skills, exp table, item
+  mall catalog). Read-only at runtime.
+- `world.db` — live server state (accounts, characters, inventory). Back
+  this one up if you want to keep your own progress.
 
-SQL Server must already be running locally with TCP/IP enabled. By default,
-Rapture connects to `localhost:1433` with Windows authentication.
-
-Optional overrides:
-
-```powershell
-$env:RAPTURE_SQLSERVER_HOST = "localhost"
-$env:RAPTURE_SQLSERVER_PORT = "1433"
-$env:RAPTURE_SQLSERVER_POOL_SIZE = "16"
-```
+No external database server, no setup, no schema creation at runtime —
+the server only ever opens these files as they are and fails with a clear
+error if either is missing or doesn't match the expected schema. Override
+the location with the `RAPTURE_DATA_DIR` env var if you don't want
+`./data`.
 
 ## Layout
 
 - `rapture_login`: headless Login server, TCP `127.0.0.1:30800`.
 - `rapture_world`: headless World server, TCP `127.0.0.1:30810`.
 - `rapture_common`: packet and crypto helpers.
-- `rapture_panel`: graphical control panel ("Rapture Emulator").
-The graphical control panel starts, stops, and monitors the headless Rust
-processes instead of embedding server logic directly.
+- `rapture_console`: terminal console ("Rapture Console").
+The console starts and stops the headless Rust processes (`start server` /
+`shutdown server`) instead of embedding server logic directly.
 
 ## References
 
@@ -91,18 +93,21 @@ BSD 3-Clause. See [LICENSE](LICENSE).
 A quick summary of what's implemented so far:
 
 - **Login & world servers**: TCP login flow, character select/creation, map
-  entry, and session handling against the original SQL Server schema.
+  entry, and session handling against the SQLite-backed schema.
 - **Spatial visibility**: entity updates (movement, combat, spawns) are
   filtered by range instead of broadcasting the whole map; chat stays
   whole-map by design.
-- **Combat & mobs**: auto-attack, targeting, mob spawn/respawn/roam sweeps,
-  NPC patrol sweeps, drop tables.
+- **Combat & mobs**: auto-attack (both directions — players damage mobs and
+  mobs fight back, with passive/aggressive AI and aggro), targeting, mob
+  spawn/respawn/roam sweeps, NPC patrol sweeps, drop tables, player death.
+- **Passive regen**: 5% of max HP/MP/SP restored every 10 seconds while
+  alive.
 - **Trade**: full player-to-player trade (request, offer items/gold, ready/
   confirm, atomic completion), verified against real client packet captures.
-- **Experience & leveling**: EXP gain and level-ups driven by
-  `PS_GameDefs.ExpDefs`; base HP/MP/SP per level driven by
-  `PS_GameDefs.StatusDefs`. Core stats (STR/DEX/REC/INT/LUC/WIS) do not grow
-  automatically with level, matching the intended design.
+- **Experience & leveling**: EXP gain and level-ups driven by `ExpDefs`;
+  base HP/MP/SP per level is a flat, hardcoded curve (not DB-driven). Core
+  stats (STR/DEX/REC/INT/LUC/WIS) do not grow automatically with level,
+  matching the intended design.
 - **GM commands**: item spawning, teleport (map/local), mob/NPC spawn and
   clear, stat editing, GM visibility toggle, inventory/equipment clearing —
   see [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full list.

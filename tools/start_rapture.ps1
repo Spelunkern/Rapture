@@ -5,21 +5,13 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 Set-Location $repoRoot
 
-$loginExe = Join-Path $repoRoot 'target\release\rapture_login.exe'
-$worldExe = Join-Path $repoRoot 'target\release\rapture_world.exe'
-$panelExe = Join-Path $repoRoot 'target\release\rapture_panel.exe'
+$consoleExe = Join-Path $repoRoot 'target\release\rapture_console.exe'
 
-if (!(Test-Path $loginExe) -or !(Test-Path $worldExe) -or !(Test-Path $panelExe)) {
+if (!(Test-Path $consoleExe)) {
     cargo build --workspace --release
 }
 
-Get-Process rapture_login, rapture_world -ErrorAction SilentlyContinue | Stop-Process -Force
-
-Start-Process -FilePath $loginExe -WorkingDirectory $repoRoot -WindowStyle Hidden
-Start-Process -FilePath $worldExe -WorkingDirectory $repoRoot -WindowStyle Hidden
-Start-Process -FilePath $panelExe -WorkingDirectory $repoRoot
-
-Start-Sleep -Milliseconds 700
-
-Get-Process rapture_login, rapture_world, rapture_panel -ErrorAction SilentlyContinue |
-    Select-Object ProcessName, Id, StartTime, Path
+# This IS the app now: a single terminal window with a "start server" /
+# "shutdown server" prompt (see rapture_console). Nothing is auto-started
+# here -- type "start server" once the prompt is up.
+& $consoleExe

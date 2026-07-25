@@ -27,12 +27,13 @@ RAPTURE_ROADMAP.md
 # license, not part of Rapture itself)
 tools/refs/
 
-# Generated local secrets for the MariaDB/SQL Server dev containers --
-# never commit, regenerate per machine (see docker/README.md once written)
-docker/mariadb/*_password.txt
-docker/mssql/*_password.txt
+# gamedata.db and world.db are tracked (see below) -- they're the canonical
+# data files this project distributes, not generated output. Only their WAL
+# journal siblings are ignored (transient; content lands in the main .db
+# file once the connection closes cleanly).
+data/*.db-wal
+data/*.db-shm
 
-# Real local config -- may contain a filled-in SQL Server login. Copy
-# config.ini.example (tracked, placeholders only) to config.ini and fill it
-# in; config.ini itself must never be committed.
-config.ini
+# Claude Code local session/agent state -- machine-specific, not project
+# source.
+.claude/

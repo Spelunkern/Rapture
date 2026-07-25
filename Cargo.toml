@@ -2,7 +2,7 @@
 members = [
     "crates/rapture_common",
     "crates/rapture_login",
-    "crates/rapture_panel",
+    "crates/rapture_console",
     "crates/rapture_world",
 ]
 resolver = "3"
