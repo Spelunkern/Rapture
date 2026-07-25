@@ -3,9 +3,9 @@ $ErrorActionPreference = 'Stop'
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
-Get-Process rapture_panel -ErrorAction SilentlyContinue | Stop-Process -Force
-
 Set-Location $repoRoot
 cargo build --workspace --release
 
-Start-Process -FilePath (Join-Path $repoRoot 'target\release\rapture_panel.exe') -WorkingDirectory $repoRoot
+# Runs attached to this same window -- this terminal IS the console (type
+# "start server" / "shutdown server" at its prompt), not a detached process.
+& (Join-Path $repoRoot 'target\release\rapture_console.exe')
