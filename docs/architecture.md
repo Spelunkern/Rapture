@@ -10,7 +10,9 @@ console.
 - `rapture_login`: login/authentication TCP server.
 - `rapture_world`: game/world TCP server.
 
-(`.exe` on Windows, no extension on Linux -- otherwise identical binaries.)
+(`.exe` on Windows, no extension on Linux -- otherwise identical binaries,
+built from `cmd/` with Go into `build/`. Storage is SQL Server with the
+original EP4.5 databases, accessed through their stored procedures.)
 
 The console owns process lifecycle. The server cores own protocol, state,
 database access, and gameplay.

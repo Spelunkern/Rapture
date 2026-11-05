@@ -1,7 +1,9 @@
 # Build output
-target/
 build/
 out/
+
+# Local SQL Server credentials and legacy data (tools/sqlserver.py)
+.local/
 
 # IDE/editor cruft
 .vs/
@@ -26,13 +28,6 @@ RAPTURE_ROADMAP.md
 # Vendored third-party reference tool (excluded: has its own git history/
 # license, not part of Rapture itself)
 tools/refs/
-
-# gamedata.db and world.db are tracked (see below) -- they're the canonical
-# data files this project distributes, not generated output. Only their WAL
-# journal siblings are ignored (transient; content lands in the main .db
-# file once the connection closes cleanly).
-data/*.db-wal
-data/*.db-shm
 
 # Claude Code local session/agent state -- machine-specific, not project
 # source.

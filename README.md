@@ -6,9 +6,13 @@ An open source Shaiya emulator targeting the 5.4 client, designed to be a
 community project to replace old server files with a modern, functional,
 and secure alternative.
 
-Rapture is written in Rust and runs on both Windows and Linux. Rapture uses
-SQLite for storage — zero setup, no external database server to install or
-configure.
+Rapture is written in Go and runs on both Windows and Linux. It stores data
+in SQL Server, using the original EP4.5 databases (`PS_UserData`,
+`PS_GameData`, `PS_GameDefs`, ...) and their stored procedures.
+
+**Status:** the Rust implementation was replaced by Go in November 2026. The
+login server is ported and works against SQL Server; the world server is
+being ported module by module and is not playable yet.
 
 **New here?** See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full
 installation and usage guide (Windows and Linux, prerequisites, database,
@@ -33,51 +37,42 @@ reference.
 - Keep research easy and simple to understand, to encourage non-technical
   users to contribute.
 
-## Rust
+## Build
 
-Build (Windows):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\build-rust.ps1
-```
-
-Build (Linux):
+Install Go 1.27 or newer, then:
 
 ```sh
-tools/build-rust.sh
+tools/build.sh          # Linux
 ```
 
-Open the Rapture console — Windows: `tools\run-rust-console.ps1` (or
-double-click `Start Rapture.bat` at the repo root); Linux:
-`tools/run-rust-console.sh` (or `./Start\ Rapture.sh`).
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\build.ps1   # Windows
+```
 
-The Rapture Console starts and stops the headless Login and World processes
-(`start server` / `shutdown server`).
+Binaries land in `build/`. Open the Rapture Console with `./Start\ Rapture.sh`
+(Linux) or `Start Rapture.bat` (Windows); it starts and stops the headless
+login and world servers (`start server` / `shutdown server`).
 
 ## Database
 
-Rapture stores everything in two SQLite files under `data/`, tracked
-directly in this repo as the canonical, ready-to-run data:
-
-- `gamedata.db` — static definitions (items, mobs, skills, exp table, item
-  mall catalog). Read-only at runtime.
-- `world.db` — live server state (accounts, characters, inventory). Back
-  this one up if you want to keep your own progress.
-
-No external database server, no setup, no schema creation at runtime —
-the server only ever opens these files as they are and fails with a clear
-error if either is missing or doesn't match the expected schema. Override
-the location with the `RAPTURE_DATA_DIR` env var if you don't want
-`./data`.
+`tools/sqlserver.py setup` creates Rapture's own SQL Server container
+(`rapture-sqlserver`, `127.0.0.1:14346`), restores the original EP4.5
+backups read-only from `~/Desktop/ep4.5/PSM_Data` (override with
+`--backups`), provisions the `rapture` login and writes its credentials to
+`.local/runtime.env` (ignored by git). Existing databases are never
+replaced. Requires Docker.
 
 ## Layout
 
-- `rapture_login`: headless Login server, TCP `127.0.0.1:30800`.
-- `rapture_world`: headless World server, TCP `127.0.0.1:30810`.
-- `rapture_common`: packet and crypto helpers.
-- `rapture_console`: terminal console ("Rapture Console").
-The console starts and stops the headless Rust processes (`start server` /
-`shutdown server`) instead of embedding server logic directly.
+- `cmd/rapture_login`: login server, TCP `127.0.0.1:30800`.
+- `cmd/rapture_world`: world server, TCP `127.0.0.1:30810` (being ported).
+- `cmd/rapture_console`: terminal console that starts and stops both.
+- `internal/`: packets, crypto, logging, configuration, the SQL Server
+  access layer (`internal/db`) and the login-to-world session handoff.
+- `tools/sqlserver.py`: Rapture's own SQL Server with the EP4.5 databases.
+
+Override listen addresses and the address clients are sent to with
+`RAPTURE_LOGIN_LISTEN`, `RAPTURE_WORLD_LISTEN` and `RAPTURE_PUBLIC_IP`.
 
 ## References
 
@@ -90,28 +85,12 @@ BSD 3-Clause. See [LICENSE](LICENSE).
 
 ## Current Progress
 
-A quick summary of what's implemented so far:
-
-- **Login & world servers**: TCP login flow, character select/creation, map
-  entry, and session handling against the SQLite-backed schema.
-- **Spatial visibility**: entity updates (movement, combat, spawns) are
-  filtered by range instead of broadcasting the whole map; chat stays
-  whole-map by design.
-- **Combat & mobs**: auto-attack (both directions — players damage mobs and
-  mobs fight back, with passive/aggressive AI and aggro), targeting, mob
-  spawn/respawn/roam sweeps, NPC patrol sweeps, drop tables, player death.
-- **Passive regen**: 5% of max HP/MP/SP restored every 10 seconds while
-  alive.
-- **Trade**: full player-to-player trade (request, offer items/gold, ready/
-  confirm, atomic completion), verified against real client packet captures.
-- **Experience & leveling**: EXP gain and level-ups driven by `ExpDefs`;
-  base HP/MP/SP per level is a flat, hardcoded curve (not DB-driven). Core
-  stats (STR/DEX/REC/INT/LUC/WIS) do not grow automatically with level,
-  matching the intended design.
-- **GM commands**: item spawning, teleport (map/local), mob/NPC spawn and
-  clear, stat editing, GM visibility toggle, inventory/equipment clearing —
-  see [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full list.
-- **Codebase**: modularized by system (`combat.rs`, `movement.rs`,
-  `sweeps.rs`, `commands.rs`, `trade.rs`, `inventory.rs`, `skills.rs`,
-  `chat.rs`) instead of one large file, to keep future contributions easier
-  to review.
+- **Login (Go):** RSA/AES key exchange, credentials checked by the original
+  `PS_UserData.dbo.usp_Try_GameLogin_Taiwan` (including its login log and
+  `UserLoginStatus` rows), the original status-to-result mapping, server list
+  and the session handoff to world. Covered by crypto parity tests against
+  the former Rust implementation and a SQL Server integration test.
+- **World (Go):** being ported from the former Rust server (character
+  select/creation, movement, combat, skills, inventory, trade, warehouse,
+  item mall, GM commands). The Rust sources remain in git history before
+  the Go switch.

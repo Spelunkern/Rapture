@@ -6,89 +6,65 @@ day-to-day usage (GM commands, trade, experience/leveling).
 
 ## 1. Prerequisites
 
-Rapture runs on **both Windows and Linux** — the binaries are the same
-codebase, no platform-specific feature gaps between them.
+Rapture runs on **both Windows and Linux** from the same Go code.
 
-- **Rust toolchain**, edition 2024 (stable channel, e.g. via
-  [rustup](https://rustup.rs)). Tested with Rust 1.96/1.97.
-- **No external database server** — Rapture stores everything in two
-  SQLite files under `data/`, shipped directly in this repo. See
-  [Database](#3-database) below.
+- **Go 1.27 or newer.**
+- **Docker** and **Python 3** to run `tools/sqlserver.py`, which hosts
+  Rapture's own SQL Server 2022 container.
+- **The original EP4.5 database backups** (`PS_UserData`, `PS_GameData`,
+  `PS_GameDefs`, ... as found in `PSM_Data`).
 - **The 5.4 client** (`Game.exe`), configured to connect to your server's
-  IP (see [Client Setup](#5-client-setup) below). The client itself is
-  Windows-only (it's the original Shaiya game client) — a Linux-hosted
-  server is for players connecting from a separate Windows machine, not
-  for running the client under Linux too.
+  IP (see [Client Setup](#5-client-setup)).
+
+> The world server is still being ported from the former Rust code; until
+> it lands, the client can log in and see the server list but cannot enter
+> the game.
 
 ## 2. Clone & Build
-
-**Windows** (PowerShell):
-
-```powershell
-git clone <this-repo-url>
-cd Rapture
-powershell -ExecutionPolicy Bypass -File tools\build-rust.ps1
-```
-
-**Linux**:
 
 ```sh
 git clone <this-repo-url>
 cd Rapture
-chmod +x tools/*.sh "Start Rapture.sh"
-tools/build-rust.sh
+tools/build.sh                                            # Linux
+powershell -ExecutionPolicy Bypass -File tools\build.ps1  # Windows
 ```
 
-Both run `cargo build --workspace --release`. Always build in **release**
-mode — debug builds are not supported/tested and the project's own tooling
-assumes `target/release/*` (`.exe` suffix on Windows, none on Linux).
-
-The workspace has four crates:
-
-| Crate | Produces | Role |
-|---|---|---|
-| `rapture_common` | (library) | Shared packet/crypto/DB helpers |
-| `rapture_login` | `rapture_login[.exe]` | Headless login/authentication server, TCP `127.0.0.1:30800` |
-| `rapture_world` | `rapture_world[.exe]` | Headless game/world server, TCP `127.0.0.1:30810` |
-| `rapture_console` | `rapture_console[.exe]` | Terminal console — `start server` / `shutdown server` for the two headless servers |
+This builds `build/rapture_login`, `build/rapture_world` (when present) and
+`build/rapture_console` (`.exe` on Windows).
 
 ## 3. Database
 
-Rapture stores everything in two SQLite files under `data/` (path
-overridable with the `RAPTURE_DATA_DIR` env var), tracked directly in this
-repo as ready-to-run canonical data — no setup step:
+```sh
+python3 tools/sqlserver.py setup   # optionally --backups /path/to/PSM_Data
+```
 
-- `gamedata.db` — static definitions (items, mobs, skills, exp table, item
-  mall catalog). Read-only at runtime.
-- `world.db` — live server state (accounts, characters, inventory). Back
-  this one up if you want to keep your own progress; it already ships with
-  a handful of test accounts/characters to log in with immediately.
+`setup` creates the `rapture-sqlserver` container on `127.0.0.1:14346`,
+restores every `PS_*`/`OMG_*` backup (read-only mount, `DBCC CHECKDB` after
+each), creates the `rapture` SQL login with its password in
+`.local/runtime.env`, installs `master.dbo.fn_md5` (used by the original
+login procedure) and the monthly `PS_UserLog_YYYYMM` databases. Re-running it
+never replaces an existing database or credential. The servers read
+`.local/runtime.env` automatically; `RAPTURE_DB_HOST`, `RAPTURE_DB_PORT`,
+`RAPTURE_DB_USER` and `RAPTURE_DB_PASSWORD` override it.
 
-The server **never creates or migrates schema at runtime** — it only ever
-opens these two files as they already are. If either is missing, or is
-missing a table the server expects, startup fails immediately with a clear
-error naming the file and what's wrong, instead of silently creating or
-patching anything. If you need to rebuild these files from scratch (e.g.
-a content update, or importing from an old SQL-Server-backed install), that
-happens with separate tooling outside this repo, not with the shipped
-binaries.
+Rapture uses the databases exactly as restored (schema and data) and goes
+through the original stored procedures, e.g.
+`PS_UserData.dbo.usp_Try_GameLogin_Taiwan` for login.
 
 ### Accounts
 
-Rapture **authenticates against existing accounts only** — it does not
-provide account registration. An account must already exist as a row in
-`world.db`'s `Users_Master` table with:
-
-- `UserID` / `Pw` matching the credentials you'll log in with.
-- `Leave = 0` (not marked as left/banned).
-
-To make an account a **GM** (required for the admin chat commands below),
-set the `Admin` flag on that row (any SQLite client, e.g. the `sqlite3`
-CLI, against `data/world.db`):
+The EP4.5 backups contain no accounts. Rapture authenticates against
+existing `PS_UserData.dbo.Users_Master` rows (`UserID`, `Pw`, `Leave = 0`).
+The login procedure reads `Status`: `0` is a regular account, `16`, `32`,
+`48`, `64` and `80` are the admin tiers 1 to 5. Example:
 
 ```sql
-UPDATE Users_Master SET Admin = 1 WHERE UserID = 'your_account_name';
+INSERT PS_UserData.dbo.Users_Master
+    (UserUID, UserID, Pw, Admin, AdminLevel, UseQueue, Status, Leave, UserType, Point)
+VALUES (1, 'admin1', 'secret', 1, 255, 0, 80, 0, 'N', 0);
 ```
+
+Run SQL with `python3 tools/sqlserver.py query --database PS_UserData --file x.sql`.
 
 ### Map data
 
@@ -117,21 +93,16 @@ Either way this builds (if needed) and opens the console. Type
 the background on Windows, or just backgrounded on Linux); `shutdown server`
 stops them.
 
-**Manually**, from the repo root (so the relative `logs/`/`runtime/`/
-`data/maps/` paths resolve correctly):
-
-```powershell
-.\target\release\rapture_login.exe
-.\target\release\rapture_world.exe
-```
+**Manually**, from the repo root (so the relative `logs/`, `runtime/` and
+`data/maps/` paths resolve):
 
 ```sh
-./target/release/rapture_login &
-./target/release/rapture_world &
+./build/rapture_login &
+./build/rapture_world &
 ```
 
-Logs are written to `logs/rapture_login.log` / `logs/rapture_world.log`
-(and echoed to the console), recreated fresh each time a server starts.
+Logs are written to `logs/rapture_login.log` and `logs/rapture_world.log`
+(and echoed to the console).
 
 ## 5. Client Setup
 
@@ -192,16 +163,14 @@ account to be flagged as GM (see [Accounts](#accounts) above) except
 
 ## 8. Troubleshooting
 
-- **Build looks instant / stale binary**: this project's build has been
-  observed to hit filesystem mtime clock skew, which can make Cargo wrongly
-  skip recompilation. If a release build finishes suspiciously fast right
-  after an edit, force a clean rebuild: `cargo clean --release -p <crate>`
-  then rebuild.
+- **Database connection fails**: run `python3 tools/sqlserver.py setup`
+  (it starts a stopped container) and check `.local/runtime.env`.
 - **Nothing spawns on a map**: check that a matching `.svmap` file exists
   under `data/maps/` for that map id.
-- **Login fails**: confirm the account row exists in `world.db`'s
-  `Users_Master` table with `Leave = 0` and the exact `UserID`/`Pw` the
-  client is sending.
+- **Login fails**: confirm the account row exists in
+  `PS_UserData.dbo.Users_Master` with `Leave = 0` and the exact `UserID`/`Pw`
+  the client is sending; `logs/rapture_login.log` shows the procedure's
+  status and the result code sent to the client.
 - **Deeper internals / protocol notes**: see [docs/architecture.md](architecture.md)
-  for the process split, and the source comments in `crates/rapture_world/src/`
+  for the process split, and the source comments under `cmd/` and `internal/`
   (each module documents the protocol assumptions it implements against).
