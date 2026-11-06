@@ -64,6 +64,19 @@ VALUES (1, 'admin1', 'secret', 1, 255, 0, 80, 0, 'N', 0);
 
 Run SQL with `python3 tools/sqlserver.py query --database PS_UserData --file x.sql`.
 
+### Item mall catalog
+
+The client's item mall lists the products of its `Cash.SData`, and buying
+sends the product code; the server looks it up in
+`PS_GameDefs.dbo.ProductList`. The stock EP4.5 rows use other codes, so load
+the client catalog once (the server reads it at startup):
+
+```sh
+python3 tools/sqlserver.py query --database PS_GameDefs --file tools/sql/client_cash_catalog.sql
+```
+
+Prices are item-mall points (`Users_Master.Point`).
+
 ### Map data
 
 Place original Shaiya `.svmap` files under `data/maps/`, named by map id

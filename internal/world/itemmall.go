@@ -80,6 +80,7 @@ func (s *Session) handlePointBuy(p []byte) {
 	}
 	prod := db.MustDefs().Products[code]
 	if prod == nil {
+		s.log.Printf("Rapture World point buy: product %q is not in PS_GameDefs.dbo.ProductList", code)
 		s.send(buildPointBuyResult(pointBuyNoProduct, s.points, code, 0, nil), "0x2602 point buy result")
 		return
 	}

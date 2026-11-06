@@ -48,6 +48,7 @@ gaps; **invented** is still a Rapture rule to replace.
 | Raids | `party_runtime_raid*`, raid exp table | done: convert, 30 wire slots, leader/sub-leader, slot swaps, invites, auto-join, expel, disband, chunked roster; item-division modes are stored but loot still goes to the killer |
 | Quests | `NpcQuest.SData` (1720 quests, item links), `CUser::QuestEnableStart` 0x0047f080, `QuestStartRequest` 0x0047f220, `QuestFindItem` 0x0047f8e0, end/reward/progress routines, `CharQuests` procedures | done: start by NPC or item, level/race/job/mode/prerequisite checks, start items, item/mob/player-kill objectives, timed and minimum-time quests, reward variants and player choice, repeatable quests, abandon, party kill credit, quest item drops (`Mobs.QuestItemID`); no player-kill source yet (no PvP), item-use starts (type 4) not wired |
 | NPC talk | `0x0E04` | done (the original only records the NPC in use) |
+| Item mall | `0x2601`-`0x2607`, `PS_GameDefs.dbo.ProductList`, NCash procedures (linked server/MSDTC, reproduced locally), `usp_Update_UserPoint`, `PointLog`, `UserStoredPointItems` | done: points, buy, gift, gift box and claim; the client catalog (`Cash.SData`) must be in ProductList (`tools/sql/client_cash_catalog.sql`) |
 | Guilds | `0x0Dxx` | missing |
 
 ## Element table
