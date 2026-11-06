@@ -485,7 +485,7 @@ func (s *Session) handlePickupItem(p []byte) {
 		s.send(buildAddItemError(0), "0x0205 pickup error")
 		return
 	}
-	if mi.OwnerID != ch.ID && time.Since(mi.DroppedAt) < mapItemOwnerWindow {
+	if mi.OwnerID != ch.ID && time.Since(mi.DroppedAt) < mapItemOwnerWindow && !samePartyIDs(mi.OwnerID, ch.ID) {
 		s.send(buildAddItemError(2), "0x0205 pickup reserved")
 		return
 	}

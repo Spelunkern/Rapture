@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,61 +81,84 @@ func msg(o packet.Opcode, body ...byte) []byte {
 	return append([]byte{byte(o), byte(o >> 8)}, body...)
 }
 
-func TestWorldSessionAgainstSQLServer(t *testing.T) {
-	os.Chdir("../..")
-	config.LoadRuntimeEnv()
-	logger, err := logx.New("rapture_world_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Definitions(); err != nil {
-		t.Fatal(err)
-	}
-	if err := world.LoadGameConfig(logger); err != nil {
-		t.Fatal(err)
-	}
-	if err := world.LoadSvmaps(logger); err != nil {
-		t.Fatal(err)
-	}
-	world.StartSweeps(logger)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go func() { world.Serve(conn, logger, logger.Tagged("test")); conn.Close() }()
-		}
-	}()
+var (
+	setupOnce sync.Once
+	worldAddr string
+)
 
+// setupWorld starts one in-process world server for all tests.
+func setupWorld(t *testing.T) string {
+	t.Helper()
+	setupOnce.Do(func() {
+		os.Chdir("../..")
+		config.LoadRuntimeEnv()
+		logger, err := logx.New("rapture_world_test")
+		if err != nil {
+			panic(err)
+		}
+		if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+			panic(err)
+		}
+		if _, err := db.Definitions(); err != nil {
+			panic(err)
+		}
+		if err := world.LoadGameConfig(logger); err != nil {
+			panic(err)
+		}
+		if err := world.LoadSvmaps(logger); err != nil {
+			panic(err)
+		}
+		world.StartSweeps(logger)
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			panic(err)
+		}
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				go func() { world.Serve(conn, logger, logger.Tagged("test")); conn.Close() }()
+			}
+		}()
+
+		worldAddr = listener.Addr().String()
+	})
+	if worldAddr == "" {
+		t.Fatal("world setup failed")
+	}
+	return worldAddr
+}
+
+// connect performs the handshake for an account.
+func connect(t *testing.T, account uint32) *client {
+	t.Helper()
 	var material [32]byte
 	rand.Read(material[:])
 	identity := session.NewIdentity()
-	if err := session.Save(session.Handoff{Identity: identity, AESMaterial: material, UserUID: testAccount, SessionID: session.NewSessionID()}); err != nil {
+	if err := session.Save(session.Handoff{Identity: identity, AESMaterial: material, UserUID: account, SessionID: session.NewSessionID()}); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := net.Dial("tcp", listener.Addr().String())
+	conn, err := net.Dial("tcp", setupWorld(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { conn.Close() })
 	var key, loginIV [16]byte
 	copy(key[:], material[:16])
 	copy(loginIV[:], material[16:])
 	iv := crypto.DeriveWorldAESIV(loginIV)
 	c := &client{t: t, conn: conn, send: crypto.NewAESCTR(key, iv), recv: crypto.NewAESCTR(key, iv)}
-
 	hs := packet.New(packet.GameHandshake)
-	hs.U32(testAccount)
+	hs.U32(account)
 	hs.Bytes(identity[:])
 	conn.Write(hs.MustFinish())
+	return c
+}
+
+func TestWorldSessionAgainstSQLServer(t *testing.T) {
+	c := connect(t, testAccount)
 	seen := map[packet.Opcode]int{}
 	c.until(packet.GameHandshake, seen)
 	c.until(packet.AccountFaction, seen)

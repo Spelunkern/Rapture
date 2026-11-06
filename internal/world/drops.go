@@ -169,7 +169,10 @@ func dropPosition(x, z float32) (float32, float32) {
 
 // rollMobDrops rolls one kill's loot, registers it on the map and returns
 // the 0x0401 packets.
-func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, y float32, log logPrinter) [][]byte {
+//
+// With two or more party members in range, the gold is split evenly among
+// them instead of dropped (at least 1 each).
+func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, y float32, party []*ConnectedPlayer, log logPrinter) [][]byte {
 	defs := db.MustDefs()
 	var packets [][]byte
 	place := func(def *db.ItemDef, money uint32) {
@@ -212,7 +215,14 @@ func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, y float32, log logP
 		if mob.MoneyMax > 0 {
 			amount += rand.Uint32N(mob.MoneyMax)
 		}
-		if amount > 0 {
+		switch {
+		case amount == 0:
+		case len(party) > 1:
+			share := max(amount/uint32(len(party)), 1)
+			for _, m := range party {
+				m.QueueGold(share)
+			}
+		default:
 			place(nil, amount)
 		}
 	}

@@ -139,12 +139,7 @@ func (s *Session) resolveMobDamage(r *MobDamageResult) bool {
 	}
 	sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, buildMobDeath(m.ID, ch.ID), "0x0606 mob death")
 	// The killer's live Y tracks terrain better than the svmap area average.
-	for _, p := range rollMobDrops(ch.MapID, m, ch.ID, ch.PosY, s.logger) {
-		sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 mob drop")
-	}
-	if m.Exp > 0 {
-		s.grantKillExp(m.MobID, m.Level, m.Exp)
-	}
+	rewardKill(s.player, ch.ID, ch.MapID, m, ch.PosY, s.logger)
 	return false
 }
 
@@ -220,6 +215,7 @@ func (s *Session) persist() {
 		s.log.Printf("Rapture World failed to save character_id=%d: %v", s.char.ID, err)
 	}
 	s.syncPlayer()
+	s.partyPools()
 }
 
 // --- experience ---
@@ -263,16 +259,43 @@ func expBounds(ch *db.Character) (prev, next uint32) {
 	return prev, exp[db.ExpKey{Level: ch.Level, Grow: grow}]
 }
 
-func (s *Session) grantKillExp(mobID, mobLevel uint16, mobExp uint32) {
+// rewardKill hands out a kill's loot and exp: drops on the ground, gold
+// split across the party (or dropped for a solo killer) and each share of
+// exp queued to its recipient's session. An offline DoT caster gets the
+// solo exp straight in the database.
+func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMob, y float32, log logPrinter) {
+	var party []*ConnectedPlayer
+	if killer != nil {
+		party = partyMembersNear(killer, mapID, m.PosX, m.PosZ)
+	}
+	for _, p := range rollMobDrops(mapID, m, killerID, y, party, log) {
+		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 mob drop")
+	}
+	if m.Exp == 0 {
+		return
+	}
+	base := uint16(min(m.Exp, 65535))
+	if killer == nil {
+		grantOfflineKillExp(killerID, m.MobID, m.Level, uint32(base), log)
+		return
+	}
+	for member, amount := range killRewards(killer, mapID, m.PosX, m.PosZ, m.Level, base) {
+		if amount > 0 {
+			member.QueueExp(amount)
+		}
+	}
+}
+
+// awardExp applies an exp reward to the session's character.
+func (s *Session) awardExp(gained uint32) {
 	ch := s.char
 	if ch == nil {
 		return
 	}
-	gained := mobExperience(mobLevel, uint16(min(mobExp, 65535)), ch.Level)
 	levels := applyExpGain(ch, gained)
 	s.persist()
-	s.log.Printf("Rapture World exp character_id=%d mob_id=%d mob_level=%d base_exp=%d gained=%d level=%d exp=%d levels_gained=%d",
-		ch.ID, mobID, mobLevel, mobExp, gained, ch.Level, ch.Exp, levels)
+	s.log.Printf("Rapture World exp character_id=%d gained=%d level=%d exp=%d levels_gained=%d",
+		ch.ID, gained, ch.Level, ch.Exp, levels)
 	if gained > 0 {
 		s.send(buildExpGain(gained), "0x0207 exp gained")
 	}
@@ -285,6 +308,7 @@ func (s *Session) grantKillExp(mobID, mobLevel uint16, mobExp uint32) {
 			o.Send(others, "0x051E level up (nearby)")
 		}
 		s.sendStatPackets()
+		s.partyLevel()
 	}
 }
 
@@ -317,7 +341,7 @@ func grantOfflineKillExp(characterID uint32, mobID, mobLevel uint16, mobExp uint
 	if err != nil {
 		return
 	}
-	scaled := mobExperience(mobLevel, uint16(min(mobExp, 65535)), ch.Level)
+	scaled := uint32(float64(mobExperience(mobLevel, uint16(min(mobExp, 65535)), ch.Level)) * 1.2)
 	applyExpGain(&ch, scaled)
 	if err := db.SaveCharacter(&ch); err != nil {
 		log.Printf("Rapture World offline exp save failed character_id=%d: %v", characterID, err)

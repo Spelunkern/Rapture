@@ -33,6 +33,8 @@ func TestPacketLayoutsMatchClient(t *testing.T) {
 		{"0x0211 0058eed0", buildBlessInit(0), 9},
 		{"0x0207 0058ed20", buildExpGain(1), 8},
 		{"0x0213 u32", buildSetMoney(1), 4},
+		{"0x0b05 u32", partyIDPacket(packet.PartyLeft, 1), 4},
+		{"0x0b07 u32", partyIDPacket(packet.PartyLeader, 1), 4},
 		{"0x0214 00595680", buildStatsReset(1, 1, 1, 1, 1, 1, 1), 15},
 		{"0x0226 0058fc50", buildChangeAppearance(1, 1, 1, 1, 1), 8},
 		{"0x0303 0058e360", buildCharacterShape(ch, 0, nil, 0), 95},

@@ -202,8 +202,16 @@ func (s *Session) tick(idle bool) {
 		if r := p.TakeTradeRefresh(); r != nil {
 			s.applyTradeRefresh(r)
 		}
-		for _, k := range p.TakeMobKills() {
-			s.grantKillExp(k.MobID, k.MobLevel, k.MobExp)
+		exp, gold := p.TakeRewards()
+		for _, e := range exp {
+			s.awardExp(e)
+		}
+		if len(gold) > 0 {
+			for _, g := range gold {
+				s.char.Money = uint32(min(uint64(s.char.Money)+uint64(g), db.MoneyCap))
+			}
+			s.persist()
+			s.send(buildSetMoney(s.char.Money), "0x0213 party gold share")
 		}
 		for _, d := range p.TakeDamage() {
 			if s.dead {
@@ -427,6 +435,22 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.handleShopSell(p)
 	case packet.ShopBuy:
 		s.handleShopBuy(p)
+	case packet.PartyInvite, packet.PartyInviteName:
+		s.handlePartyInvite(op, p)
+	case packet.PartyAnswer:
+		s.handlePartyAnswer(p)
+	case packet.PartyLeft, packet.PartyLeaveAlt:
+		s.handlePartyLeave()
+	case packet.PartyExpelled:
+		s.handlePartyExpel(p)
+	case packet.PartyLeader:
+		s.handlePartyLeader(p)
+	case packet.ChatParty:
+		if s.char != nil {
+			if msg, err := readChatMessage(p); err == nil {
+				s.partyChat(msg)
+			}
+		}
 	case packet.Gatekeeper:
 		s.handleGatekeeper(p)
 	case packet.ExchangeRequest:

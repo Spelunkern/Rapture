@@ -35,12 +35,6 @@ type pendingTeleport struct {
 	X, Y, Z float32
 }
 
-type pendingKill struct {
-	MobID    uint16
-	MobLevel uint16
-	MobExp   uint32
-}
-
 type pendingDamage struct {
 	MobGlobalID uint32
 	MobID       uint16
@@ -70,10 +64,40 @@ type ConnectedPlayer struct {
 	mailMu       sync.Mutex
 	teleport     *pendingTeleport
 	tradeRefresh *tradeRefresh
-	kills        []pendingKill
 	damage       []pendingDamage
 
 	alive atomic.Bool
+
+	// Party state, guarded by partyMu.
+	party          *party
+	inviterID      uint32
+	inviteDeadline time.Time
+
+	rewardMu   sync.Mutex
+	expRewards []uint32
+	goldShares []uint32
+}
+
+// QueueExp / QueueGold carry a party member's share of a kill to its own
+// session, the only one that mutates its character.
+func (p *ConnectedPlayer) QueueExp(amount uint32) {
+	p.rewardMu.Lock()
+	p.expRewards = append(p.expRewards, amount)
+	p.rewardMu.Unlock()
+}
+
+func (p *ConnectedPlayer) QueueGold(amount uint32) {
+	p.rewardMu.Lock()
+	p.goldShares = append(p.goldShares, amount)
+	p.rewardMu.Unlock()
+}
+
+func (p *ConnectedPlayer) TakeRewards() (exp, gold []uint32) {
+	p.rewardMu.Lock()
+	defer p.rewardMu.Unlock()
+	exp, gold = p.expRewards, p.goldShares
+	p.expRewards, p.goldShares = nil, nil
+	return
 }
 
 var (
@@ -107,6 +131,7 @@ func (p *ConnectedPlayer) Unregister() {
 	delete(bucket(p.MapID()), p.CharacterID)
 	registryMu.Unlock()
 	tradeCancelForDisconnect(p.CharacterID, p.log)
+	partyLeaveOnDisconnect(p)
 }
 
 func (p *ConnectedPlayer) SetMap(mapID uint16) {
@@ -216,20 +241,6 @@ func (p *ConnectedPlayer) TakeTradeRefresh() *tradeRefresh {
 	r := p.tradeRefresh
 	p.tradeRefresh = nil
 	return r
-}
-
-func (p *ConnectedPlayer) QueueMobKill(mobID, level uint16, exp uint32) {
-	p.mailMu.Lock()
-	p.kills = append(p.kills, pendingKill{mobID, level, exp})
-	p.mailMu.Unlock()
-}
-
-func (p *ConnectedPlayer) TakeMobKills() []pendingKill {
-	p.mailMu.Lock()
-	defer p.mailMu.Unlock()
-	k := p.kills
-	p.kills = nil
-	return k
 }
 
 func (p *ConnectedPlayer) QueueDamage(mobGlobalID uint32, mobID uint16, attack uint32) {
