@@ -196,6 +196,9 @@ func LoadGameConfig(log *logx.Logger) error {
 		return fmt.Errorf("SequenceItemCreate.ini: %w", err)
 	}
 	buildDropCatalog()
+	if err := loadNpcQuest(log); err != nil {
+		return fmt.Errorf("NpcQuest.SData: %w", err)
+	}
 	return nil
 }
 

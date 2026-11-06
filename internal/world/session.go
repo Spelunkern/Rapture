@@ -425,6 +425,10 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.handleItemBagToBag(p)
 	case packet.ShopSell:
 		s.handleShopSell(p)
+	case packet.ShopBuy:
+		s.handleShopBuy(p)
+	case packet.Gatekeeper:
+		s.handleGatekeeper(p)
 	case packet.ExchangeRequest:
 		if len(p) >= 6 {
 			id, _ := packet.U32(p[2:])

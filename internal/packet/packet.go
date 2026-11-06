@@ -35,6 +35,8 @@ const (
 	AutoAttackStop         Opcode = 0x0212
 	SetMoney               Opcode = 0x0213
 	ExpGain                Opcode = 0x0207
+	Gatekeeper             Opcode = 0x020C
+	ShopBuy                Opcode = 0x0702
 	LevelUpSelf            Opcode = 0x0508
 	LevelUpOther           Opcode = 0x051E
 	TargetMobGetState      Opcode = 0x0304

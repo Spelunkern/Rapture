@@ -15,20 +15,21 @@ gaps; **invented** is still a Rapture rule to replace.
 | Start position, rebirth points | `Map.ini`, `CMap::LoadGameMapConfig` 0x004270a0 | done |
 | Character creation | `CUser::ProcessCharacterCreate` 0x00480e90, `CGameData::LoadBaseItem` 0x004bf800 | done |
 | Base HP/MP/SP | `CUser::InitEquipment` 0x00454560, `StatusDefs` | done |
-| Attack, defense | `CUser::SetAttack` 0x00454280 | partial: no accuracy, evasion, critical or ranged formula yet |
+| Attack, defense, accuracy, evasion, critical | `CUser::SetAttack` 0x00454280 | done (weapon-mastery and skill bonuses not modeled) |
 | Level-up | stat/skill points by mode, +1 main stat | done |
 | Exp per kill | `CMob::GetExp` 0x00491690 | done (no event multiplier) |
 | Recovery | 5 s tick, 5% sitting, none in combat | partial: no equipment/skill recovery bonuses |
 | Lapisia enchant | `ItemEnchant.ini` | partial: gold cost to be configured |
-| Hit chance | `CUser::AttackSuccess` / `CMob::AttackSuccess` | invented: every hit lands |
-| Damage | `CUser::AttackDamage` 0x0044d540, `CMob::AttackDamage` 0x004a2920, element table `CGameData::m_AttackAttr` 0x00542260 | invented: average attack, mob attack minus defense |
-| Mob stats | `Mobs` Dex/Wis/Luc/Defense/Magic/Attrib, three attack slots | invented: only Attack1 |
-| Mob movement | `NormalTime/NormalStep/ChaseTime/ChaseStep` | invented: fixed steps |
+| Hit chance | `CUser::AttackSuccess` / `CMob::AttackSuccess` | done |
+| Damage | `CUser::AttackDamage` 0x0044d540, `CMob::AttackDamage` 0x004a2920, element table `CGameData::m_AttackAttr` 0x00542260 | partial: no close-range bow penalty, armour element or skill damage modes |
+| Mob stats | `Mobs` Dex/Wis/Luc/Defense/Magic/Attrib/Size, three attack slots | partial: only the first attack slot is used |
+| Mob movement | `update_mob_ai_idle`, `NormalTime/NormalStep/ChaseTime/ChaseStep`, reach `Size + Attackrange + 0.3` | done (no pathfinding around walls) |
 | Mob respawn | `Attackspecial3`, random ±60 min for selector ≥ 9 | partial |
-| Drops | `MobItems` orders 1..9 (1-6 per cent, 7-9 per million), grade pick with `Drop` limits, `SequenceItemCreate.ini`, 30% gold `Money1 + rand(Money2)` | invented: order 0 counted, 25% gold |
+| Drops | `MobItems` orders 1..9 (1-6 per cent, 7-9 per million), grade pick with `Drop` limits, `SequenceItemCreate.ini`, 30% gold `Money1 + rand(Money2)` | done (no party split) |
 | Quest item drops | `Mobs.QuestItemID` | missing |
-| Equip requirements | level, class, stats, country | missing |
-| NPC shop buy | `NpcQuest.SData` | missing |
+| Equip requirements | `CUser::EnableEquipment` 0x0045b450 | done |
+| NPC shop buy | `CUser::PacketShop` 0x0046af10, `NpcQuest.SData` | done (no guild-house discounts) |
+| Gatekeepers | `CUser::PacketMaininterface` case 0x020C, `NpcQuest.SData` | done (no guild-house rates; teleport is immediate) |
 | Party, quests, guilds | `0x0Bxx`, `0x09xx`, `0x0Dxx` | missing |
 
 ## Element table
