@@ -34,7 +34,7 @@ func StartSweeps(log *logx.Logger) {
 		for _, p := range players {
 			x, z := p.PositionXZ()
 			c, _ := p.viewCell()
-			snaps = append(snaps, PlayerCombatSnapshot{p.CharacterID, p.MapID(), x, z, p.IsAlive(), p.Faction(), c})
+			snaps = append(snaps, PlayerCombatSnapshot{p.CharacterID, p.MapID(), x, z, p.IsAlive(), p.Faction(), c, p.Snapshot().CurrentHP})
 		}
 		tick := TickMobCombat(snaps, 256)
 		for _, a := range tick.Attacks {

@@ -380,6 +380,7 @@ type PlayerCombatSnapshot struct {
 	Alive       bool
 	Faction     uint8
 	Cell        cell
+	HP          uint32
 }
 
 type MobAttackAction struct {
@@ -769,12 +770,18 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 			}
 			d := DistanceXZ(m.PosX, m.PosZ, target.PosX, target.PosZ)
 			if d < m.attackReach() && !now.Before(m.nextAttackAt) {
-				m.retargetByAggro(mapPlayers)
+				slot, ok := m.pickAttackSlot(now, d, &mods)
+				// AttackAI: an Attackok 6 slot turns to the weakest
+				// attacker of another country (FindAttackUserMinHP); the
+				// others to the top of the aggro ledger.
+				weakest := ok && m.def != nil && m.def.Attacks[slot].OK == 6 && mods.VisionFix == 0 && m.targetWeakest(mapPlayers)
+				if !weakest {
+					m.retargetByAggro(mapPlayers)
+				}
 				if t := m.liveTarget(mapPlayers); t != nil {
 					target = t
 					d = DistanceXZ(m.PosX, m.PosZ, target.PosX, target.PosZ)
 				}
-				slot, ok := m.pickAttackSlot(now, d, &mods)
 				if !ok {
 					// No slot ready: CMob::AttackAI waits 2.5 s.
 					m.nextAttackAt = now.Add(mobAttackIdle + mods.attackDelayOffset())
@@ -839,6 +846,25 @@ func (m *MapMob) findTarget(now time.Time, players []PlayerCombatSnapshot) *Play
 		}
 	}
 	return nil
+}
+
+// targetWeakest is CMob::FindAttackUserMinHP over the damage ledger.
+func (m *MapMob) targetWeakest(players []PlayerCombatSnapshot) bool {
+	var best *PlayerCombatSnapshot
+	for k := range players {
+		p := &players[k]
+		if _, hit := m.aggro[p.CharacterID]; !hit || !p.Alive || (m.def.Country < 2 && p.Faction == m.def.Country) {
+			continue
+		}
+		if best == nil || p.HP < best.HP {
+			best = p
+		}
+	}
+	if best == nil {
+		return false
+	}
+	m.AggroTarget = best.CharacterID
+	return true
 }
 
 // retargetByAggro is CMob::ReTargetByAggro: the living attacker on the map
