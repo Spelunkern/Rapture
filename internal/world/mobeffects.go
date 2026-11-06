@@ -320,12 +320,9 @@ func TickMobEffects() []MobEffectOutcome {
 				killed := m.CurrentHP == 0
 				o := MobEffectOutcome{MapID: mapID, CasterID: e.CasterID, SkillID: e.Def.SkillID, SkillLevel: e.Def.SkillLevel,
 					Damage: damage, AppliedHP: applied, Damaged: true, Killed: killed}
-				if killed && m.respawnDelay > 0 {
-					m.respawnAt = now.Add(m.respawnDelay)
-					o.RespawnSeconds = uint64(m.respawnDelay / time.Second)
-				}
 				if killed {
-					m.Effects, m.diedAt, m.corpseGone = nil, now, false
+					m.died(now)
+					o.RespawnSeconds = uint64(m.respawnDelay / time.Second)
 				} else if applied > 0 {
 					o.Speed = m.removeSleep()
 				}

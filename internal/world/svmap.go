@@ -236,10 +236,14 @@ func readMonsterAreas(r *svmapReader, mapSize uint32, mask []byte, defs *db.Defs
 			if def != nil {
 				respawn = def.RespawnSeconds
 			}
+			// stMobRespawn: one respawn group per area entry.
+			g := &mobGroup{count: int(count), alive: int(count)}
 			for range count {
 				p := positionInArea(lower, upper, index, mapSize, mask)
 				a := area
-				mobs = append(mobs, NewStaticMob(def, uint16(mobID), p.x, p.z, &a, respawn))
+				m := NewStaticMob(def, uint16(mobID), p.x, p.z, &a, respawn)
+				m.group = g
+				mobs = append(mobs, m)
 				index++
 			}
 		}

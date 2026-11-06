@@ -471,3 +471,51 @@ func TestMobAI(t *testing.T) {
 		t.Fatal("return did not complete within 10 units of home")
 	}
 }
+
+// TestGroupRespawn: a group of two that loses both mobs gets one back per
+// timer (CZone::UpdateMobRespawn), the timer started by the first death.
+func TestGroupRespawn(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	md := db.MustDefs().Mobs[103]
+	const mapID = 60002
+	g := &mobGroup{count: 2, alive: 2}
+	area := MobArea{0, 0, 20, 20}
+	var list []MapMob
+	for range 2 {
+		m := NewStaticMob(md, 103, 10, 10, &area, 1)
+		m.group = g
+		list = append(list, m)
+	}
+	AddEntities(mapID, MapEntities{Mobs: list})
+	for _, m := range EntitiesOnMap(mapID).Mobs {
+		if r, ok := DamageMob(mapID, m.ID, m.MaxHP); !ok || !r.Killed {
+			t.Fatal("kill failed")
+		}
+	}
+	if g.alive != 0 {
+		t.Fatalf("alive %d", g.alive)
+	}
+	s := shard(mapID)
+	s.mu.Lock()
+	for i := range s.entities.Mobs {
+		s.entities.Mobs[i].corpseGone = true
+	}
+	g.respawnAt = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	viewers := map[uint16][][2]float32{mapID: {{10, 10}}}
+	if got := len(TickMobRespawns(viewers, 128)); got != 1 || g.alive != 1 {
+		t.Fatalf("first timer respawned %d (alive %d)", got, g.alive)
+	}
+	if got := len(TickMobRespawns(viewers, 128)); got != 0 {
+		t.Fatalf("respawned %d before the timer ran out again", got)
+	}
+}

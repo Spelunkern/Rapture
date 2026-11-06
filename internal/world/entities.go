@@ -63,7 +63,8 @@ type MapMob struct {
 	MoneyMin, MoneyMax uint32
 	Exp                uint32
 	Area               *MobArea
-	respawnDelay       time.Duration // 0: no respawn
+	respawnDelay       time.Duration // 0: no respawn (ungrouped) / immediate (grouped)
+	group              *mobGroup     // stMobRespawn: the area entry it belongs to
 	respawnAt          time.Time
 	roamStep           uint32
 	Attack             uint32
@@ -361,13 +362,10 @@ func DamageMob(mapID uint16, id uint32, damage uint32) (MobDamageResult, bool) {
 		m.CurrentHP -= applied
 		r := MobDamageResult{DamageHP: uint16(min(damage, 65535)), AppliedHP: applied, Killed: m.CurrentHP == 0}
 		if r.Killed {
-			m.Effects, m.diedAt, m.corpseGone = nil, time.Now(), false
+			m.died(time.Now())
+			r.RespawnSeconds = uint64(m.respawnDelay / time.Second)
 		} else {
 			r.Speed = m.removeSleep()
-		}
-		if r.Killed && m.respawnDelay > 0 {
-			m.respawnAt = time.Now().Add(m.respawnDelay)
-			r.RespawnSeconds = uint64(m.respawnDelay / time.Second)
 		}
 		r.Mob = cloneMob(m)
 		return r, true
@@ -475,10 +473,26 @@ func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []enti
 				break
 			}
 			m := &s.entities.Mobs[i]
-			if m.CurrentHP > 0 || m.respawnAt.IsZero() || m.respawnAt.After(now) {
+			if m.CurrentHP > 0 {
 				continue
 			}
-			x, z := m.pickRespawnPosition(mapID)
+			var x, z float32
+			if g := m.group; g != nil {
+				if !m.corpseGone || g.alive >= g.count || now.Before(g.respawnAt) {
+					continue
+				}
+				var ok bool
+				if x, z, ok = m.respawnSpot(mapID); !ok {
+					continue
+				}
+				g.alive++
+				g.respawnAt = now.Add(m.respawnDelay)
+			} else {
+				if m.respawnAt.IsZero() || m.respawnAt.After(now) {
+					continue
+				}
+				x, z = m.pickRespawnPosition(mapID)
+			}
 			m.PosX, m.PosZ, m.homeX, m.homeZ = x, z, x, z
 			m.CurrentHP = max(m.MaxHP, 1)
 			m.respawnAt = time.Time{}
@@ -557,6 +571,54 @@ func (n *MapNpc) stepPatrol(now time.Time) bool {
 	n.PosZ += dz / dist * step
 	n.nextMoveAt = now.Add(interval)
 	return true
+}
+
+// mobGroup is stMobRespawn: an svmap area entry of Count mobs. The first
+// death of a full group starts its timer (RespawnTime, +-60 min for
+// Attackspecial3 >= 9, CZone::UpdateMobDeath); CZone::UpdateMobRespawn then
+// brings back one mob each time the timer runs out, at a random spot of
+// the area, restarting the timer.
+type mobGroup struct {
+	count, alive int
+	respawnAt    time.Time
+}
+
+// died books a death (shard lock held).
+func (m *MapMob) died(now time.Time) {
+	m.Effects, m.diedAt, m.corpseGone = nil, now, false
+	g := m.group
+	if g == nil {
+		if m.respawnDelay > 0 {
+			m.respawnAt = now.Add(m.respawnDelay)
+		}
+		return
+	}
+	if g.alive == g.count {
+		delay := m.respawnDelay
+		if m.def != nil && m.def.Attacks[2].Special >= 9 && delay > 0 {
+			delay += time.Duration(rand.IntN(120)-60) * time.Minute
+		}
+		g.respawnAt = now.Add(max(delay, 0))
+	}
+	g.alive--
+}
+
+// respawnSpot is UpdateMobRespawn's position: lower + rand(width) on each
+// axis; ok false when it is not walkable (the next update tries again).
+func (m *MapMob) respawnSpot(mapID uint16) (float32, float32, bool) {
+	if m.Area == nil {
+		return m.homeX, m.homeZ, true
+	}
+	a := m.Area.normalized()
+	w, d := int(a.UpperX-a.LowerX), int(a.UpperZ-a.LowerZ)
+	x, z := a.LowerX, a.LowerZ
+	if w > 0 {
+		x += float32(rand.IntN(w))
+	}
+	if d > 0 {
+		z += float32(rand.IntN(d))
+	}
+	return x, z, IsMapWalkable(mapID, x, z)
 }
 
 // relocate updates the mob's cell after a position change and returns the
