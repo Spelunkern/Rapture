@@ -26,7 +26,9 @@ powershell -ExecutionPolicy Bypass -File tools\build.ps1  # Windows
 ```
 
 This builds `build/rapture_login`, `build/rapture_world` and
-`build/rapture_console` (`.exe` on Windows).
+`build/rapture_console` (`.exe` on Windows), plus the `build/rapture_switch`
+window when a C compiler is available (Fyne needs cgo: gcc and the
+OpenGL/X11 or Wayland headers on Linux, MSYS2/TDM-GCC on Windows).
 
 ## 3. Database
 
@@ -88,6 +90,11 @@ Either way this builds (if needed) and opens the console. Type
 `start server` at its prompt to launch the login/world processes (hidden in
 the background on Windows, or just backgrounded on Linux); `shutdown server`
 stops them.
+
+**One-button window:** `build/rapture_switch` opens a small window that
+shows login/world status and has a single Start/Stop button. The servers
+run detached, so closing the window (or the console) leaves them as they
+are.
 
 **Manually**, from the repo root (so the relative `logs/`, `runtime/` and
 `data/maps/` paths resolve):

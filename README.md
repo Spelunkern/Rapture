@@ -50,7 +50,8 @@ powershell -ExecutionPolicy Bypass -File tools\build.ps1   # Windows
 
 Binaries land in `build/`. Open the Rapture Console with `./Start\ Rapture.sh`
 (Linux) or `Start Rapture.bat` (Windows); it starts and stops the headless
-login and world servers (`start server` / `shutdown server`).
+login and world servers (`start server` / `shutdown server`). For a
+one-button window instead, run `build/rapture_switch`.
 
 ## Database
 
@@ -68,6 +69,8 @@ replaced. Requires Docker.
 - `internal/world`: the game itself (maps, entities, combat, skills, items,
   trade, item mall, the per-connection session).
 - `cmd/rapture_console`: terminal console that starts and stops both.
+- `cmd/rapture_switch`: one-button window (Fyne) doing the same.
+- `internal/control`: the shared start/stop logic.
 - `internal/`: packets, crypto, logging, configuration, the SQL Server
   access layer (`internal/db`) and the login-to-world session handoff.
 - `tools/sqlserver.py`: Rapture's own SQL Server with the EP4.5 databases.
