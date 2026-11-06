@@ -276,6 +276,7 @@ func (s *Session) inSkillRange(m *MapMob, def *db.SkillDef, st *CharacterStats) 
 // ends except those with FixRange set.
 func (s *Session) clearBuffsOnDeath() {
 	s.deathLoss = s.deathExpLoss()
+	s.startRebirthTimer()
 	kept := s.buffs[:0]
 	var removed []uint32
 	for _, b := range s.buffs {

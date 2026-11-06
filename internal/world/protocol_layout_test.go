@@ -70,7 +70,7 @@ func TestPacketLayoutsMatchClient(t *testing.T) {
 		{"0x051f 0058fb50", buildMaxHPMPSP(ch, st), 16},
 		{"0x0521 00595090", buildCurrentHitpoints(st), 12},
 		{"0x0526 12 dwords", buildAdditionalStats(st), 48},
-		{"0x0551 00592090", buildCharacterResurrect(1, 1, 1, 1), 21},
+		{"0x0551 00592090", buildCharacterResurrect(1, 4, 0, 1, 1, 1), 21},
 		{"0x0601 00590b50", buildMobEnter(m, false), 15},
 		{"0x0602 u32", buildMobLeave(1), 4},
 		{"0x0603 00590c00", buildMobMove(m, 0), 13},

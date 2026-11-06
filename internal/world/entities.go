@@ -1363,10 +1363,13 @@ func buildCharacterReviveInit(characterID uint32) []byte {
 	return w.MustFinish()
 }
 
-func buildCharacterResurrect(characterID uint32, x, y, z float32) []byte {
+// buildCharacterResurrect (0x0551) is CUser::Rebirth's packet: id, kind
+// (1 in place, 4 bind point, 5 party leader), current exp, position.
+func buildCharacterResurrect(characterID uint32, kind uint8, exp uint32, x, y, z float32) []byte {
 	w := packet.New(packet.CharacterResurrect)
 	w.U32(characterID)
-	w.Bytes([]byte{0x04, 0x46, 0xAF, 0x37, 0x01})
+	w.U8(kind)
+	w.U32(exp)
 	w.F32(x)
 	w.F32(y)
 	w.F32(z)

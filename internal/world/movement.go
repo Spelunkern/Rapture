@@ -75,34 +75,6 @@ func (s *Session) applyTeleport(mapID uint16, x, y, z float32, label string) {
 	s.placeView()
 }
 
-// resurrect is CUser::KillSoul: the death's exp loss (ExpDrop), then
-// rebirth at the bind point with half HP/MP/SP, using the captured
-// sequence 0x0406, teleport, 0x0551, 0x0505.
-func (s *Session) resurrect() bool {
-	ch := s.char
-	if ch == nil {
-		return false
-	}
-	mapID, x, y, z := bindPosition(ch.MapID, s.faction, ch.PosX, ch.PosY, ch.PosZ)
-	lost := expDrop(ch, s.deathLoss)
-	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
-	full := StatsFor(ch, s.equipment())
-	ch.CurrentHP = satSub(ch.CurrentHP, full.CurrentHP-full.MaxHP/2)
-	ch.CurrentMP = satSub(ch.CurrentMP, full.CurrentMP-full.MaxMP/2)
-	ch.CurrentSP = satSub(ch.CurrentSP, full.CurrentSP-full.MaxSP/2)
-	s.persist()
-	stats := StatsFor(ch, s.equipment())
-	s.send(buildCharacterReviveInit(ch.ID), "0x0406 revive init")
-	s.applyTeleport(mapID, x, y, z, "resurrect")
-	s.send(buildCharacterResurrect(ch.ID, x, y, z), "0x0551 resurrect reposition")
-	s.send(buildCharacterReviveHitpoints(ch.ID, stats.CurrentHP, stats.CurrentMP, stats.CurrentSP), "0x0505 revive hitpoints")
-	if s.player != nil {
-		s.player.SetAlive(true)
-	}
-	s.log.Printf("Rapture World resurrected character_id=%d map=%d pos=(%.2f, %.2f, %.2f) exp_lost=%d", ch.ID, mapID, x, y, z, lost)
-	return true
-}
-
 // handleCharacterMove (0x0501): motion:u8, direction:u16, x, y, z:f32.
 func (s *Session) handleCharacterMove(p []byte) {
 	if len(p) < 17 || s.char == nil {

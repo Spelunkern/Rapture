@@ -56,7 +56,9 @@ type Session struct {
 	cast           *pendingCast
 	mounted        bool
 	dead           bool
-	deathLoss      int // CUser::Death exp-loss percent, kept until revive
+	deathLoss      int       // CUser::Death exp-loss percent, kept until revive
+	rebirthAt      time.Time // UpdateRebirth deadline while dead
+	rebirthParty   bool      // 0x0553 mode 3 waiting for the party leader
 
 	autoAttack       bool
 	autoAttackTarget uint32
@@ -238,6 +240,10 @@ func (s *Session) tick(idle bool) {
 		}
 	}
 	s.processBuffs()
+	s.tickRebirth(time.Now())
+	if s.char == nil {
+		return
+	}
 	s.recoveryTick()
 	if time.Since(s.lastQuestCheck) >= 5*time.Second {
 		s.lastQuestCheck = time.Now()
@@ -549,9 +555,7 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 	case packet.AutoAttackStop, packet.TargetClear:
 		s.autoAttack = false
 	case packet.ResurrectRequest:
-		if s.dead && s.resurrect() {
-			s.dead = false
-		}
+		s.handleResurrect(p)
 	case packet.UseVehicle:
 		s.handleUseVehicle()
 	case packet.CharacterMobAutoAttack:

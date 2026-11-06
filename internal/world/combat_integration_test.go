@@ -574,3 +574,88 @@ func TestCraftRules(t *testing.T) {
 		t.Fatal("capacity or duplicate check failed")
 	}
 }
+
+// TestRebirth follows KillSoul / KillSoulByItem(NoMove) / UpdateRebirth:
+// the normal revive loses exp and restores full pools at the bind point;
+// runes cost no exp, give half pools and are chosen by ReqVg (0 to stay,
+// set to move); ultimate mode needs a rune, and without one the character
+// ends.
+func TestRebirth(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := logx.New("rapture_world_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mapID = 60010
+	RegisterMapGrid(mapID, 2048, nil)
+	AddEntities(mapID, MapEntities{SpawnAreas: []MapSpawnArea{{Faction: 1, Boxes: []SpawnBox{{300, 10, 300, 310, 12, 310}}}}})
+	ch := &db.Character{Level: 30, Mode: growNormal, Str: 100, Dex: 100, Rec: 100, Int: 50, Wis: 50, Luc: 50, MapID: mapID, PosX: 900, PosZ: 900}
+	ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
+	s := &Session{char: ch, log: logger.Tagged("unit"), logger: logger, faction: FactionLight, skillCooldowns: map[uint16]time.Time{}}
+	prev, next := expBounds(ch)
+	die := func() {
+		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = 0, 0, 0
+		ch.PosX, ch.PosZ = 900, 900
+		s.dead = true
+		s.deathLoss = s.deathExpLoss()
+		s.startRebirthTimer()
+	}
+	full := func() CharacterStats {
+		c := *ch
+		c.CurrentHP, c.CurrentMP, c.CurrentSP = c.MaxHP, c.MaxMP, c.MaxSP
+		return StatsFor(&c, s.equipment())
+	}
+	inBox := func() bool { return ch.PosX >= 300 && ch.PosX < 310 && ch.PosZ >= 300 && ch.PosZ < 310 }
+
+	ch.Exp = prev + (next-prev)/2
+	die()
+	s.handleResurrect([]byte{0x53, 0x05, reviveAtBind})
+	if s.dead || !inBox() || s.stats().CurrentHP != full().MaxHP || ch.Exp >= prev+(next-prev)/2 {
+		t.Fatalf("bind revive: dead %v pos (%v, %v) hp %d/%d exp %d", s.dead, ch.PosX, ch.PosZ, s.stats().CurrentHP, full().MaxHP, ch.Exp)
+	}
+
+	s.items = []db.Item{{Bag: 1, Slot: 3, Type: 100, TypeID: 44, Count: 2}, {Bag: 1, Slot: 1, Type: 100, TypeID: 81, Count: 1}}
+	exp := ch.Exp
+	die()
+	s.handleResurrect([]byte{0x53, 0x05, reviveRuneHere})
+	if s.dead || ch.PosX != 900 || ch.Exp != exp || s.stats().CurrentHP != full().MaxHP/2 || len(s.items) != 2 || s.items[0].Count != 1 {
+		t.Fatalf("rune here: dead %v pos %v exp %d hp %d items %+v", s.dead, ch.PosX, ch.Exp, s.stats().CurrentHP, s.items)
+	}
+	die()
+	s.handleResurrect([]byte{0x53, 0x05, reviveRuneAtBind})
+	if s.dead || !inBox() || ch.Exp != exp || len(s.items) != 1 || s.items[0].TypeID != 44 {
+		t.Fatalf("rune at bind: dead %v pos (%v, %v) exp %d items %+v", s.dead, ch.PosX, ch.PosZ, ch.Exp, s.items)
+	}
+
+	die()
+	s.tickRebirth(time.Now().Add(rebirthDeadline - time.Second))
+	if !s.dead {
+		t.Fatal("revived before the 200 s deadline")
+	}
+	s.tickRebirth(time.Now().Add(rebirthDeadline + time.Second))
+	if s.dead || !inBox() {
+		t.Fatal("not revived at the deadline")
+	}
+
+	ch.Mode = growUltimate
+	exp = ch.Exp
+	die()
+	s.handleResurrect([]byte{0x53, 0x05, reviveAtBind})
+	if s.dead || ch.Exp != exp || len(s.items) != 0 || s.stats().CurrentHP != full().MaxHP/2 {
+		t.Fatalf("ultimate with rune: dead %v exp %d items %+v", s.dead, ch.Exp, s.items)
+	}
+	die()
+	s.handleResurrect([]byte{0x53, 0x05, reviveAtBind})
+	if s.char != nil {
+		t.Fatal("ultimate death without a rune kept the character")
+	}
+}
