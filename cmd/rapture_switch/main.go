@@ -45,9 +45,13 @@ func main() {
 			return "OFF"
 		}
 		login, world := state("rapture_login"), state("rapture_world")
+		database := "OFF"
+		if control.DatabaseRunning() {
+			database = "ON"
+		}
 		running := control.AnyRunning()
 		fyne.Do(func() {
-			status.SetText("login: " + login + "   |   world: " + world)
+			status.SetText("db: " + database + "   |   login: " + login + "   |   world: " + world)
 			if busy {
 				return
 			}
@@ -71,6 +75,7 @@ func main() {
 			button.SetText("Stopping...")
 		} else {
 			button.SetText("Starting...")
+			message.SetText("Starting the database can take a minute.")
 		}
 		go func() {
 			var err error
@@ -78,7 +83,6 @@ func main() {
 				control.StopAll()
 			} else {
 				err = control.StartAll()
-				time.Sleep(time.Second) // let a failing server exit before the status check
 			}
 			fyne.Do(func() {
 				busy = false
@@ -107,7 +111,7 @@ func main() {
 		container.NewHBox(layout.NewSpacer(), container.NewGridWrap(fyne.NewSize(220, 48), button), layout.NewSpacer()),
 		message,
 	)))
-	w.Resize(fyne.NewSize(340, 170))
+	w.Resize(fyne.NewSize(380, 170))
 	w.SetFixedSize(true)
 	w.ShowAndRun()
 }

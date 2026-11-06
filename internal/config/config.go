@@ -15,8 +15,11 @@ const ServerID = 1
 
 // LoadRuntimeEnv reads KEY=VALUE lines from .local/runtime.env into the
 // process environment without overriding variables that are already set.
-func LoadRuntimeEnv() {
-	file, err := os.Open(filepath.Join(".local", "runtime.env"))
+func LoadRuntimeEnv() { LoadRuntimeEnvFrom(".") }
+
+// LoadRuntimeEnvFrom is LoadRuntimeEnv for the checkout at root.
+func LoadRuntimeEnvFrom(root string) {
+	file, err := os.Open(filepath.Join(root, ".local", "runtime.env"))
 	if err != nil {
 		return
 	}

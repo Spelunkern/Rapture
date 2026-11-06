@@ -89,10 +89,15 @@ powershell -ExecutionPolicy Bypass -File tools\start_rapture.ps1
 Either way this builds (if needed) and opens the console. Type
 `start server` at its prompt to launch the login/world processes (hidden in
 the background on Windows, or just backgrounded on Linux); `shutdown server`
-stops them.
+stops them. `start server` first starts the `rapture-sqlserver` container
+if it is stopped (after a reboot, for example) and waits until it accepts a
+login; `shutdown server` stops the container too, to free its memory. A
+server that exits right after starting is reported with the last line of
+its log.
 
 **One-button window:** `build/rapture_switch` opens a small window that
-shows login/world status and has a single Start/Stop button. The servers
+shows database/login/world status and has a single Start/Stop button that
+does the same as the console commands, database included. The servers
 run detached, so closing the window (or the console) leaves them as they
 are.
 

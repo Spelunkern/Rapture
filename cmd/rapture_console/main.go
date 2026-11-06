@@ -35,20 +35,15 @@ func main() {
 		}
 		switch strings.ToLower(strings.TrimSpace(input.Text())) {
 		case "start server":
-			for _, name := range control.Servers {
-				control.Stop(name)
-				if err := control.Start(name); err != nil {
-					fmt.Printf("%s: error -- %v\n", short(name), err)
-				} else {
-					fmt.Printf("%s: started\n", short(name))
-				}
+			if err := control.StartAll(); err != nil {
+				fmt.Printf("error -- %v\n", err)
+			} else {
+				fmt.Println("server started")
 			}
 			status()
 		case "shutdown server":
-			for _, name := range control.Servers {
-				control.Stop(name)
-				fmt.Printf("%s: stopped\n", short(name))
-			}
+			control.StopAll()
+			fmt.Println("server stopped")
 			status()
 		case "":
 		default:

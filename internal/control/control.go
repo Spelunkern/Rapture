@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Servers are started in this order and stopped together.
@@ -118,23 +119,40 @@ func Start(name string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	return cmd.Process.Release()
+	// Reap the child when it exits so it does not linger as a zombie.
+	go cmd.Wait()
+	return nil
 }
 
-// StartAll (re)starts every server, stopping old instances first.
+// startupGrace is how long a fresh server gets to fail before it counts as up.
+const startupGrace = 3 * time.Second
+
+// StartAll starts the database, then (re)starts every server, stopping old
+// instances first. A server that exits during startupGrace is reported with
+// the last line of its log.
 func StartAll() error {
+	if err := EnsureDatabase(); err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
 	for _, name := range Servers {
 		Stop(name)
 		if err := Start(name); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
+	time.Sleep(startupGrace)
+	for _, name := range Servers {
+		if !Running(name) {
+			return fmt.Errorf("%s exited: %s", name, lastLogLine(name))
+		}
+	}
 	return nil
 }
 
-// StopAll stops every server.
+// StopAll stops every server and then the database.
 func StopAll() {
 	for _, name := range Servers {
 		Stop(name)
 	}
+	StopDatabase()
 }
