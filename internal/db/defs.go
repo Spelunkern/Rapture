@@ -103,6 +103,7 @@ type MobDef struct {
 	Defense, Magic     uint16
 	ShieldDefense      uint32 // Attacktime3, as the original reads it
 	Attrib             uint8
+	Size               uint8
 	NormalTimeMS       uint32
 	NormalStep         uint16
 	ChaseTimeMS        uint32
@@ -289,7 +290,7 @@ func loadDefs() (*Defs, error) {
 	rows.Close()
 
 	rows, err = pool.QueryContext(c, `SELECT MobID, ISNULL(MobName,''), Level, HP, Money1, Money2, Attackspecial3,
-		Exp, Attack1, AI, ChaseRange, Dex, Wis, Luc, Defense, Magic, Attacktime3, Attrib, NormalTime, NormalStep,
+		Exp, Attack1, AI, ChaseRange, Dex, Wis, Luc, Defense, Magic, Attacktime3, Attrib, ISNULL(Size,0), NormalTime, NormalStep,
 		ChaseTime, ChaseStep, AttackType1, AttackTime1, Attackrange1, Attack1, Attackplus1, Attackattrib1, Attackok1,
 		Attacktype2, Attacktime2, Attackrange2, Attack2, Attackplus2, Attackattrib2, Attackok2,
 		Attacktype3, Attacktime3, Attackrange3, Attack3, Attackplus3, Attackattrib3, Attackok3 FROM dbo.Mobs`)
@@ -298,12 +299,12 @@ func loadDefs() (*Defs, error) {
 	}
 	for rows.Next() {
 		var mobID, level, hp, money1, money2, exp, attack, chase int64
-		var dex, wis, luc, def, magic, shield, attrib, ntime, nstep, ctime, cstep int64
+		var dex, wis, luc, def, magic, shield, attrib, size, ntime, nstep, ctime, cstep int64
 		var a [3][7]int64
 		var special, ai uint8
 		var name string
 		dest := []any{&mobID, &name, &level, &hp, &money1, &money2, &special, &exp, &attack, &ai, &chase,
-			&dex, &wis, &luc, &def, &magic, &shield, &attrib, &ntime, &nstep, &ctime, &cstep}
+			&dex, &wis, &luc, &def, &magic, &shield, &attrib, &size, &ntime, &nstep, &ctime, &cstep}
 		for i := range a {
 			for j := range a[i] {
 				dest = append(dest, &a[i][j])
@@ -321,7 +322,7 @@ func loadDefs() (*Defs, error) {
 			MoneyMax: uint32(max(money2, 0)), RespawnSeconds: MobRespawnSeconds(special),
 			Exp: uint32(max(exp, 0)), Attack: uint32(max(attack, 0)), AI: ai, ChaseRange: float32(max(chase, 0)),
 			Dex: clampU16(dex), Wis: clampU16(wis), Luc: clampU16(luc), Defense: clampU16(def), Magic: clampU16(magic),
-			ShieldDefense: uint32(max(shield, 0)), Attrib: clampU8(attrib), NormalTimeMS: uint32(max(ntime, 0)),
+			ShieldDefense: uint32(max(shield, 0)), Attrib: clampU8(attrib), Size: clampU8(size), NormalTimeMS: uint32(max(ntime, 0)),
 			NormalStep: clampU16(nstep), ChaseTimeMS: uint32(max(ctime, 0)), ChaseStep: clampU16(cstep)}
 		for i := range a {
 			d.Mobs[uint16(mobID)].Attacks[i] = MobAttack{Type: clampU16(a[i][0]), TimeMS: uint32(max(a[i][1], 0)),

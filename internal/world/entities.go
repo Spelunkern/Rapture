@@ -2,6 +2,7 @@ package world
 
 import (
 	"math"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,7 +23,6 @@ const (
 	mobMotionRun        = 1
 	mobMotionWalk       = 0
 	mobAttackPause      = 200 * time.Millisecond
-	mobReturnStep       = 2.0
 	mobReturnArrive     = 1.0
 	mobRetaliationLeash = 20.0
 	mobLeashGrace       = 8.0
@@ -86,6 +86,9 @@ type MapMob struct {
 	AggroTarget        uint32 // 0: none
 	lastAttackAt       time.Time
 	returningHome      bool
+	def                *db.MobDef
+	nextMoveAt         time.Time // idle wander
+	nextChaseAt        time.Time // chase / return step
 	Dots               []ActiveDot
 }
 
@@ -158,13 +161,12 @@ type mapGrid struct {
 }
 
 var (
-	shardsMu   sync.Mutex
-	shards     = map[uint16]*mapShard{}
-	gridsMu    sync.RWMutex
-	grids      = map[uint16]mapGrid{}
-	nextNpcID  atomic.Uint32
-	nextMobID  atomic.Uint32
-	roamCursor atomic.Uint32
+	shardsMu  sync.Mutex
+	shards    = map[uint16]*mapShard{}
+	gridsMu   sync.RWMutex
+	grids     = map[uint16]mapGrid{}
+	nextNpcID atomic.Uint32
+	nextMobID atomic.Uint32
 )
 
 func init() {
@@ -565,12 +567,11 @@ func (b viewerBuckets) nearAny(x, z float32, radius float32) bool {
 // TickMobRoam moves idle mobs near viewers within their area.
 func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacket {
 	var out []mapPacket
-	cursor := roamCursor.Add(1) - 1
 	for mapID, viewers := range viewersByMap {
 		s := shard(mapID)
 		s.mu.Lock()
 		buckets := bucketViewers(viewers)
-		moved, visited := 0, 0
+		moved := 0
 		for i := range s.entities.Mobs {
 			if moved >= maxPerMap {
 				break
@@ -578,10 +579,6 @@ func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacke
 			m := &s.entities.Mobs[i]
 			if m.CurrentHP == 0 || m.Area == nil || m.AggroTarget != 0 || m.returningHome ||
 				!buckets.nearAny(m.PosX, m.PosZ, ViewportRadius) {
-				continue
-			}
-			visited++
-			if (uint32(visited)+cursor)%4 != 0 {
 				continue
 			}
 			if m.advanceRoam(mapID) {
@@ -626,10 +623,12 @@ func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapP
 	return out
 }
 
+var npcPatrolCursor atomic.Uint32
+
 // TickNpcPatrol advances patrolling NPCs near viewers.
 func TickNpcPatrol(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacket {
 	var out []mapPacket
-	cursor := roamCursor.Add(1) - 1
+	cursor := npcPatrolCursor.Add(1) - 1
 	for mapID, viewers := range viewersByMap {
 		s := shard(mapID)
 		s.mu.Lock()
@@ -742,12 +741,16 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 			}
 			if m.AggroTarget == 0 {
 				if m.returningHome {
+					if now.Before(m.nextChaseAt) {
+						continue
+					}
+					m.nextChaseAt = now.Add(m.chaseInterval())
 					d := DistanceXZ(m.PosX, m.PosZ, m.homeX, m.homeZ)
 					arrived := false
 					if d <= mobReturnArrive {
 						m.PosX, m.PosZ, arrived = m.homeX, m.homeZ, true
 					} else {
-						step := min(float32(mobReturnStep), d)
+						step := min(m.chaseStep(), d)
 						nx := m.PosX + (m.homeX-m.PosX)/d*step
 						nz := m.PosZ + (m.homeZ-m.PosZ)/d*step
 						if IsMapWalkable(mapID, nx, nz) {
@@ -777,8 +780,8 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 				continue
 			}
 			d := DistanceXZ(m.PosX, m.PosZ, target.PosX, target.PosZ)
-			if d <= MobAttackRange {
-				if m.lastAttackAt.IsZero() || now.Sub(m.lastAttackAt) >= MobAttackInterval {
+			if d < m.attackReach() {
+				if m.lastAttackAt.IsZero() || now.Sub(m.lastAttackAt) >= m.attackInterval() {
 					m.lastAttackAt = now
 					actions++
 					tick.Attacks = append(tick.Attacks, MobAttackAction{m.ID, m.MobID, m.Attack, m.AggroTarget})
@@ -788,8 +791,12 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 			if !m.lastAttackAt.IsZero() && now.Sub(m.lastAttackAt) < mobAttackPause {
 				continue
 			}
+			if now.Before(m.nextChaseAt) {
+				continue
+			}
+			m.nextChaseAt = now.Add(m.chaseInterval())
 			if d > 0.001 {
-				step := min(float32(mobChaseStep), d)
+				step := min(m.chaseStep(), max(d-m.attackReach()+0.5, 0.5))
 				nx := m.PosX + (target.PosX-m.PosX)/d*step
 				nz := m.PosZ + (target.PosZ-m.PosZ)/d*step
 				if IsMapWalkable(mapID, nx, nz) {
@@ -868,7 +875,10 @@ func NewStaticMob(def *db.MobDef, mobID uint16, x, z float32, area *MobArea, res
 	if def != nil {
 		m.Level, m.MaxHP, m.MoneyMin, m.MoneyMax = def.Level, max(def.MaxHP, 1), def.MoneyMin, def.MoneyMax
 		m.Exp, m.Attack, m.AI, m.ChaseRange = def.Exp, def.Attack, def.AI, def.ChaseRange
+		m.def = def
 	}
+	// CMob::Init: the first wander comes within a minute.
+	m.nextMoveAt = time.Now().Add(time.Duration(rand.IntN(60000)) * time.Millisecond)
 	m.CurrentHP = m.MaxHP
 	if area != nil {
 		a := area.normalized()
@@ -898,27 +908,66 @@ func (m *MapMob) pickRespawnPosition(mapID uint16) (float32, float32) {
 	return m.homeX, m.homeZ
 }
 
+// mobSpeedOffsets are the original move-speed step offsets (0x00542538);
+// mobs start at speed 2 (no offset).
+var mobSpeedOffsets = [5]float32{-4, -2, 0, 2, 4}
+
+const mobHomeRadius = 10.0
+
+// advanceRoam is the idle state's wander (update_mob_ai_idle): every
+// 10 s + NormalTime + up to 30 s, a step of NormalStep + 0..4 units in a
+// random direction, staying within 10 units of home.
 func (m *MapMob) advanceRoam(mapID uint16) bool {
-	if m.Area == nil {
+	now := time.Now()
+	if m.def == nil || now.Before(m.nextMoveAt) {
 		return false
 	}
-	a := m.Area.normalized()
-	m.roamStep++
-	for attempt := uint32(0); attempt < 16; attempt++ {
-		seed := m.roamStep*17 + attempt + m.ID
-		angle := float64(seed%16) * 2 * math.Pi / 16
-		radius := 2.0 + float64((seed/16)%5)
-		nx := a.clampX(m.homeX + float32(math.Cos(angle)*radius))
-		nz := a.clampZ(m.homeZ + float32(math.Sin(angle)*radius))
-		if roamWalkable(mapID, nx, nz, a) {
-			if abs32(m.PosX-nx) < 0.1 && abs32(m.PosZ-nz) < 0.1 {
-				continue
-			}
-			m.PosX, m.PosZ = nx, nz
-			return true
-		}
+	pause := 10*time.Second + time.Duration(rand.IntN(30000))*time.Millisecond
+	if m.def.NormalStep == 0 || m.AI == 4 {
+		m.nextMoveAt = now.Add(pause)
+		return false
 	}
-	return false
+	m.nextMoveAt = now.Add(pause + time.Duration(m.def.NormalTimeMS)*time.Millisecond)
+	length := float32(m.def.NormalStep) + mobSpeedOffsets[2] + float32(rand.IntN(500)/100)
+	angle := float64(rand.IntN(10000)) * math.Pi / 180
+	nx := m.PosX - float32(math.Sin(angle))*length
+	nz := m.PosZ + float32(math.Cos(angle))*length
+	if DistanceXZ(nx, nz, m.homeX, m.homeZ) >= mobHomeRadius || !IsMapWalkable(mapID, nx, nz) {
+		return false
+	}
+	m.PosX, m.PosZ = nx, nz
+	return true
+}
+
+// chaseStep and chaseInterval are ChaseStep / ChaseTime (used both to
+// chase and to walk home).
+func (m *MapMob) chaseStep() float32 {
+	if m.def == nil || m.def.ChaseStep == 0 {
+		return mobChaseStep
+	}
+	return max(float32(m.def.ChaseStep)+mobSpeedOffsets[2], 1)
+}
+
+func (m *MapMob) chaseInterval() time.Duration {
+	if m.def == nil || m.def.ChaseTimeMS == 0 {
+		return time.Second
+	}
+	return time.Duration(m.def.ChaseTimeMS) * time.Millisecond
+}
+
+// attackReach is vertical_mobs_attack_range: Size + Attackrange + 0.3.
+func (m *MapMob) attackReach() float32 {
+	if m.def == nil {
+		return MobAttackRange
+	}
+	return float32(m.def.Size) + float32(m.def.Attacks[0].Range) + 0.3
+}
+
+func (m *MapMob) attackInterval() time.Duration {
+	if m.def == nil || m.def.Attacks[0].TimeMS == 0 {
+		return MobAttackInterval
+	}
+	return time.Duration(m.def.Attacks[0].TimeMS) * time.Millisecond
 }
 
 func roamWalkable(mapID uint16, x, z float32, a MobArea) bool {
