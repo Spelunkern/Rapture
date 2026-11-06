@@ -447,7 +447,10 @@ func (s *Session) handleDropItem(p []byte) {
 	}
 	dropped := it
 	dropped.Count, dropped.Bag, dropped.Slot, dropped.UID = n, 0, 0, 0
-	mi := MapItem{ID: nextMapItemID(), Item: dropped, OwnerID: ch.ID, DroppedAt: time.Now(), PosX: ch.PosX, PosY: ch.PosY, PosZ: ch.PosZ}
+	// CUser::ItemDrop: the dropper owns it (no party share), at
+	// CUser::GetDropPosRand: within half a unit, at the character's height.
+	x, z := dropPosition(ch.PosX, ch.PosZ)
+	mi := MapItem{ID: nextMapItemID(), Item: dropped, OwnerID: ch.ID, NoParty: true, DroppedAt: time.Now(), PosX: x, PosY: ch.PosY, PosZ: z}
 	res := it
 	res.Count = it.Count - n
 	var err error
@@ -494,13 +497,25 @@ func (s *Session) handlePickupItem(p []byte) {
 	}
 	ch := s.char
 	id, _ := packet.U32(p[2:])
+	// CZone::GetPickItem: 3 missing, 0 reserved (CItem::PickEnable: the
+	// owner, or its party for mob loot, for the first 30 s), 4 farther than
+	// 10 units, 2 a quest item no active quest needs.
 	mi, ok := findMapItem(ch.MapID, id)
 	if !ok {
-		s.send(buildAddItemError(0), "0x0205 pickup error")
+		s.send(buildAddItemError(3), "0x0205 pickup error")
 		return
 	}
-	if mi.OwnerID != ch.ID && time.Since(mi.DroppedAt) < mapItemOwnerWindow && !samePartyIDs(mi.OwnerID, ch.ID) {
-		s.send(buildAddItemError(2), "0x0205 pickup reserved")
+	if mi.OwnerID != 0 && mi.OwnerID != ch.ID && time.Since(mi.DroppedAt) < mapItemOwnerWindow &&
+		(mi.NoParty || !samePartyIDs(mi.OwnerID, ch.ID)) {
+		s.send(buildAddItemError(0), "0x0205 pickup reserved")
+		return
+	}
+	if DistanceXZ(mi.PosX, mi.PosZ, ch.PosX, ch.PosZ) > 10 {
+		s.send(buildAddItemError(4), "0x0205 pickup too far")
+		return
+	}
+	if mi.Money == 0 && realType(mi.Item.Type) == 27 && !s.questNeeds(mi.Item.Type, mi.Item.TypeID) {
+		s.send(buildAddItemError(2), "0x0205 pickup quest item not needed")
 		return
 	}
 	if mi.Money > 0 {

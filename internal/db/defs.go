@@ -280,12 +280,14 @@ func normalizeSkill(s *SkillDef, defenceType, fixRange uint8, keep uint32, aggro
 
 // MobRespawnSeconds maps Mobs.Attackspecial3 to the respawn delay.
 func MobRespawnSeconds(special uint8) uint64 {
-	table := []uint64{40, 40, 60, 3 * 60, 8 * 60, 12 * 60, 15 * 60, 30 * 60, 45 * 60, 60 * 60,
-		12 * 3600, 24 * 3600, 3 * 86400, 4 * 86400, 6 * 86400, 7 * 86400}
+	// CGameData::LoadConstMob 0x004c1e81..0x004c1f62 (ms): selector 14 is
+	// 0 (immediate), anything above 15 reads 0 too.
+	table := []uint64{5, 30, 60, 3 * 60, 5 * 60, 10 * 60, 15 * 60, 30 * 60, 3600, 4 * 3600,
+		12 * 3600, 24 * 3600, 3 * 86400, 2 * 3600, 0, 7 * 86400}
 	if int(special) < len(table) {
 		return table[special]
 	}
-	return 0
+	return table[0]
 }
 
 func loadDefs() (*Defs, error) {

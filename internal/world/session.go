@@ -289,7 +289,8 @@ func (s *Session) recoveryTick() {
 	if st.CurrentHP == 0 {
 		return
 	}
-	hp, mp, sp := s.healDelta(sittingRecovery(st.MaxHP), sittingRecovery(st.MaxMP), sittingRecovery(st.MaxSP))
+	hp, mp, sp := s.healDelta(sittingRecovery(st.MaxHP, st.SitRecover[0]), sittingRecovery(st.MaxMP, st.SitRecover[2]),
+		sittingRecovery(st.MaxSP, st.SitRecover[1]))
 	if hp+mp+sp == 0 {
 		return
 	}

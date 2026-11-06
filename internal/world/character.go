@@ -82,17 +82,18 @@ type EquipmentStats struct {
 	RangedWeapon         bool
 	// CUser::SetSkillAbility / AddSkillPassive / gems: per-category
 	// (melee, ranged, magic) additions and other modifiers.
-	Mods        [3]CategoryMods
-	Critical    int32
-	Range       int32 // added to the weapon's reach
-	AttackSpeed int32 // added to the swing-speed index
-	MoveSpeed   int32
-	CrossRoad   int32 // passive detail 9: no close-range bow penalty
-	SPCostCut   int32 // ability 13 / 14: percent off skill costs
-	MPCostCut   int32
-	Disabled    [3]int32 // abilities 32-34: no attacks of that category
-	WeaponType  uint8    // real type of the equipped weapon (0 none)
-	ShieldType  uint8    // real type of the equipped shield (0 none)
+	Mods          [3]CategoryMods
+	Critical      int32
+	Range         int32 // added to the weapon's reach
+	AttackSpeed   int32 // added to the swing-speed index
+	MoveSpeed     int32
+	CrossRoad     int32    // passive detail 9: no close-range bow penalty
+	SitRecoverPct [3]int32 // abilities 10-12: extra sitting recovery % (HP, SP, MP)
+	SPCostCut     int32    // ability 13 / 14: percent off skill costs
+	MPCostCut     int32
+	Disabled      [3]int32 // abilities 32-34: no attacks of that category
+	WeaponType    uint8    // real type of the equipped weapon (0 none)
+	ShieldType    uint8    // real type of the equipped shield (0 none)
 }
 
 // CategoryMods are SetSkillAbility's per-category additions.
@@ -274,6 +275,7 @@ type CharacterStats struct {
 	AttackSpeed  int32
 	MoveSpeed    int32
 	Disabled     [3]int32
+	SitRecover   [3]int32
 	SPCostCut    int32
 	MPCostCut    int32
 }

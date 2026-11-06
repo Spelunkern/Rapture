@@ -198,8 +198,12 @@ func mobExperience(mobLevel, base, userLevel uint16) uint32 {
 // sittingRecovery is the 5-second recovery while sitting: 5% of each max
 // (the original's standing_amount, 0.05f) plus skill/equipment bonuses,
 // which Rapture does not model yet.
-func sittingRecovery(maxValue uint32) uint32 {
-	return uint32(math.Trunc(float64(float32(maxValue)) * float64(float32(0.05))))
+// sittingRecovery is CUser::UpdateRecover's sitting amount: 5% of the
+// maximum plus the sitting-recovery abilities' percent (10-12).
+func sittingRecovery(maxValue uint32, extraPct int32) uint32 {
+	m := float64(float32(maxValue))
+	v := math.RoundToEven(m*float64(float32(0.05)) + float64(float32(extraPct))*m*float64(float32(0.01)))
+	return uint32(max(v, 0))
 }
 
 // resetStats undoes stat allocation: the job's starting stats plus the

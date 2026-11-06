@@ -23,6 +23,7 @@ type MapItem struct {
 	Item             db.Item
 	Money            uint32
 	OwnerID          uint32
+	NoParty          bool // a player's drop: its party does not share it
 	DroppedAt        time.Time
 	PosX, PosY, PosZ float32
 }

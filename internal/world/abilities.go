@@ -38,6 +38,8 @@ func applyAbility(e *EquipmentStats, effect, kind uint8, value int32) bool {
 		e.Dex = addSigned(e.Dex, value)
 	case 9:
 		e.Luc = addSigned(e.Luc, value)
+	case 10, 11, 12:
+		e.SitRecoverPct[kind-10] += value // HP, SP, MP
 	case 13:
 		e.SPCostCut += value
 	case 14:

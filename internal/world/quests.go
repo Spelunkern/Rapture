@@ -726,6 +726,23 @@ func (s *Session) questKill(mobID uint16) {
 	}
 }
 
+// questNeeds: an item that starts a quest, or one an active quest ends with.
+func (s *Session) questNeeds(t, id uint8) bool {
+	link, ok := questItemLinks[[2]uint8{t, id}]
+	if !ok {
+		return false
+	}
+	if len(link.Start) > 0 {
+		return true
+	}
+	for _, qid := range link.End {
+		if s.findQuest(qid) != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // questPickup is quest_requests_progress_pick_item.
 func (s *Session) questPickup(t, id uint8) {
 	link, ok := questItemLinks[[2]uint8{t, id}]
