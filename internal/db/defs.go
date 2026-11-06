@@ -81,6 +81,7 @@ type SkillDef struct {
 	TypeEffect     uint8 // 0 passive, 1 attack, 2 heal, 3 debuff, 4 buff, ...
 	DamageType     uint8 // AttackDamage mode 0..5
 	TimeDamageType uint8 // TimeDamage mode 0, 3, 4, 5
+	TypeShow       uint8 // 0: not learnable
 	DamageSP       int32
 	DamageMP       int32
 	AddDamageSP    int32
@@ -345,7 +346,7 @@ func loadDefs() (*Defs, error) {
 		AttrType, StateType, SuccessType, SuccessValue, Weapon1, Weapon2, Weaponvalue, DefenceType, DefenceValue,
 		Arrow, LimitHP, FixRange, NeedWeapon1, NeedWeapon2, NeedWeapon3, NeedWeapon4, NeedWeapon5, NeedWeapon6,
 		NeedWeapon7, NeedWeapon8, NeedWeapon9, NeedWeapon10, NeedWeapon11, NeedWeapon12, NeedWeapon13, NeedWeapon14,
-		NeedWeapon15, Shield, TimeDamageType FROM dbo.Skills`)
+		NeedWeapon15, Shield, TimeDamageType, TypeShow FROM dbo.Skills`)
 	if err != nil {
 		return nil, fmt.Errorf("load Skills: %w", err)
 	}
@@ -361,7 +362,7 @@ func loadDefs() (*Defs, error) {
 		for i := range need {
 			extra = append(extra, &need[i])
 		}
-		extra = append(extra, &shield, &s.TimeDamageType)
+		extra = append(extra, &shield, &s.TimeDamageType, &s.TypeShow)
 		if err := rows.Scan(append([]any{&skillID, &s.SkillLevel, &s.Name, &s.Country, &reqLevel, &s.Grow, &s.SkillPointCost,
 			&prev, &classes[0], &classes[1], &classes[2], &classes[3], &classes[4], &classes[5], &sp, &mp,
 			&reset, &s.ReadyTime, &s.DamageHP, &s.AddDamageHP, &s.HealHP, &s.HealSP, &s.HealMP, &typeDetail,

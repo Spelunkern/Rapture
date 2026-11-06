@@ -15,7 +15,6 @@ const (
 
 	mountSlot      = 13
 	mountItemType  = 42
-	mountShape     = 0x19
 	unmountedShape = 0x00
 )
 
@@ -88,6 +87,50 @@ func (s *Session) handleSkillBar(p []byte) {
 	s.log.Printf("Rapture World saved %d quick slots", len(s.quickSlots))
 }
 
+// buildLearnSkillError (0x0209): reason, skill id, level.
+func buildLearnSkillError(reason uint8, skillID uint16, level uint8) []byte {
+	w := packet.New(packet.LearnNewSkill)
+	w.U8(reason)
+	w.U8(0)
+	w.U16(skillID)
+	w.U8(level)
+	return w.MustFinish()
+}
+
+// skillCountryAllows is EnableLearnSkill's Country byte by family (0 human,
+// 1 elf, 2 vail, 3 deatheater).
+func skillCountryAllows(country, family uint8) bool {
+	switch country {
+	case 0:
+		return family == 0
+	case 1:
+		return family == 1
+	case 2:
+		return family == 0 || family == 1
+	case 3:
+		return family == 3
+	case 4:
+		return family == 2
+	case 5:
+		return family == 2 || family == 3
+	}
+	return true
+}
+
+// skillGrowAllows: easy mode learns only Grow 0 skills, normal up to 1,
+// hard all but 3.
+func skillGrowAllows(grow, mode uint8) bool {
+	switch mode {
+	case 0:
+		return grow == 0
+	case 1:
+		return grow <= 1
+	case 2:
+		return grow != 3
+	}
+	return true
+}
+
 func buildLearnSkillResult(ok bool, number uint8, skillID uint16, level uint8) []byte {
 	w := packet.New(packet.LearnNewSkill)
 	w.U8(resultByte(ok))
@@ -105,20 +148,17 @@ func (s *Session) handleLearnSkill(p []byte) {
 	ch := s.char
 	skillID, _ := packet.U16(p[2:])
 	level := p[4]
-	reject := func(why string) {
+	// CUser::LearnSkill / EnableLearnSkill (0x004842e0 / 0x00484080):
+	// levels 1-3; a new skill starts at level 1 and a known one goes to
+	// any higher level; then skill points (error 1), level (2), and the
+	// country, job, growth mode and TypeShow (3). No prerequisite skill.
+	reject := func(code uint8, why string) {
 		s.log.Printf("Rapture World rejected learn skill skill_id=%d level=%d: %s", skillID, level, why)
-		s.send(buildLearnSkillResult(false, 0, skillID, level), "0x0209 learn skill rejected")
+		s.send(buildLearnSkillError(code, skillID, level), "0x0209 learn skill rejected")
 	}
 	def := db.MustDefs().Skill(skillID, level)
-	switch {
-	case def == nil:
-		reject("no such skill/level")
-		return
-	case int(ch.Class) >= len(def.ClassEligible) || !def.ClassEligible[ch.Class]:
-		reject("class not eligible")
-		return
-	case ch.Level < def.ReqLevel:
-		reject("level too low")
+	if level < 1 || level > 3 || def == nil {
+		reject(3, "no such skill/level")
 		return
 	}
 	existing := -1
@@ -127,28 +167,27 @@ func (s *Session) handleLearnSkill(p []byte) {
 			existing = i
 		}
 	}
-	if level > 1 {
-		if existing < 0 || s.skills[existing].Level != level-1 {
-			reject("previous level not known")
+	if existing >= 0 {
+		if s.skills[existing].Level >= level {
+			reject(3, "level already known")
 			return
 		}
-	} else if existing >= 0 {
-		reject("already known")
+	} else if level != 1 {
 		return
 	}
-	if def.PrevSkillID != 0 {
-		found := false
-		for _, k := range s.skills {
-			found = found || k.SkillID == def.PrevSkillID
-		}
-		if !found {
-			reject("missing prerequisite")
-			return
-		}
-	}
 	cost := uint16(def.SkillPointCost)
-	if ch.SkillPoint < cost {
-		reject("not enough skill points")
+	switch {
+	case ch.SkillPoint < cost:
+		reject(1, "not enough skill points")
+		return
+	case ch.Level < def.ReqLevel:
+		reject(2, "level too low")
+		return
+	case !skillCountryAllows(def.Country, ch.Race):
+		s.log.Printf("Rapture World rejected learn skill skill_id=%d: country %d", skillID, def.Country)
+		return
+	case int(ch.Class) >= len(def.ClassEligible) || !def.ClassEligible[ch.Class] || !skillGrowAllows(def.Grow, ch.Mode) || def.TypeShow == 0:
+		reject(3, "job, growth mode or hidden skill")
 		return
 	}
 	var learned db.CharacterSkill
@@ -170,7 +209,7 @@ func (s *Session) handleLearnSkill(p []byte) {
 	}
 	if err != nil {
 		s.log.Printf("Rapture World failed to save learned skill: %v", err)
-		reject("database error")
+		reject(3, "database error")
 		return
 	}
 	ch.SkillPoint -= cost
@@ -234,18 +273,32 @@ func (s *Session) handleUseVehicle() {
 		w.Bool(on)
 		return w.MustFinish()
 	}
+	// vertical_combat_vehicle_prefix: a slot-13 mount (not while in the
+	// transform shapes 10-12); its shape is the item's Range r as r*2
+	// below 2, else r+7. A refusal answers 0x0216 (0, 1).
 	next := !s.mounted
+	shape := uint8(unmountedShape)
 	if next {
-		if m := equippedItem(s.items, mountSlot); m == nil || m.Type != mountItemType {
-			s.send(reply(false, false), "0x0216 use vehicle rejected")
+		m := equippedItem(s.items, mountSlot)
+		var d *db.ItemDef
+		if m != nil {
+			d = db.MustDefs().Item(m.Type, m.TypeID)
+		}
+		if m == nil || m.Type != mountItemType || d == nil {
+			s.send(reply(false, true), "0x0216 use vehicle rejected")
 			return
+		}
+		r := uint8(max(d.Range, 0))
+		if r < 2 {
+			shape = r * 2
+		} else {
+			shape = r + 7
 		}
 	}
 	s.mounted = next
-	s.send(reply(true, next), "0x0216 use vehicle")
-	shape := uint8(unmountedShape)
-	if next {
-		shape = mountShape
+	s.send(reply(true, true), "0x0216 use vehicle")
+	if s.player != nil {
+		s.player.setMountShape(shape)
 	}
 	w := packet.New(packet.CharacterMountShape)
 	w.U32(ch.ID)
@@ -254,4 +307,22 @@ func (s *Session) handleUseVehicle() {
 	s.send(frame, "0x051D character mount shape")
 	s.sendToViewers(frame, "0x051D character mount shape")
 	s.log.Printf("Rapture World character_id=%d mounted=%t", ch.ID, next)
+}
+
+// dismount is StatusCastingStop's vehicle cancel: a hit takes the rider
+// off its mount (shape 0 to the viewers).
+func (s *Session) dismount() {
+	if !s.mounted || s.char == nil {
+		return
+	}
+	s.mounted = false
+	if s.player != nil {
+		s.player.setMountShape(0)
+	}
+	w := packet.New(packet.CharacterMountShape)
+	w.U32(s.char.ID)
+	w.U8(unmountedShape)
+	frame := w.MustFinish()
+	s.send(frame, "0x051D dismounted by a hit")
+	s.sendToViewers(frame, "0x051D dismounted by a hit")
 }

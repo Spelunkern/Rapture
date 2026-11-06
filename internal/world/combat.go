@@ -334,6 +334,7 @@ func (s *Session) takeMobDamage(d pendingDamage, damage uint32, stats *Character
 		ch.Deaths++
 	}
 	s.persist()
+	s.dismount()
 	if !killed {
 		s.wake()
 	}

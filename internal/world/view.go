@@ -311,6 +311,12 @@ func (s *Session) refreshView() {
 // enterFrames is what CCell::SendCellInfoEnter shows of a user.
 func (p *ConnectedPlayer) enterFrames() [][]byte {
 	frames := [][]byte{p.EnteredMapPacket(), p.ShapePacket(), p.MovePacket()}
+	if shape := p.mountShape(); shape != 0 {
+		w := packet.New(packet.CharacterMountShape)
+		w.U32(p.CharacterID)
+		w.U8(shape)
+		frames = append(frames, w.MustFinish())
+	}
 	if p.IsSitting() {
 		frames = append(frames, p.SitMotionPacket())
 	}
@@ -378,4 +384,16 @@ func (s *Session) placeView() {
 	}
 	s.player.moveViewCell(s.char.PosX, s.char.PosZ)
 	s.refreshView()
+}
+
+func (p *ConnectedPlayer) setMountShape(shape uint8) {
+	p.mu.Lock()
+	p.mount = shape
+	p.mu.Unlock()
+}
+
+func (p *ConnectedPlayer) mountShape() uint8 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.mount
 }

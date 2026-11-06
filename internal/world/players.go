@@ -62,6 +62,7 @@ type ConnectedPlayer struct {
 	direction uint16
 	sitting   bool
 	gmVisible bool
+	mount     uint8 // 0x051D vehicle shape, 0 on foot
 
 	mailMu       sync.Mutex
 	teleport     *pendingTeleport
