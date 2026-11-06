@@ -61,7 +61,10 @@ func pids(name string) []int {
 		if err != nil {
 			continue
 		}
-		if target, err := os.Readlink(filepath.Join("/proc", entry.Name(), "exe")); err == nil && target == want {
+		// A rebuild replaces the file under a running server, whose exe link
+		// then reads "<path> (deleted)"; it is still this checkout's server.
+		if target, err := os.Readlink(filepath.Join("/proc", entry.Name(), "exe")); err == nil &&
+			(target == want || target == want+" (deleted)") {
 			found = append(found, pid)
 		}
 	}
