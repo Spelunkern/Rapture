@@ -199,6 +199,7 @@ func (s *Session) skillHit(target uint32, def *db.SkillDef, k db.CharacterSkill,
 	if !ok {
 		return false
 	}
+	AddMobAggro(ch.MapID, target, ch.ID, int64(r.AppliedHP)+int64(def.Aggro))
 	code := uint8(attackSuccessNormal)
 	if crit {
 		code = attackResultCritical

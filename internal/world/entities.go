@@ -19,13 +19,8 @@ const (
 	MobAttackRange     = 3.0
 	MobAttackInterval  = 2500 * time.Millisecond
 
-	mobChaseStep        = 3.5
-	mobMotionRun        = 1
-	mobMotionWalk       = 0
-	mobAttackPause      = 200 * time.Millisecond
-	mobReturnArrive     = 1.0
-	mobRetaliationLeash = 20.0
-	mobLeashGrace       = 8.0
+	mobMotionRun  = 1
+	mobMotionWalk = 0
 )
 
 type NpcPatrolPoint struct {
@@ -76,8 +71,11 @@ type MapMob struct {
 	ChaseRange         float32
 	AggroTarget        uint32 // 0: none
 	lastAttackAt       time.Time
-	nextAttackAt       time.Time    // CMob m_dwNextAttackTime
-	slotReadyAt        [3]time.Time // per attack slot (AttackAI)
+	nextAttackAt       time.Time        // CMob m_dwNextAttackTime
+	noTargetUntil      time.Time        // CMob::Init: no target search for 5 s
+	recoverAt          time.Time        // CMob::UpdateRecover, every 5 s
+	aggro              map[uint32]int64 // CDamage ledger: damage and skill aggro
+	slotReadyAt        [3]time.Time     // per attack slot (AttackAI)
 	returningHome      bool
 	def                *db.MobDef
 	nextMoveAt         time.Time   // idle wander
@@ -382,6 +380,8 @@ type PlayerCombatSnapshot struct {
 	MapID       uint16
 	PosX, PosZ  float32
 	Alive       bool
+	Faction     uint8
+	Cell        cell
 }
 
 type MobAttackAction struct {
@@ -485,6 +485,7 @@ func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []enti
 			m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, false
 			respawned++
 			m.hasCell, m.diedAt, m.corpseGone = false, time.Time{}, false
+			m.noTargetUntil, m.aggro = now.Add(5*time.Second), nil
 			e := m.relocate(mapID, 0)
 			e.Move, e.Enter = nil, buildMobEnter(m, true)
 			out = append(out, e)
@@ -600,31 +601,53 @@ func TickMobCorpses() []entityMove {
 	return out
 }
 
-// SetMobAggro makes a live mob fight characterID (last-hit aggro).
-func SetMobAggro(mapID uint16, id, characterID uint32) {
+// SetMobAggro is CMob::Damage's ledger and CMob::SetTarget for a player's
+// hit: the attacker's aggro grows by the damage plus ten times the skill's
+// aggro, and an idle mob takes the attacker as its target. CMob::AttackAI
+// later turns to the top of the ledger (ReTargetByAggro).
+func SetMobAggro(mapID uint16, id, characterID uint32) { AddMobAggro(mapID, id, characterID, 0) }
+
+func AddMobAggro(mapID uint16, id, characterID uint32, amount int64) {
 	s := shard(mapID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.entities.Mobs {
 		if m := &s.entities.Mobs[i]; m.ID == id && m.CurrentHP > 0 {
-			m.AggroTarget = characterID
+			if m.aggro == nil {
+				m.aggro = map[uint32]int64{}
+			}
+			m.aggro[characterID] += amount
+			if m.AggroTarget == 0 {
+				m.AggroTarget, m.returningHome = characterID, false
+			}
 		}
 	}
 }
 
-// ClearMobAggro drops a mob's target and sends it walking home.
+// ClearMobAggro is CMob::Attack after killing its target: back to idle
+// (status 0) with the dead user's aggro gone; UpdateIdle walks it home
+// when it is more than 10 units away.
 func ClearMobAggro(mapID uint16, id uint32) {
 	s := shard(mapID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.entities.Mobs {
 		if m := &s.entities.Mobs[i]; m.ID == id {
-			m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, true
+			delete(m.aggro, m.AggroTarget)
+			m.dropTarget(false)
 		}
 	}
 }
 
-// TickMobCombat advances aggro, attacks, chasing and walking home.
+// Mob combat as CMob::UpdateIdle / UpdateAttack / Chase / ReturnHome run it.
+const (
+	mobLeash        = 45.0 // target farther than this from home or from the mob
+	mobHomeDone     = 10.0 // ReturnHome completes within 10 units of home
+	mobChaseReached = 1.5  // Chase: within Size + range + 1.5 no step
+	mobRecoverEvery = 5 * time.Second
+)
+
+// TickMobCombat advances targeting, attacks, chasing and walking home.
 func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick {
 	var tick MobCombatTick
 	now := time.Now()
@@ -642,89 +665,52 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 			}
 			m := &s.entities.Mobs[i]
 			if m.CurrentHP == 0 {
-				m.AggroTarget, m.returningHome = 0, false
+				m.AggroTarget, m.returningHome, m.aggro = 0, false, nil
 				continue
+			}
+			if r := m.recover(now); r != nil {
+				tick.Restores = append(tick.Restores, mapPacket{mapID, m.PosX, m.PosZ, r})
 			}
 			mods := m.mods()
 			if mods.VisionFix != 0 {
 				for _, p := range mapPlayers {
 					if p.CharacterID == mods.VisionFix && p.Alive {
-						m.AggroTarget = mods.VisionFix
+						m.AggroTarget, m.returningHome = mods.VisionFix, false
 					}
 				}
 			}
 			if !mods.canAct() {
 				continue
 			}
-			if m.AggroTarget != 0 {
-				valid := false
-				for _, p := range mapPlayers {
-					if p.CharacterID == m.AggroTarget && p.Alive {
-						leash := max(m.ChaseRange, mobRetaliationLeash) + mobLeashGrace
-						valid = DistanceXZ(m.homeX, m.homeZ, p.PosX, p.PosZ) <= leash
-					}
-				}
-				if !valid {
-					m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, true
+			target := m.liveTarget(mapPlayers)
+			if m.AggroTarget != 0 && target == nil {
+				m.AggroTarget = 0 // gone, dead or on another map: back to idle
+			}
+			if target != nil && mods.VisionFix == 0 {
+				switch {
+				case DistanceXZ(target.PosX, target.PosZ, m.homeX, m.homeZ) > mobLeash:
+					m.dropTarget(true)
+					target = nil
+				case DistanceXZ(target.PosX, target.PosZ, m.PosX, m.PosZ) > mobLeash:
+					m.dropTarget(false)
+					target = nil
 				}
 			}
-			if m.AggroTarget == 0 && !m.returningHome && m.AI >= 1 && m.ChaseRange > 0 {
-				best, bestDist := uint32(0), float32(0)
-				for _, p := range mapPlayers {
-					if !p.Alive {
-						continue
-					}
-					d := DistanceXZ(m.PosX, m.PosZ, p.PosX, p.PosZ)
-					if d <= m.ChaseRange && (best == 0 || d < bestDist) {
-						best, bestDist = p.CharacterID, d
-					}
-				}
-				m.AggroTarget = best
-			}
-			if m.AggroTarget == 0 {
-				if m.returningHome {
-					if now.Before(m.nextChaseAt) {
-						continue
-					}
-					m.nextChaseAt = now.Add(m.chaseInterval())
-					d := DistanceXZ(m.PosX, m.PosZ, m.homeX, m.homeZ)
-					arrived := false
-					if d <= mobReturnArrive {
-						m.PosX, m.PosZ, arrived = m.homeX, m.homeZ, true
-					} else {
-						step := min(m.chaseStep(), d)
-						nx := m.PosX + (m.homeX-m.PosX)/d*step
-						nz := m.PosZ + (m.homeZ-m.PosZ)/d*step
-						if IsMapWalkable(mapID, nx, nz) {
-							m.PosX, m.PosZ = nx, nz
-						} else {
-							m.PosX, m.PosZ, arrived = m.homeX, m.homeZ, true
-						}
-					}
-					actions++
-					tick.Moves = append(tick.Moves, m.relocate(mapID, mobMotionWalk))
-					if arrived {
-						m.returningHome, m.lastAttackAt = false, time.Time{}
-						m.CurrentHP, m.Effects = max(m.MaxHP, 1), nil
-						tick.Restores = append(tick.Restores, mapPacket{mapID, m.PosX, m.PosZ, buildMobCurrentHP(m.ID, m.CurrentHP)})
-					}
-				}
-				continue
-			}
-			m.returningHome = false
-			var target *PlayerCombatSnapshot
-			for k := range mapPlayers {
-				if mapPlayers[k].CharacterID == m.AggroTarget {
-					target = &mapPlayers[k]
-				}
+			if target == nil && !m.returningHome {
+				target = m.findTarget(now, mapPlayers)
 			}
 			if target == nil {
+				if m.returningHome && m.stepHome(now, mapID, &mods, &tick) {
+					actions++
+				}
 				continue
 			}
 			d := DistanceXZ(m.PosX, m.PosZ, target.PosX, target.PosZ)
-			if d < m.attackReach() {
-				if now.Before(m.nextAttackAt) {
-					continue
+			if d < m.attackReach() && !now.Before(m.nextAttackAt) {
+				m.retargetByAggro(mapPlayers)
+				if t := m.liveTarget(mapPlayers); t != nil {
+					target = t
+					d = DistanceXZ(m.PosX, m.PosZ, target.PosX, target.PosZ)
 				}
 				slot, ok := m.pickAttackSlot(now, d, &mods)
 				if !ok {
@@ -733,39 +719,162 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 					continue
 				}
 				m.lastAttackAt = now
+				actions++
 				if heal := m.useSlot(slot, now); heal != nil {
-					actions++
 					tick.Restores = append(tick.Restores, mapPacket{mapID, m.PosX, m.PosZ, heal})
 					continue
 				}
-				actions++
 				tick.Attacks = append(tick.Attacks, MobAttackAction{m.ID, m.MobID, m.Attack, m.AggroTarget, slot, m.PosX, m.PosZ})
 				continue
 			}
-			if !m.lastAttackAt.IsZero() && now.Sub(m.lastAttackAt) < mobAttackPause {
-				continue
-			}
-			if !mods.canMove() {
-				continue
-			}
-			if now.Before(m.nextChaseAt) {
-				continue
-			}
-			m.nextChaseAt = now.Add(m.chaseInterval())
-			if d > 0.001 {
-				step := min(m.chaseStep(), max(d-m.attackReach()+0.5, 0.5))
-				nx := m.PosX + (target.PosX-m.PosX)/d*step
-				nz := m.PosZ + (target.PosZ-m.PosZ)/d*step
-				if IsMapWalkable(mapID, nx, nz) {
-					m.PosX, m.PosZ = nx, nz
-					actions++
-					tick.Moves = append(tick.Moves, m.relocate(mapID, mobMotionRun))
-				}
+			if m.stepChase(now, mapID, target, d, &mods, &tick) {
+				actions++
 			}
 		}
 		s.mu.Unlock()
 	}
 	return tick
+}
+
+func (m *MapMob) liveTarget(players []PlayerCombatSnapshot) *PlayerCombatSnapshot {
+	if m.AggroTarget == 0 {
+		return nil
+	}
+	for k := range players {
+		if players[k].CharacterID == m.AggroTarget && players[k].Alive {
+			return &players[k]
+		}
+	}
+	return nil
+}
+
+// dropTarget: status 0 (idle) or 3 (walk home).
+func (m *MapMob) dropTarget(home bool) {
+	m.AggroTarget, m.lastAttackAt, m.nextAttackAt = 0, time.Time{}, time.Time{}
+	m.returningHome = home
+}
+
+// findTarget is CMob::FindTarget for AI 1 and 3: the first living user of
+// another country within ChaseRange, cell by cell over the 3x3 cells
+// around the mob.
+func (m *MapMob) findTarget(now time.Time, players []PlayerCombatSnapshot) *PlayerCombatSnapshot {
+	if m.def == nil || (m.AI != 1 && m.AI != 3) || m.ChaseRange <= 0 || now.Before(m.noTargetUntil) {
+		return nil
+	}
+	for dz := int32(-1); dz <= 1; dz++ {
+		for dx := int32(-1); dx <= 1; dx++ {
+			c := cell{m.cell.x + dx, m.cell.z + dz}
+			for k := range players {
+				p := &players[k]
+				if p.Cell != c || !p.Alive || (m.def.Country < 2 && p.Faction == m.def.Country) {
+					continue
+				}
+				if DistanceXZ(p.PosX, p.PosZ, m.PosX, m.PosZ) <= m.ChaseRange {
+					m.AggroTarget = p.CharacterID
+					return p
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// retargetByAggro is CMob::ReTargetByAggro: the living attacker on the map
+// with the most aggro.
+func (m *MapMob) retargetByAggro(players []PlayerCombatSnapshot) {
+	var best uint32
+	var top int64 = -1
+	for k := range players {
+		p := &players[k]
+		if v, ok := m.aggro[p.CharacterID]; ok && p.Alive && v > top {
+			best, top = p.CharacterID, v
+		}
+	}
+	if best != 0 {
+		m.AggroTarget = best
+	}
+}
+
+// stepChase is CMob::Chase: ChaseStep (plus the speed offset) every
+// ChaseTime toward the target, stopping just inside attack reach.
+func (m *MapMob) stepChase(now time.Time, mapID uint16, t *PlayerCombatSnapshot, d float32, mods *mobMods, tick *MobCombatTick) bool {
+	if now.Before(m.nextChaseAt) || !mods.canMove() || m.def == nil {
+		return false
+	}
+	reach := float32(m.def.Size) + float32(m.def.Attacks[0].Range)
+	if d < reach+mobChaseReached && d < m.attackReach() {
+		return false
+	}
+	step := m.chaseStep(mods)
+	interval := m.chaseInterval()
+	stop := reach + 0.2 // inside CMob::EnableAttackRange's Size + range + 0.3
+	remaining := d - stop
+	if remaining <= 0 {
+		return false
+	}
+	if remaining < step {
+		m.nextChaseAt = now.Add(time.Duration(float64(remaining) / float64(step) * float64(interval)))
+		step = remaining
+	} else {
+		m.nextChaseAt = now.Add(interval)
+	}
+	nx := m.PosX + (t.PosX-m.PosX)/d*step
+	nz := m.PosZ + (t.PosZ-m.PosZ)/d*step
+	if !IsMapWalkable(mapID, nx, nz) {
+		// No straight line (the original then paths around walls; not
+		// modeled): give up and walk home.
+		m.dropTarget(true)
+		return false
+	}
+	m.PosX, m.PosZ = nx, nz
+	tick.Moves = append(tick.Moves, m.relocate(mapID, mobMotionRun))
+	return true
+}
+
+// stepHome is CMob::ReturnHome: ChaseStep every ChaseTime toward the spawn
+// point; within 10 units the return completes, clearing the applied
+// skills and the damage ledger (HP is not refilled: UpdateRecover does it).
+func (m *MapMob) stepHome(now time.Time, mapID uint16, mods *mobMods, tick *MobCombatTick) bool {
+	if now.Before(m.nextChaseAt) {
+		return false
+	}
+	d := DistanceXZ(m.PosX, m.PosZ, m.homeX, m.homeZ)
+	if d < mobHomeDone {
+		m.returningHome, m.lastAttackAt, m.Effects, m.aggro = false, time.Time{}, nil, nil
+		return false
+	}
+	if !mods.canMove() {
+		return false
+	}
+	step := m.chaseStep(mods)
+	interval := m.chaseInterval()
+	remaining := d - (float32(m.def.Size) + 1)
+	if remaining < step {
+		m.nextChaseAt = now.Add(time.Duration(float64(max(remaining, 0)) / float64(step) * float64(interval)))
+		m.PosX, m.PosZ = m.homeX, m.homeZ
+	} else {
+		m.nextChaseAt = now.Add(interval)
+		nx := m.PosX + (m.homeX-m.PosX)/d*step
+		nz := m.PosZ + (m.homeZ-m.PosZ)/d*step
+		if IsMapWalkable(mapID, nx, nz) {
+			m.PosX, m.PosZ = nx, nz
+		} else {
+			m.PosX, m.PosZ = m.homeX, m.homeZ
+		}
+	}
+	tick.Moves = append(tick.Moves, m.relocate(mapID, mobMotionWalk))
+	return true
+}
+
+// recover is CMob::UpdateRecover: every 5 s a wounded mob regains its
+// RecoverValue (0x0610 to 60 units).
+func (m *MapMob) recover(now time.Time) []byte {
+	if m.def == nil || m.def.RecoverValue <= 0 || m.CurrentHP >= m.MaxHP || now.Before(m.recoverAt) {
+		return nil
+	}
+	m.recoverAt = now.Add(mobRecoverEvery)
+	m.CurrentHP = min(m.CurrentHP+uint32(m.def.RecoverValue), m.MaxHP)
+	return buildMobCurrentHP(m.ID, m.CurrentHP)
 }
 
 func AddEntities(mapID uint16, e MapEntities) {
@@ -839,6 +948,7 @@ func NewStaticMob(def *db.MobDef, mobID uint16, x, z float32, area *MobArea, res
 	m.nextMoveAt = time.Now().Add(time.Duration(rand.IntN(60000)) * time.Millisecond)
 	m.CurrentHP = m.MaxHP
 	m.cell, m.hasCell = cellFor(x, z), true
+	m.noTargetUntil = time.Now().Add(5 * time.Second)
 	if area != nil {
 		a := area.normalized()
 		m.Area = &a
@@ -881,13 +991,18 @@ func (m *MapMob) advanceRoam(mapID uint16) bool {
 	if m.def == nil || now.Before(m.nextMoveAt) {
 		return false
 	}
+	if DistanceXZ(m.PosX, m.PosZ, m.homeX, m.homeZ) > mobHomeRadius {
+		m.returningHome = true // CMob::UpdateIdle: status 3
+		return false
+	}
 	pause := 10*time.Second + time.Duration(rand.IntN(30000))*time.Millisecond
 	if m.def.NormalStep == 0 || m.AI == 4 {
 		m.nextMoveAt = now.Add(pause)
 		return false
 	}
 	m.nextMoveAt = now.Add(pause + time.Duration(m.def.NormalTimeMS)*time.Millisecond)
-	length := float32(m.def.NormalStep) + mobSpeedOffsets[2] + float32(rand.IntN(500)/100)
+	mods := m.mods()
+	length := float32(m.def.NormalStep) + mobSpeedOffsets[min(max(2+mods.MoveSpeed, 0), 4)] + float32(rand.IntN(500)/100)
 	angle := float64(rand.IntN(10000)) * math.Pi / 180
 	nx := m.PosX - float32(math.Sin(angle))*length
 	nz := m.PosZ + float32(math.Cos(angle))*length
@@ -900,11 +1015,12 @@ func (m *MapMob) advanceRoam(mapID uint16) bool {
 
 // chaseStep and chaseInterval are ChaseStep / ChaseTime (used both to
 // chase and to walk home).
-func (m *MapMob) chaseStep() float32 {
-	if m.def == nil || m.def.ChaseStep == 0 {
-		return mobChaseStep
+func (m *MapMob) chaseStep(mods *mobMods) float32 {
+	if m.def == nil {
+		return 1
 	}
-	return max(float32(m.def.ChaseStep)+mobSpeedOffsets[2], 1)
+	idx := min(max(2+mods.MoveSpeed, 0), 4)
+	return max(float32(m.def.ChaseStep)+mobSpeedOffsets[idx], 1)
 }
 
 func (m *MapMob) chaseInterval() time.Duration {

@@ -393,3 +393,81 @@ func TestPlayerEffects(t *testing.T) {
 		}
 	}
 }
+
+// TestMobAI drives real mobs through TickMobCombat: target search (AI 1/3,
+// country, the 5 s spawn delay), aggro retargeting, the 45-unit leash,
+// returning home without a refill and the 5 s recovery.
+func TestMobAI(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	var md *db.MobDef
+	for _, d := range db.MustDefs().Mobs {
+		if d.AI == 1 && d.ChaseRange >= 8 && d.Country == 2 && d.RecoverValue > 0 && d.ChaseStep > 0 && d.Attacks[0].OK != 0 {
+			md = d
+			break
+		}
+	}
+	if md == nil {
+		t.Skip("no aggressive mob")
+	}
+	const mapID = 60001
+	AddEntities(mapID, MapEntities{Mobs: []MapMob{NewStaticMob(md, md.MobID, 100, 100, nil, 0)}})
+	s := shard(mapID)
+	mob := func() *MapMob { return &s.entities.Mobs[0] }
+	snap := func(id uint32, x, z float32) PlayerCombatSnapshot {
+		return PlayerCombatSnapshot{CharacterID: id, MapID: mapID, PosX: x, PosZ: z, Alive: true, Faction: 0, Cell: cellFor(x, z)}
+	}
+	near := snap(1, 100+md.ChaseRange-1, 100)
+	TickMobCombat([]PlayerCombatSnapshot{near}, 64)
+	if mob().AggroTarget != 0 {
+		t.Fatal("targeted during the 5 s spawn delay")
+	}
+	s.mu.Lock()
+	mob().noTargetUntil = time.Time{}
+	s.mu.Unlock()
+	TickMobCombat([]PlayerCombatSnapshot{near}, 64)
+	if mob().AggroTarget != 1 {
+		t.Fatalf("AI %d mob did not target a player within ChaseRange %.0f", md.AI, md.ChaseRange)
+	}
+	// A second attacker with more damage takes over at the next attack.
+	other := snap(2, 101, 100)
+	AddMobAggro(mapID, mob().ID, 1, 10)
+	AddMobAggro(mapID, mob().ID, 2, 500)
+	s.mu.Lock()
+	m := mob()
+	m.PosX, m.PosZ, m.nextAttackAt = 100, 100, time.Time{}
+	s.mu.Unlock()
+	TickMobCombat([]PlayerCombatSnapshot{snap(1, 100.5, 100), other}, 64)
+	if mob().AggroTarget != 2 {
+		t.Fatalf("ReTargetByAggro kept %d", mob().AggroTarget)
+	}
+	// The target runs past 45 units from home: the mob walks home.
+	far := snap(2, 100+mobLeash+5, 100)
+	TickMobCombat([]PlayerCombatSnapshot{far}, 64)
+	if mob().AggroTarget != 0 || !mob().returningHome {
+		t.Fatal("leash did not send the mob home")
+	}
+	s.mu.Lock()
+	m = mob()
+	m.CurrentHP = m.MaxHP / 2
+	m.PosX, m.recoverAt = 100+mobHomeDone-1, time.Time{}
+	m.nextChaseAt = time.Time{}
+	s.mu.Unlock()
+	before := mob().CurrentHP
+	TickMobCombat(nil, 64)
+	TickMobCombat([]PlayerCombatSnapshot{snap(3, 900, 900)}, 64)
+	if got := mob().CurrentHP; got != min(before+uint32(md.RecoverValue), md.MaxHP) {
+		t.Fatalf("hp after return and one recovery %d (before %d, recover %d)", got, before, md.RecoverValue)
+	}
+	if mob().returningHome {
+		t.Fatal("return did not complete within 10 units of home")
+	}
+}

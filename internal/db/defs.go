@@ -138,8 +138,14 @@ type MobDef struct {
 	ChaseTimeMS        uint32
 	ChaseStep          uint16
 	Attacks            [3]MobAttack
-	ResistState        [15]uint8 // immune to skills of StateType i+1 when non-zero
-	ResistSkill        [6]uint16 // immune to these skill IDs
+	// CGameData::LoadConstMob reuses attack slot 3: Attack3 is the 5 s
+	// recovery (nRecoverValue), Attackplus3 != 0 an obelisk, Attackattrib3
+	// the country (1 light -> 0, 2 fury -> 1, otherwise 2: none).
+	RecoverValue int32
+	Obelisk      bool
+	Country      uint8
+	ResistState  [15]uint8 // immune to skills of StateType i+1 when non-zero
+	ResistSkill  [6]uint16 // immune to these skill IDs
 }
 
 type MobDrop struct {
@@ -438,6 +444,20 @@ func loadDefs() (*Defs, error) {
 		}
 		m := d.Mobs[uint16(mobID)]
 		m.MaxMP, m.MaxSP = uint32(max(mobMP, 0)), uint32(max(mobSP, 0))
+		m.RecoverValue, m.Obelisk = int32(m.Attacks[2].Attack), m.Attacks[2].Plus != 0
+		switch m.Attacks[2].Attrib {
+		case 1:
+			m.Country = 0
+		case 2:
+			m.Country = 1
+		default:
+			m.Country = 2
+		}
+		for i := 0; i < 2; i++ {
+			if m.Attacks[i].Attrib > 4 {
+				m.Attacks[i].Attrib = 0
+			}
+		}
 		for i, v := range resistState {
 			m.ResistState[i] = clampU8(v)
 		}

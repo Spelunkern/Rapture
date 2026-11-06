@@ -197,6 +197,12 @@ func (p *ConnectedPlayer) MapID() uint16 {
 	return p.mapID
 }
 
+func (p *ConnectedPlayer) Faction() uint8 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.faction
+}
+
 func (p *ConnectedPlayer) PositionXZ() (float32, float32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
