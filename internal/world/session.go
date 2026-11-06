@@ -57,6 +57,7 @@ type Session struct {
 	cast           *pendingCast
 	mounted        bool
 	dead           bool
+	deathLoss      int // CUser::Death exp-loss percent, kept until revive
 
 	autoAttack       bool
 	autoAttackTarget uint32

@@ -77,29 +77,30 @@ type SkillDef struct {
 	TargetType, ApplyRange, MultiAttack      uint8
 
 	// CGameData::LoadConstSkill (0x004bffe0) normalizes these on load.
-	Kind         uint8 // clamp(TypeAttack, 1, 3) - 1: 0 melee, 1 ranged, 2 magic
-	TypeEffect   uint8 // 0 passive, 1 attack, 2 heal, 3 debuff, 4 buff, ...
-	DamageType   uint8 // AttackDamage mode 0..5
-	DamageSP     int32
-	DamageMP     int32
-	AddDamageSP  int32
-	AddDamageMP  int32
-	AttrType     uint8 // element override, 0 when > 8
-	StateType    uint8 // 0 when > 15
-	SuccessType  uint8
-	SuccessValue uint8
-	Weapon1      uint8 // passive weapon types, at most 19
-	Weapon2      uint8
-	WeaponValue  uint8
-	DefenceType  uint8 // clamp(DefenceType, 1, 3) - 1
-	DefenceValue uint8
-	Aggro        uint16 // Arrow
-	LimitHP      uint8
-	KeepSeconds  uint32 // KeepTime, in hours when FixRange is 1
-	KeepOnDeath  bool   // FixRange != 0: survives CUser::ClearApplySkillByDeath
-	NeedWeapon   [15]bool
-	NeedShield   bool
-	MobSkill     bool // SkillLevel 100 rows are mob skills
+	Kind           uint8 // clamp(TypeAttack, 1, 3) - 1: 0 melee, 1 ranged, 2 magic
+	TypeEffect     uint8 // 0 passive, 1 attack, 2 heal, 3 debuff, 4 buff, ...
+	DamageType     uint8 // AttackDamage mode 0..5
+	TimeDamageType uint8 // TimeDamage mode 0, 3, 4, 5
+	DamageSP       int32
+	DamageMP       int32
+	AddDamageSP    int32
+	AddDamageMP    int32
+	AttrType       uint8 // element override, 0 when > 8
+	StateType      uint8 // 0 when > 15
+	SuccessType    uint8
+	SuccessValue   uint8
+	Weapon1        uint8 // passive weapon types, at most 19
+	Weapon2        uint8
+	WeaponValue    uint8
+	DefenceType    uint8 // clamp(DefenceType, 1, 3) - 1
+	DefenceValue   uint8
+	Aggro          uint16 // Arrow
+	LimitHP        uint8
+	KeepSeconds    uint32 // KeepTime, in hours when FixRange is 1
+	KeepOnDeath    bool   // FixRange != 0: survives CUser::ClearApplySkillByDeath
+	NeedWeapon     [15]bool
+	NeedShield     bool
+	MobSkill       bool // SkillLevel 100 rows are mob skills
 }
 
 // MobAttack is one of a mob's three attack slots (AttackTypeN..AttackokN).
@@ -336,7 +337,7 @@ func loadDefs() (*Defs, error) {
 		AttrType, StateType, SuccessType, SuccessValue, Weapon1, Weapon2, Weaponvalue, DefenceType, DefenceValue,
 		Arrow, LimitHP, FixRange, NeedWeapon1, NeedWeapon2, NeedWeapon3, NeedWeapon4, NeedWeapon5, NeedWeapon6,
 		NeedWeapon7, NeedWeapon8, NeedWeapon9, NeedWeapon10, NeedWeapon11, NeedWeapon12, NeedWeapon13, NeedWeapon14,
-		NeedWeapon15, Shield FROM dbo.Skills`)
+		NeedWeapon15, Shield, TimeDamageType FROM dbo.Skills`)
 	if err != nil {
 		return nil, fmt.Errorf("load Skills: %w", err)
 	}
@@ -352,7 +353,7 @@ func loadDefs() (*Defs, error) {
 		for i := range need {
 			extra = append(extra, &need[i])
 		}
-		extra = append(extra, &shield)
+		extra = append(extra, &shield, &s.TimeDamageType)
 		if err := rows.Scan(append([]any{&skillID, &s.SkillLevel, &s.Name, &s.Country, &reqLevel, &s.Grow, &s.SkillPointCost,
 			&prev, &classes[0], &classes[1], &classes[2], &classes[3], &classes[4], &classes[5], &sp, &mp,
 			&reset, &s.ReadyTime, &s.DamageHP, &s.AddDamageHP, &s.HealHP, &s.HealSP, &s.HealMP, &typeDetail,
@@ -365,6 +366,8 @@ func loadDefs() (*Defs, error) {
 		}
 		s.SkillID, s.ReqLevel, s.PrevSkillID = clampU16(skillID), clampU16(reqLevel), clampU16(prev)
 		s.SPCost, s.MPCost, s.ResetTimeSeconds = clampU16(sp), clampU16(mp), clampU16(reset)
+		// KeepTime is a smallint holding an unsigned word (43200 reads -22336).
+		keep = int64(uint16(keep))
 		s.TypeDetail, s.KeepTime = clampU16(typeDetail), clampU16(keep)
 		for i, v := range classes {
 			s.ClassEligible[i] = v != 0

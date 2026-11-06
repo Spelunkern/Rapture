@@ -71,7 +71,7 @@ func setAttack(s *CharacterStats, e EquipmentStats) {
 	s.Guard[attackMagic] = magic.Defense + int32(e.Resistance) + int32(s.Wis)
 	s.Variance, s.AttackAttr, s.RangedWeapon = e.Variance, e.AttackAttr, e.RangedWeapon
 	s.DefenseAttr, s.CrossRoad, s.Range, s.AttackSpeed = e.DefenseAttr, e.CrossRoad, e.Range, e.AttackSpeed
-	s.SPCostCut, s.MPCostCut = e.SPCostCut, e.MPCostCut
+	s.SPCostCut, s.MPCostCut, s.MoveSpeed, s.Disabled = e.SPCostCut, e.MPCostCut, e.MoveSpeed, e.Disabled
 
 	physical := attackMelee
 	if e.RangedWeapon {

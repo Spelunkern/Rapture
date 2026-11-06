@@ -4,10 +4,12 @@ package world
 
 import (
 	"os"
+	"time"
 	"testing"
 
 	"github.com/Spelunkern/Rapture/internal/config"
 	"github.com/Spelunkern/Rapture/internal/db"
+	"github.com/Spelunkern/Rapture/internal/logx"
 )
 
 // TestCombatNumbers simulates the migrated test characters against real
@@ -201,5 +203,193 @@ func TestSkillCombat(t *testing.T) {
 	applyPassives(&e, []db.CharacterSkill{})
 	if e.ItemAttack != 0 {
 		t.Fatal("passives without skills changed the attack")
+	}
+}
+
+// TestMobEffects applies real player debuff skills to a mob: stun blocks
+// it (0x0609 255), damage over time ticks every 3 s, a detail-63 skill
+// takes the mob's whole HP when it ends, and damage wakes a sleeping mob.
+func TestMobEffects(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	find := func(detail uint16) *db.SkillDef {
+		for _, d := range db.MustDefs().Skills {
+			if !d.MobSkill && d.TypeEffect == typeEffectDebuff && d.TypeDetail == detail && d.KeepSeconds > 0 {
+				return d
+			}
+		}
+		t.Fatalf("no player skill with detail %d", detail)
+		return nil
+	}
+	const mapID = 60000
+	md := db.MustDefs().Mobs[103]
+	AddEntities(mapID, MapEntities{Mobs: []MapMob{NewStaticMob(md, 103, 10, 10, nil, 0)}})
+	mob := EntitiesOnMap(mapID).Mobs[0]
+
+	stun := find(detailStun)
+	speed, ok := ApplyMobEffect(mapID, mob.ID, 7, stun)
+	if !ok || speed == nil || speed[8] != 255 || speed[9] != 255 {
+		t.Fatalf("stun speed packet %v ok %t", speed, ok)
+	}
+	m, _ := MobByID(mapID, mob.ID)
+	if o := m.mods(); o.canAct() {
+		t.Fatal("stunned mob can act")
+	}
+
+	sleep := find(detailSleep)
+	ApplyMobEffect(mapID, mob.ID, 7, sleep)
+	r, _ := DamageMob(mapID, mob.ID, 1)
+	if r.Speed == nil {
+		t.Fatal("damage did not wake the sleeping mob")
+	}
+	m, _ = MobByID(mapID, mob.ID)
+	if o := m.mods(); o.Sleep != 0 {
+		t.Fatal("sleep survived damage")
+	}
+
+	dot := find(detailTimeDamage)
+	ApplyMobEffect(mapID, mob.ID, 7, dot)
+	s := shard(mapID)
+	s.mu.Lock()
+	for i := range s.entities.Mobs[0].Effects {
+		s.entities.Mobs[0].Effects[i].prevTick = time.Now().Add(-3 * time.Second)
+	}
+	s.mu.Unlock()
+	var dotHits int
+	for _, o := range TickMobEffects() {
+		if o.MapID == mapID && o.Damaged && o.SkillID == dot.SkillID {
+			dotHits++
+			t.Logf("dot %d/%d type %d dealt %v", dot.SkillID, dot.SkillLevel, dot.TimeDamageType, o.Damage)
+		}
+	}
+	if dotHits != 1 {
+		t.Fatalf("dot ticks %d", dotHits)
+	}
+
+	s.mu.Lock()
+	s.entities.Mobs[0].CurrentHP, s.entities.Mobs[0].Effects = s.entities.Mobs[0].MaxHP, nil
+	s.mu.Unlock()
+	sentence := find(detailDeathSentence)
+	if _, ok := ApplyMobEffect(mapID, mob.ID, 7, sentence); !ok {
+		t.Fatal("detail 63 not applied")
+	}
+	s.mu.Lock()
+	for i := range s.entities.Mobs[0].Effects {
+		s.entities.Mobs[0].Effects[i].endsAt = time.Now().Add(-time.Second)
+	}
+	s.mu.Unlock()
+	killed := false
+	for _, o := range TickMobEffects() {
+		if o.MapID == mapID && o.Killed {
+			killed = true
+		}
+	}
+	if !killed {
+		t.Fatal("detail 63 did not take the whole HP on expiry")
+	}
+}
+
+// TestPlayerEffects runs mob debuffs, item charms, blocks and reflection
+// on an offline session (sends are no-ops without a connection).
+func TestPlayerEffects(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := logx.New("rapture_world_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := &db.Character{Level: 60, Race: 0, Class: 0, Mode: 1, Str: 100, Dex: 100, Rec: 100, Int: 50, Wis: 50, Luc: 50}
+	ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
+	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
+	s := &Session{char: ch, log: logger.Tagged("unit"), logger: logger, skillCooldowns: map[uint16]time.Time{}}
+	mobSkill := func(detail uint16) *db.SkillDef {
+		for _, d := range db.MustDefs().Skills {
+			if d.MobSkill && d.TypeEffect == typeEffectDebuff && d.TypeDetail == detail && d.KeepSeconds > 0 {
+				return d
+			}
+		}
+		return nil
+	}
+	if stun := mobSkill(detailStun); stun != nil {
+		s.applyMobDebuff(stun, 1)
+		if !s.actionBlocked() || s.speeds().attack != 255 {
+			t.Fatal("stun did not block actions")
+		}
+		s.removeEffects(func(*ActiveBuff) bool { return true }, "test")
+	}
+	if sleep := mobSkill(detailSleep); sleep != nil {
+		s.applyMobDebuff(sleep, 1)
+		s.takeMobDamage(pendingDamage{MobGlobalID: 1}, 1, nil)
+		if s.actionBlocked() {
+			t.Fatal("damage did not wake the player")
+		}
+	}
+	if dot := mobSkill(detailTimeDamage); dot != nil {
+		s.applyMobDebuff(dot, 1)
+		s.buffs[len(s.buffs)-1].prevTick = time.Now().Add(-3 * time.Second)
+		before := s.stats().CurrentHP
+		s.tickDebuffs(time.Now())
+		t.Logf("mob dot %d/%d type %d: hp %d -> %d", dot.SkillID, dot.SkillLevel, dot.TimeDamageType, before, s.stats().CurrentHP)
+		s.removeEffects(func(*ActiveBuff) bool { return true }, "test")
+	}
+	if down := mobSkill(detailAbilityDown); down != nil {
+		before := s.stats()
+		s.applyMobDebuff(down, 1)
+		after := s.stats()
+		t.Logf("ability down %d/%d types %v values %v: str %d->%d dex %d->%d", down.SkillID, down.SkillLevel,
+			down.AbilityType, down.AbilityValue, before.Str, after.Str, before.Dex, after.Dex)
+		s.removeEffects(func(*ActiveBuff) bool { return true }, "test")
+	}
+	charm := func(skillID uint16) int {
+		s.buffs = nil
+		if d := db.MustDefs().Skill(skillID, 1); d != nil {
+			s.addEffect(d, 0)
+		}
+		return s.deathExpLoss()
+	}
+	if got := charm(231); got != 1 {
+		t.Errorf("Blue Dragon charm loss %d", got)
+	}
+	if got := charm(233); got != 0 {
+		t.Errorf("Red Phoenix charm loss %d", got)
+	}
+	if got := charm(230); got != 0 {
+		t.Errorf("Prevent EXP Drop loss %d", got)
+	}
+	s.buffs = nil
+	if got := s.deathExpLoss(); got != deathExpPercent {
+		t.Errorf("plain loss %d", got)
+	}
+	for _, d := range db.MustDefs().Skills {
+		if d.TypeEffect == typeEffectBuff && d.TypeDetail == 85 && !d.MobSkill && d.DefenceValue > 0 {
+			s.buffs = nil
+			s.addEffect(d, 0)
+			blocked := 0
+			for range int(d.DefenceValue) + 2 {
+				if s.blocksAttack(int(d.DefenceType)) {
+					blocked++
+				}
+			}
+			if blocked != int(d.DefenceValue) {
+				t.Errorf("block %d/%d blocked %d of %d", d.SkillID, d.SkillLevel, blocked, d.DefenceValue)
+			}
+			break
+		}
 	}
 }

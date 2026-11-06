@@ -26,8 +26,6 @@ const (
 	mobReturnArrive     = 1.0
 	mobRetaliationLeash = 20.0
 	mobLeashGrace       = 8.0
-	dotTick             = 3 * time.Second
-	MobDebuffTypeDOT    = 0x02
 )
 
 type NpcPatrolPoint struct {
@@ -56,17 +54,6 @@ func (a MobArea) contains(x, z float32) bool {
 	return x >= a.LowerX && x <= a.UpperX && z >= a.LowerZ && z <= a.UpperZ
 }
 
-// ActiveDot is a periodic-damage effect on a mob; it lives on the mob so it
-// keeps ticking whether or not its caster is still online.
-type ActiveDot struct {
-	CasterID   uint32
-	SkillID    uint16
-	SkillLevel uint8
-	endsAt     time.Time
-	nextTickAt time.Time
-	damageHP   uint32
-}
-
 type MapMob struct {
 	ID                 uint32
 	MobID              uint16
@@ -89,9 +76,9 @@ type MapMob struct {
 	slotReadyAt        [3]time.Time // per attack slot (AttackAI)
 	returningHome      bool
 	def                *db.MobDef
-	nextMoveAt         time.Time // idle wander
-	nextChaseAt        time.Time // chase / return step
-	Dots               []ActiveDot
+	nextMoveAt         time.Time   // idle wander
+	nextChaseAt        time.Time   // chase / return step
+	Effects            []MobEffect // applied skills (TypeEffect 3)
 }
 
 type MapPortal struct {
@@ -199,7 +186,7 @@ func shardIDs() []uint16 {
 
 func cloneMob(m *MapMob) MapMob {
 	c := *m
-	c.Dots = append([]ActiveDot(nil), m.Dots...)
+	c.Effects = append([]MobEffect(nil), m.Effects...)
 	if m.Area != nil {
 		a := *m.Area
 		c.Area = &a
@@ -393,6 +380,7 @@ func MobByID(mapID uint16, id uint32) (MapMob, bool) {
 
 type MobDamageResult struct {
 	Mob            MapMob
+	Speed          []byte // 0x0609 when the hit woke the mob
 	DamageHP       uint16
 	AppliedHP      uint32
 	Killed         bool
@@ -415,6 +403,11 @@ func DamageMob(mapID uint16, id uint32, damage uint32) (MobDamageResult, bool) {
 		applied := min(damage, m.CurrentHP)
 		m.CurrentHP -= applied
 		r := MobDamageResult{DamageHP: uint16(min(damage, 65535)), AppliedHP: applied, Killed: m.CurrentHP == 0}
+		if r.Killed {
+			m.Effects = nil
+		} else {
+			r.Speed = m.removeSleep()
+		}
 		if r.Killed && m.respawnDelay > 0 {
 			m.respawnAt = time.Now().Add(m.respawnDelay)
 			r.RespawnSeconds = uint64(m.respawnDelay / time.Second)
@@ -423,92 +416,6 @@ func DamageMob(mapID uint16, id uint32, damage uint32) (MobDamageResult, bool) {
 		return r, true
 	}
 	return MobDamageResult{}, false
-}
-
-// ApplyDotToMob starts or refreshes a caster's DoT of skillID on a mob.
-func ApplyDotToMob(mapID uint16, id, casterID uint32, skillID uint16, level uint8, damage uint32, keep time.Duration) {
-	s := shard(mapID)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.entities.Mobs {
-		m := &s.entities.Mobs[i]
-		if m.ID != id {
-			continue
-		}
-		if m.CurrentHP == 0 || m.returningHome {
-			return
-		}
-		now := time.Now()
-		kept := m.Dots[:0]
-		for _, d := range m.Dots {
-			if !(d.CasterID == casterID && d.SkillID == skillID) {
-				kept = append(kept, d)
-			}
-		}
-		m.Dots = append(kept, ActiveDot{CasterID: casterID, SkillID: skillID, SkillLevel: level,
-			endsAt: now.Add(keep), nextTickAt: now.Add(dotTick), damageHP: damage})
-		return
-	}
-}
-
-type DotTickOutcome struct {
-	MapID          uint16
-	Mob            MapMob
-	CasterID       uint32
-	SkillID        uint16
-	SkillLevel     uint8
-	AppliedHP      uint32
-	Killed         bool
-	RespawnSeconds uint64
-	IsFinalTick    bool
-}
-
-// TickAllMobDots applies every due DoT tick (and one final tick on expiry).
-func TickAllMobDots() []DotTickOutcome {
-	now := time.Now()
-	var out []DotTickOutcome
-	for _, mapID := range shardIDs() {
-		s := shard(mapID)
-		s.mu.Lock()
-		for i := range s.entities.Mobs {
-			m := &s.entities.Mobs[i]
-			if m.CurrentHP == 0 || len(m.Dots) == 0 || m.returningHome {
-				continue
-			}
-			for j := 0; j < len(m.Dots); {
-				d := m.Dots[j]
-				expiring := !d.endsAt.After(now)
-				due := !d.nextTickAt.After(now)
-				if due || expiring {
-					applied := min(d.damageHP, m.CurrentHP)
-					m.CurrentHP -= applied
-					killed := m.CurrentHP == 0
-					var respawn uint64
-					if killed && m.respawnDelay > 0 {
-						m.respawnAt = now.Add(m.respawnDelay)
-						respawn = uint64(m.respawnDelay / time.Second)
-					}
-					out = append(out, DotTickOutcome{MapID: mapID, Mob: cloneMob(m), CasterID: d.CasterID,
-						SkillID: d.SkillID, SkillLevel: d.SkillLevel, AppliedHP: applied, Killed: killed,
-						RespawnSeconds: respawn, IsFinalTick: expiring})
-					if !expiring {
-						m.Dots[j].nextTickAt = m.Dots[j].nextTickAt.Add(dotTick)
-					}
-					if killed {
-						m.Dots = nil
-						break
-					}
-				}
-				if expiring {
-					m.Dots = append(m.Dots[:j], m.Dots[j+1:]...)
-				} else {
-					j++
-				}
-			}
-		}
-		s.mu.Unlock()
-	}
-	return out
 }
 
 type PlayerCombatSnapshot struct {
@@ -582,7 +489,7 @@ func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacke
 			}
 			m := &s.entities.Mobs[i]
 			if m.CurrentHP == 0 || m.Area == nil || m.AggroTarget != 0 || m.returningHome ||
-				!buckets.nearAny(m.PosX, m.PosZ, ViewportRadius) {
+				!buckets.nearAny(m.PosX, m.PosZ, ViewportRadius) || !m.movable() {
 				continue
 			}
 			if m.advanceRoam(mapID) {
@@ -718,6 +625,17 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 				m.AggroTarget, m.returningHome = 0, false
 				continue
 			}
+			mods := m.mods()
+			if mods.VisionFix != 0 {
+				for _, p := range mapPlayers {
+					if p.CharacterID == mods.VisionFix && p.Alive {
+						m.AggroTarget = mods.VisionFix
+					}
+				}
+			}
+			if !mods.canAct() {
+				continue
+			}
 			if m.AggroTarget != 0 {
 				valid := false
 				for _, p := range mapPlayers {
@@ -767,7 +685,7 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 					tick.Moves = append(tick.Moves, mapPacket{mapID, m.PosX, m.PosZ, buildMobMove(m, mobMotionWalk)})
 					if arrived {
 						m.returningHome, m.lastAttackAt = false, time.Time{}
-						m.CurrentHP, m.Dots = max(m.MaxHP, 1), nil
+						m.CurrentHP, m.Effects = max(m.MaxHP, 1), nil
 						tick.Restores = append(tick.Restores, mapPacket{mapID, m.PosX, m.PosZ, buildMobCurrentHP(m.ID, m.CurrentHP)})
 					}
 				}
@@ -788,10 +706,10 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 				if now.Before(m.nextAttackAt) {
 					continue
 				}
-				slot, ok := m.pickAttackSlot(now, d)
+				slot, ok := m.pickAttackSlot(now, d, &mods)
 				if !ok {
 					// No slot ready: CMob::AttackAI waits 2.5 s.
-					m.nextAttackAt = now.Add(mobAttackIdle)
+					m.nextAttackAt = now.Add(mobAttackIdle + mods.attackDelayOffset())
 					continue
 				}
 				m.lastAttackAt = now
@@ -805,6 +723,9 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 				continue
 			}
 			if !m.lastAttackAt.IsZero() && now.Sub(m.lastAttackAt) < mobAttackPause {
+				continue
+			}
+			if !mods.canMove() {
 				continue
 			}
 			if now.Before(m.nextChaseAt) {
@@ -986,7 +907,7 @@ const mobAttackIdle = 2500 * time.Millisecond
 // pickAttackSlot is CMob::AttackAI's scan: slots 3 to 1, the first one in
 // use (Attackok), off its own cooldown, within its HP condition (3: HP
 // 20-40%, 4: HP at most 5%, 5: HP under 20%) and in reach.
-func (m *MapMob) pickAttackSlot(now time.Time, distance float32) (uint8, bool) {
+func (m *MapMob) pickAttackSlot(now time.Time, distance float32, mods *mobMods) (uint8, bool) {
 	if m.def == nil {
 		return 0, true
 	}
@@ -1012,8 +933,14 @@ func (m *MapMob) pickAttackSlot(now time.Time, distance float32) (uint8, bool) {
 			}
 		}
 		reach := float32(m.def.Size) + float32(a.Range) + 0.3
+		if a.Type == 0 && mods.Disabled[0] > 0 {
+			continue // CMob::Attack: m_pAttack[0].nDisable
+		}
 		if a.Type != 0 {
 			if sk := db.MustDefs().Skill(a.Type, 100); sk != nil {
+				if mods.Disabled[sk.Kind] > 0 {
+					continue
+				}
 				if sk.TypeEffect == 2 {
 					return uint8(slot), true // self heal: no reach needed
 				}
@@ -1035,7 +962,7 @@ func (m *MapMob) useSlot(slot uint8, now time.Time) []byte {
 	if a.Type != 0 {
 		if sk := db.MustDefs().Skill(a.Type, 100); sk != nil {
 			m.slotReadyAt[slot] = now.Add(time.Duration(sk.ResetTimeSeconds) * time.Second)
-			m.nextAttackAt = now.Add(mobAttackIdle)
+			m.nextAttackAt = now.Add(mobAttackIdle + m.mods().attackDelayOffset())
 			if sk.TypeEffect == 2 {
 				m.CurrentHP = min(satAdd(m.CurrentHP, uint32(max(sk.HealHP, 0))), m.MaxHP)
 				return buildMobCurrentHP(m.ID, m.CurrentHP)
@@ -1044,9 +971,16 @@ func (m *MapMob) useSlot(slot uint8, now time.Time) []byte {
 		}
 	}
 	// CMob::Attack: the slot waits its own AttackTime, the mob slot 1's.
-	m.slotReadyAt[slot] = now.Add(time.Duration(a.TimeMS) * time.Millisecond)
-	m.nextAttackAt = now.Add(m.attackInterval())
+	offset := m.mods().attackDelayOffset()
+	m.slotReadyAt[slot] = now.Add(time.Duration(a.TimeMS)*time.Millisecond + offset)
+	m.nextAttackAt = now.Add(m.attackInterval() + offset)
 	return nil
+}
+
+// movable: not stunned, asleep or stopped.
+func (m *MapMob) movable() bool {
+	o := m.mods()
+	return o.canMove()
 }
 
 func (m *MapMob) attackInterval() time.Duration {
@@ -1201,15 +1135,6 @@ func buildMobDeath(mobID, killerID uint32) []byte {
 	w.U32(mobID)
 	w.U8(1)
 	w.U32(killerID)
-	return w.MustFinish()
-}
-
-func buildMobDebuff(op packet.Opcode, debuffType uint8, mobID uint32, skillID uint16, level uint8) []byte {
-	w := packet.New(op)
-	w.U8(debuffType)
-	w.U32(mobID)
-	w.U16(skillID)
-	w.U8(level)
 	return w.MustFinish()
 }
 

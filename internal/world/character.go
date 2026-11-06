@@ -34,7 +34,7 @@ const (
 	MotionStandUp = 11
 )
 
-var consumableItemTypes = []uint8{25, 100, 101, 102}
+var consumableItemTypes = []uint8{25, 44, 100, 101, 102}
 
 func isConsumableType(t uint8) bool {
 	for _, c := range consumableItemTypes {
@@ -90,8 +90,9 @@ type EquipmentStats struct {
 	CrossRoad   int32 // passive detail 9: no close-range bow penalty
 	SPCostCut   int32 // ability 13 / 14: percent off skill costs
 	MPCostCut   int32
-	WeaponType  uint8 // real type of the equipped weapon (0 none)
-	ShieldType  uint8 // real type of the equipped shield (0 none)
+	Disabled    [3]int32 // abilities 32-34: no attacks of that category
+	WeaponType  uint8    // real type of the equipped weapon (0 none)
+	ShieldType  uint8    // real type of the equipped shield (0 none)
 }
 
 // CategoryMods are SetSkillAbility's per-category additions.
@@ -271,6 +272,8 @@ type CharacterStats struct {
 	CrossRoad    int32
 	Range        int32
 	AttackSpeed  int32
+	MoveSpeed    int32
+	Disabled     [3]int32
 	SPCostCut    int32
 	MPCostCut    int32
 }

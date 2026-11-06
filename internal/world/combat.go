@@ -71,6 +71,9 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 		s.log.Printf("Rapture World cancelled auto attack while mounted character_id=%d mob_global_id=%d", ch.ID, target)
 		return false
 	}
+	if s.actionBlocked() {
+		return false // CUser::GetAttackSpeed is 255 while stunned or asleep
+	}
 	wc, ok := equippedWeaponCombat(s.items)
 	if !ok {
 		s.log.Printf("Rapture World cancelled auto attack without valid weapon character_id=%d mob_global_id=%d", ch.ID, target)
@@ -109,10 +112,13 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 	if def == nil {
 		return false
 	}
-	mc := mobCombatFor(def)
+	mc, _ := MobCombatByID(ch.MapID, target)
 	kind := attackMelee
 	if stats.RangedWeapon {
 		kind = attackRanged
+	}
+	if stats.Disabled[kind] > 0 {
+		return true // the category is disabled (abilities 32-34); wait it out
 	}
 	s.lastAutoAttackAt, s.lastCombatAt = time.Now(), time.Now()
 	SetMobAggro(ch.MapID, target, ch.ID)
@@ -145,6 +151,9 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 func (s *Session) resolveMobDamage(r *MobDamageResult) bool {
 	ch := s.char
 	m := &r.Mob
+	if r.Speed != nil {
+		sendNear(ch.MapID, m.PosX, m.PosZ, ViewportRadius, r.Speed, "0x0609 mob speed (woke)")
+	}
 	if !r.Killed {
 		sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, buildMobCurrentHP(m.ID, m.CurrentHP), "0x0610 mob current hp after attack")
 		s.send(buildMobTargetHP(m), "0x0305 mob target hp after attack")
@@ -173,7 +182,10 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 	if def == nil {
 		return false
 	}
-	mc := mobCombatFor(def)
+	mc, ok := MobCombatByID(ch.MapID, d.MobGlobalID)
+	if !ok {
+		mc = mobCombatFor(def)
+	}
 	slot := &def.Attacks[min(d.Slot, 2)]
 	if slot.Type != 0 {
 		if sk := db.MustDefs().Skill(slot.Type, 100); sk != nil {
@@ -183,7 +195,7 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 	// CMob::AttackSuccess / CMob::AttackDamage: normal attacks are melee.
 	var damage uint32
 	result := uint8(attackSuccessNormal)
-	if !mobHits(&mc, &stats, attackMelee) {
+	if s.blocksAttack(attackMelee) || !mobHits(&mc, &stats, attackMelee) {
 		result = attackResultMiss
 	} else {
 		v, crit := mobDamage(&mc, slot, &stats)
@@ -195,9 +207,21 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 			result = attackResultCritical
 		}
 	}
-	killed := s.takeMobDamage(d, damage, &stats)
+	// CMob::Attack: a reflected hit spares the player and goes back to
+	// the mob (0x0605 then carries no damage).
+	reflected := result != attackResultMiss && s.reflects(attackMelee, def)
+	killed := false
+	shown := damage
+	if reflected {
+		shown = 0
+	} else {
+		killed = s.takeMobDamage(d, damage, &stats)
+	}
 	sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius,
-		buildMobAttackCharacter(result, d.MobGlobalID, ch.ID, uint16(min(damage, 65535))), "0x0605 mob attack character")
+		buildMobAttackCharacter(result, d.MobGlobalID, ch.ID, uint16(min(shown, 65535))), "0x0605 mob attack character")
+	if reflected {
+		s.reflectToMob(d.MobGlobalID, [3]uint16{uint16(min(damage, 65535)), 0, 0})
+	}
 	s.log.Printf("Rapture World mob attack mob_global_id=%d mob_id=%d slot=%d result=%d damage=%d killed=%t",
 		d.MobGlobalID, d.MobID, d.Slot, result, damage, killed)
 	s.afterMobDamage(d, killed)
@@ -220,7 +244,7 @@ func (s *Session) applyMobSkill(d pendingDamage, md *db.MobDef, mc *mobCombat, s
 		drain := first && sk.TypeDetail == detailDrain
 		var damage [3]int32
 		result := uint8(attackSuccessNormal)
-		if !mobSkillHits(mc, md, sk, stats) {
+		if s.blocksAttack(int(sk.Kind)) || !mobSkillHits(mc, md, sk, stats) {
 			result = attackResultMiss
 		} else {
 			var crit bool
@@ -259,6 +283,10 @@ func (s *Session) applyMobSkill(d pendingDamage, md *db.MobDef, mc *mobCombat, s
 			w.U16(uint16(sk.AddDamageSP))
 			w.U16(uint16(sk.AddDamageMP))
 			sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius, w.MustFinish(), "0x060E mob skill extra damage")
+		}
+		// CMob::AttackUser(skill): a debuff stays on the player.
+		if !killed && result != attackResultMiss && sk.TypeEffect == typeEffectDebuff {
+			s.applyMobDebuff(sk, d.MobGlobalID)
 		}
 		refreshed := s.stats()
 		stats = &refreshed
@@ -305,6 +333,9 @@ func (s *Session) takeMobDamage(d pendingDamage, damage uint32, stats *Character
 		ch.Deaths++
 	}
 	s.persist()
+	if !killed {
+		s.wake()
+	}
 	return killed
 }
 

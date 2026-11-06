@@ -59,6 +59,8 @@ func TestPacketLayoutsMatchClient(t *testing.T) {
 		{"0x0508 0058fa30", buildLevelUp(packet.LevelUpSelf, ch), 18},
 		{"0x051e 0058fac0", buildLevelUp(packet.LevelUpOther, ch), 18},
 		{"0x0517 00590370", buildSkillUseResult(packet.SkillUse, 0, 1, 1, 1, 1, 1, 1, 1), 18},
+		{"0x050d 0058fd80", buildBuffAdd(1, 1, 1), 7},
+		{"0x0609 00591a90", buildMobSpeed(m), 6},
 		{"0x0518 slot_168", buildSkillDrainResult(0, 1, 1, 1, 1, [3]uint16{}, [3]uint16{}), 24},
 		{"0x0519 00590520", buildSkillUseResult(opSkillOther, 0, 1, 1, 1, 1, 1, 1, 1), 18},
 		{"0x060b slot_17c", buildMobSkillPacket(0x060B, 0, 1, 1, sk, [3]uint16{}, nil), 19},

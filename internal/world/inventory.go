@@ -297,6 +297,31 @@ func (s *Session) handleUseItem(p []byte) {
 		s.send(buildCurrentHitpoints(&stats), "0x0521 current hp/mp/sp (reset)")
 		return
 	}
+	// CUser::ItemUse -> UseItemSkill: Range/AttackTime name a skill
+	// (candies, remedies, charms) that the item casts on its user.
+	if def.Special == specialNone && def.Range != 0 && def.AttackTime != 0 {
+		if sk := db.MustDefs().Skill(uint16(def.Range), def.AttackTime); sk != nil && sk.TypeEffect == typeEffectBuff {
+			cd := cooldownForReqIg(def.ReqIg)
+			if last, ok := s.itemCooldowns[def.ReqIg]; ok && cd > 0 && time.Since(last) < cd {
+				reject("cooldown")
+				return
+			}
+			res, err := s.consumeOne(i)
+			if err != nil {
+				s.log.Printf("Rapture World failed to consume item: %v", err)
+			}
+			if cd > 0 {
+				s.itemCooldowns[def.ReqIg] = time.Now()
+			}
+			s.persist()
+			s.send(buildUseItemResult(ch.ID, &res), "0x050A use item")
+			s.send(buildRemoveItem(&res, res.Count == 0), "0x0206 remove item")
+			if _, ok := s.addEffect(sk, 0); ok {
+				s.log.Printf("Rapture World item skill item=%d/%d skill_id=%d level=%d keep=%d", def.Type, def.TypeID, sk.SkillID, sk.SkillLevel, sk.KeepSeconds)
+			}
+			return
+		}
+	}
 	hp, mp, sp := pos16(def.ConstHP), pos16(def.ConstMP), pos16(def.ConstSP)
 	if (def.Special != specialNone && def.Special != specialPercentHealingPotion) || hp+mp+sp == 0 {
 		reject(fmt.Sprintf("unsupported special=%d", def.Special))

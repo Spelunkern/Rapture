@@ -26,6 +26,10 @@ type ActiveBuff struct {
 	EndsAt                 time.Time
 	Effect, Detail         uint8
 	Attr                   uint8 // AttrType, for the element buffs 94/95
+	DefenceType            uint8
+	BlockLeft              uint32 // detail 85 blocks left / 86 chance
+	CasterMob              uint32 // the mob that applied a debuff
+	prevTick               time.Time
 	Abilities              [3]buffAbility
 	HealHP, HealSP, HealMP uint32
 	nextTickAt             time.Time // zero: no heal component
@@ -46,18 +50,22 @@ type buffAbility struct {
 
 // addBuffs applies each active buff's abilities, as CUser::AddApplySkillBuff
 // does: detail 82 adds all three, detail 91 negates the first, 94 and 95
-// set the attack and defence element.
+// set the attack and defence element; mob debuffs 62/67 subtract them and
+// 68 clears the armour element.
 func addBuffs(e EquipmentStats, buffs []ActiveBuff) EquipmentStats {
 	for _, b := range buffs {
-		switch b.Detail {
-		case 94: // attack element
+		debuff := b.Effect == typeEffectDebuff
+		switch {
+		case !debuff && b.Detail == 94: // attack element
 			e.AttackAttr = b.Attr
-		case 95: // defence element
+		case !debuff && b.Detail == 95: // defence element
 			e.DefenseAttr = b.Attr
+		case debuff && b.Detail == detailNoElement2:
+			e.DefenseAttr = 0
 		}
 		for i, a := range b.Abilities {
 			v := a.Value
-			if b.Detail == 91 && i == 0 {
+			if (b.Detail == 91 && i == 0) || debuff {
 				v = -v
 			}
 			applyAbility(&e, b.Effect, a.Type, v)
@@ -73,7 +81,8 @@ func newBuff(id uint32, def *db.SkillDef, ends time.Time, log logPrinter) Active
 	if b.HealHP+b.HealSP+b.HealMP > 0 {
 		b.nextTickAt = time.Now().Add(periodicHealTick)
 	}
-	if def.TypeDetail == 82 || def.TypeDetail == 91 {
+	b.DefenceType, b.BlockLeft, b.prevTick = def.DefenceType, uint32(def.DefenceValue), time.Now()
+	if def.TypeDetail == 82 || def.TypeDetail == 91 || def.TypeDetail == detailAbilityDown || def.TypeDetail == detailAbilityDown2 {
 		for i, t := range def.AbilityType {
 			b.Abilities[i] = buffAbility{t, int32(def.AbilityValue[i])}
 			if !applyAbility(&EquipmentStats{}, def.TypeEffect, t, 0) {
@@ -141,8 +150,8 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 	ch := s.char
 	number := p[2]
 	target, _ := packet.U32(p[3:])
-	if s.mounted || s.cast != nil {
-		s.log.Printf("Rapture World rejected skill use (mounted or already casting) character_id=%d", ch.ID)
+	if s.mounted || s.cast != nil || s.actionBlocked() {
+		s.log.Printf("Rapture World rejected skill use (mounted, casting, stunned or asleep) character_id=%d", ch.ID)
 		return
 	}
 	k, def, ok := s.knownSkill(number)
@@ -256,32 +265,10 @@ func (s *Session) startBuff(k db.CharacterSkill, def *db.SkillDef, op packet.Opc
 	s.spendDelta(mp, sp)
 	s.persist()
 	s.send(buildSkillUsedSpMp(sp, mp), "0x050C skill used sp/mp")
-	id := uint32(0)
-	kept := s.buffs[:0]
-	for _, b := range s.buffs {
-		if b.SkillID == k.SkillID {
-			id = b.ID
-			continue
-		}
-		kept = append(kept, b)
-	}
-	s.buffs = kept
-	if id == 0 {
-		for _, b := range s.buffs {
-			id = max(id, b.ID)
-		}
-		id++
-	}
-	s.buffs = append(s.buffs, newBuff(id, def, time.Now().Add(time.Duration(def.KeepSeconds)*time.Second), s.log))
-	s.log.Printf("Rapture World skill buff started skill_id=%d level=%d keep_time=%d", k.SkillID, k.Level, def.KeepSeconds)
 	s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill buff cast")
-	w := packet.New(packet.BuffAdd)
-	w.U32(id)
-	w.U16(k.SkillID)
-	w.U8(k.Level)
-	w.U32(uint32(def.KeepSeconds))
-	s.send(w.MustFinish(), "0x050D buff add")
-	s.sendBuffStats("after buff")
+	if _, ok := s.addEffect(def, 0); ok {
+		s.log.Printf("Rapture World skill buff started skill_id=%d level=%d keep_time=%d", k.SkillID, k.Level, def.KeepSeconds)
+	}
 }
 
 func (s *Session) sendBuffStats(why string) {
@@ -291,19 +278,22 @@ func (s *Session) sendBuffStats(why string) {
 	s.send(buildCurrentHitpoints(&st), "0x0521 current hp/mp/sp "+why)
 }
 
-// processBuffs ticks heal-over-time and expires buffs.
+// processBuffs ticks heal-over-time and debuff damage, then expires
+// applied skills (CUser::ChkKeepSkill / ChkEndTimeSkill).
 func (s *Session) processBuffs() {
-	if len(s.buffs) == 0 || s.char == nil {
+	if len(s.buffs) == 0 || s.char == nil || s.dead {
 		return
 	}
 	now := time.Now()
-	var removed []uint32
-	for i := 0; i < len(s.buffs); {
+	if s.tickDebuffs(now) {
+		return
+	}
+	for i := range s.buffs {
 		b := &s.buffs[i]
 		expiring := !b.EndsAt.After(now)
 		hasHeal := b.HealHP+b.HealSP+b.HealMP > 0
 		due := !b.nextTickAt.IsZero() && !b.nextTickAt.After(now)
-		if due || (expiring && hasHeal) {
+		if hasHeal && (due || expiring) {
 			hp, mp, sp := s.healDelta(b.HealHP, b.HealMP, b.HealSP)
 			s.persist()
 			w := packet.New(packet.SkillKeep)
@@ -320,23 +310,14 @@ func (s *Session) processBuffs() {
 				b.nextTickAt = b.nextTickAt.Add(periodicHealTick)
 			}
 		}
-		if expiring {
-			removed = append(removed, b.ID)
-			s.log.Printf("Rapture World skill buff expired skill_id=%d level=%d", b.SkillID, b.SkillLevel)
-			s.buffs = append(s.buffs[:i], s.buffs[i+1:]...)
-		} else {
-			i++
+	}
+	s.removeEffects(func(b *ActiveBuff) bool {
+		if b.EndsAt.After(now) {
+			return false
 		}
-	}
-	if len(removed) == 0 {
-		return
-	}
-	for _, id := range removed {
-		w := packet.New(packet.BuffRemove)
-		w.U32(id)
-		s.send(w.MustFinish(), "0x050E buff remove")
-	}
-	s.sendBuffStats("after buff expiry")
+		s.log.Printf("Rapture World applied skill expired skill_id=%d level=%d", b.SkillID, b.SkillLevel)
+		return true
+	}, "after expiry")
 }
 
 // persistBuffs snapshots remaining buff time (frozen while offline).

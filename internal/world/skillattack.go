@@ -53,6 +53,10 @@ func (s *Session) skillAttack(k db.CharacterSkill, def *db.SkillDef, target uint
 			return
 		}
 	}
+	if stats.Disabled[def.Kind] > 0 {
+		s.log.Printf("Rapture World rejected skill use: category %d disabled skill_id=%d", def.Kind, k.SkillID)
+		return
+	}
 	var center *MapMob
 	if def.TargetType != targetTypeEnemiesNearCaster {
 		mob, ok := MobByID(ch.MapID, target)
@@ -168,7 +172,7 @@ func (s *Session) skillHit(target uint32, def *db.SkillDef, k db.CharacterSkill,
 		return false
 	}
 	stats := s.stats()
-	mc := mobCombatFor(md)
+	mc, _ := MobCombatByID(ch.MapID, target)
 	drain := first && def.TypeDetail == detailDrain
 	op := opSkillOther
 	switch {
@@ -229,10 +233,10 @@ func (s *Session) skillHit(target uint32, def *db.SkillDef, k db.CharacterSkill,
 		}
 	}
 	// TypeEffect 3 leaves the skill on the mob (CMob::AddApplySkill).
-	if alive && def.TypeEffect == typeEffectDebuff && (def.TimeDamageHP > 0 || def.TimeDamageSP > 0 || def.TimeDamageMP > 0) {
-		ApplyDotToMob(ch.MapID, target, ch.ID, k.SkillID, k.Level, uint32(max(def.TimeDamageHP, 0)), time.Duration(def.KeepSeconds)*time.Second)
-		sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, CombatRadius,
-			buildMobDebuff(packet.MobDebuffAdd, MobDebuffTypeDOT, target, k.SkillID, k.Level), "0x030C mob debuff add")
+	if alive && def.TypeEffect == typeEffectDebuff {
+		if speed, ok := ApplyMobEffect(ch.MapID, target, ch.ID, def); ok && speed != nil {
+			sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, ViewportRadius, speed, "0x0609 mob speed")
+		}
 	}
 	return alive
 }
@@ -270,6 +274,7 @@ func (s *Session) inSkillRange(m *MapMob, def *db.SkillDef, st *CharacterStats) 
 // clearBuffsOnDeath is CUser::ClearApplySkillByDeath: every active skill
 // ends except those with FixRange set.
 func (s *Session) clearBuffsOnDeath() {
+	s.deathLoss = s.deathExpLoss()
 	kept := s.buffs[:0]
 	var removed []uint32
 	for _, b := range s.buffs {

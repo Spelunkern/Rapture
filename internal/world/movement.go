@@ -116,7 +116,7 @@ func (s *Session) resurrect() bool {
 	} else if area, ok := FindNearestSpawnArea(ch.MapID, s.faction, ch.PosX, ch.PosZ); ok {
 		x, y, z = area.Center()
 	}
-	lost := expDrop(ch, deathExpPercent)
+	lost := expDrop(ch, s.deathLoss)
 	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
 	full := StatsFor(ch, s.equipment())
 	ch.CurrentHP = satSub(ch.CurrentHP, full.CurrentHP-full.MaxHP/2)
@@ -215,8 +215,7 @@ func (s *Session) executeTown() {
 		"0x1101 town command result")
 }
 
-// deathExpPercent is CUser::Death's drop: 5% (amulet benefits that lower
-// it to 1% or 0% are not modeled yet).
+// deathExpPercent is CUser::Death's drop without charms (deathExpLoss).
 const deathExpPercent = 5
 
 // expDrop is CUser::ExpDrop (0x0045ad50): above level 10, percent of the

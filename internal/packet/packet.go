@@ -72,8 +72,6 @@ const (
 	TargetMobHpUpdate      Opcode = 0x0305
 	TargetClear            Opcode = 0x030A
 	UseVehicle             Opcode = 0x0216 // empty request; response ok:u8, isOnVehicle:u8
-	MobDebuffAdd           Opcode = 0x030C // debuffType:u8, mobId:u32, skillId:u16, skillLevel:u8
-	MobDebuffRemove        Opcode = 0x030D
 	ItemBagToBag           Opcode = 0x0204
 	AddItem                Opcode = 0x0205
 	RemoveItem             Opcode = 0x0206

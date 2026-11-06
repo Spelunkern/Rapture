@@ -99,23 +99,23 @@ func broadcastMapPackets(list []mapPacket, radius float32, label string) {
 }
 
 func runDotSweep(log *logx.Logger) {
-	for _, o := range TickAllMobDots() {
-		if o.AppliedHP == 0 {
+	for _, o := range TickMobEffects() {
+		m := &o.Mob
+		if o.Speed != nil {
+			sendNear(o.MapID, m.PosX, m.PosZ, ViewportRadius, o.Speed, "0x0609 mob speed")
+		}
+		if !o.Damaged {
 			continue
 		}
-		m := &o.Mob
-		if o.IsFinalTick {
-			sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius,
-				buildMobDebuff(0x030D, MobDebuffTypeDOT, m.ID, o.SkillID, o.SkillLevel), "0x030D mob debuff remove")
-		}
 		sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius,
-			buildMobPeriodicDamage(m.ID, o.SkillID, o.SkillLevel, uint16(min(o.AppliedHP, 65535)), 0, 0), "0x0607 mob periodic damage")
+			buildMobPeriodicDamage(m.ID, o.SkillID, o.SkillLevel, uint16(min(max(o.Damage[0], 0), 65535)),
+				uint16(min(max(o.Damage[1], 0), 65535)), uint16(min(max(o.Damage[2], 0), 65535))), "0x0607 mob skill damage")
 		sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius, buildMobCurrentHP(m.ID, m.CurrentHP), "0x0610 mob current hp")
 		if !o.Killed {
 			continue
 		}
-		log.Printf("Rapture World dot kill character_id=%d mob_global_id=%d mob_id=%d", o.CasterID, m.ID, m.MobID)
-		sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius, buildMobDeath(m.ID, o.CasterID), "0x0606 mob death (dot)")
+		log.Printf("Rapture World skill effect kill character_id=%d mob_global_id=%d mob_id=%d", o.CasterID, m.ID, m.MobID)
+		sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius, buildMobDeath(m.ID, o.CasterID), "0x0606 mob death (skill effect)")
 		rewardKill(FindPlayerByID(o.CasterID), o.CasterID, o.MapID, m, log)
 	}
 }
