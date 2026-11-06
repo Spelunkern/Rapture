@@ -92,7 +92,7 @@ func runDotSweep(log *logx.Logger) {
 		if caster != nil {
 			y = caster.Snapshot().PosY
 		}
-		for _, p := range rollMobDrops(o.MapID, m.MobID, m.MoneyMin, m.MoneyMax, o.CasterID, m.PosX, y, m.PosZ, log) {
+		for _, p := range rollMobDrops(o.MapID, m, o.CasterID, y, log) {
 			sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 dot kill drop")
 		}
 		if m.Exp > 0 {

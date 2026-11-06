@@ -26,6 +26,7 @@ type ItemDef struct {
 	Range                                  int16
 	AttackTime                             uint8
 	Special                                uint8
+	Attrib                                 uint8
 	Slot                                   uint8
 	Quality                                uint16
 	Effect1, Effect2, Effect3, Effect4     int16
@@ -34,6 +35,7 @@ type ItemDef struct {
 	ConstInt, ConstWis, ConstLuc           int16
 	Buy, Sell                              int32
 	Grade                                  uint16
+	Drop                                   uint16 // drop-limit interval selector (0 = unlimited)
 	Server                                 uint8
 	Count                                  uint8
 }
@@ -75,18 +77,37 @@ type SkillDef struct {
 	TargetType, ApplyRange, MultiAttack      uint8
 }
 
+// MobAttack is one of a mob's three attack slots (AttackTypeN..AttackokN).
+type MobAttack struct {
+	Type         uint16 // 0 melee, 1 ranged, 2 magic
+	TimeMS       uint32
+	Range        uint16
+	Attack, Plus uint16 // base damage and random variance
+	Attrib       uint8
+	OK           uint8
+}
+
 // MobDef is the subset of PS_GameDefs.dbo.Mobs the world uses.
 type MobDef struct {
 	MobID              uint16
 	Name               string
 	Level              uint16
 	MaxHP              uint32
-	MoneyMin, MoneyMax uint32
+	MoneyMin, MoneyMax uint32 // Money1 (base) and Money2 (random range)
 	RespawnSeconds     uint64 // 0: does not respawn
 	Exp                uint32
 	Attack             uint32
 	AI                 uint8
 	ChaseRange         float32
+	Dex, Wis, Luc      uint16
+	Defense, Magic     uint16
+	ShieldDefense      uint32 // Attacktime3, as the original reads it
+	Attrib             uint8
+	NormalTimeMS       uint32
+	NormalStep         uint16
+	ChaseTimeMS        uint32
+	ChaseStep          uint16
+	Attacks            [3]MobAttack
 }
 
 type MobDrop struct {
@@ -201,27 +222,27 @@ func loadDefs() (*Defs, error) {
 
 	rows, err := pool.QueryContext(c, `SELECT ItemID, ISNULL(ItemName,''), Type, TypeID, Reqlevel, Country,
 		Attackfighter, Defensefighter, Patrolrogue, Shootrogue, Attackmage, Defensemage, Grow,
-		ReqStr, ReqDex, ReqRec, ReqInt, ReqWis, Reqluc, ReqIg, Range, AttackTime, Special, Slot, Quality,
+		ReqStr, ReqDex, ReqRec, ReqInt, ReqWis, Reqluc, ReqIg, Range, AttackTime, Special, ISNULL(Attrib,0), Slot, Quality,
 		Effect1, Effect2, Effect3, Effect4, ConstHP, ConstSP, ConstMP, ConstStr, ConstDex, ConstRec,
-		ConstInt, ConstWis, ConstLuc, Buy, Sell, Grade, Server, Count FROM dbo.Items`)
+		ConstInt, ConstWis, ConstLuc, Buy, Sell, Grade, ISNULL([Drop],0), Server, Count FROM dbo.Items`)
 	if err != nil {
 		return nil, fmt.Errorf("load Items: %w", err)
 	}
 	for rows.Next() {
 		var it ItemDef
-		var reqLevel, quality, grade int64
+		var reqLevel, quality, grade, drop int64
 		var classes [6]uint8
 		if err := rows.Scan(&it.ItemID, &it.Name, &it.Type, &it.TypeID, &reqLevel, &it.Country,
 			&classes[0], &classes[1], &classes[2], &classes[3], &classes[4], &classes[5], &it.Grow,
 			&it.ReqStr, &it.ReqDex, &it.ReqRec, &it.ReqInt, &it.ReqWis, &it.ReqLuc, &it.ReqIg, &it.Range,
-			&it.AttackTime, &it.Special, &it.Slot, &quality, &it.Effect1, &it.Effect2, &it.Effect3, &it.Effect4,
+			&it.AttackTime, &it.Special, &it.Attrib, &it.Slot, &quality, &it.Effect1, &it.Effect2, &it.Effect3, &it.Effect4,
 			&it.ConstHP, &it.ConstSP, &it.ConstMP, &it.ConstStr, &it.ConstDex, &it.ConstRec, &it.ConstInt,
-			&it.ConstWis, &it.ConstLuc, &it.Buy, &it.Sell, &grade, &it.Server, &it.Count); err != nil {
+			&it.ConstWis, &it.ConstLuc, &it.Buy, &it.Sell, &grade, &drop, &it.Server, &it.Count); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Items: %w", err)
 		}
 		it.Name = strings.TrimRight(it.Name, " ")
-		it.ReqLevel, it.Quality, it.Grade = clampU16(reqLevel), clampU16(quality), clampU16(grade)
+		it.ReqLevel, it.Quality, it.Grade, it.Drop = clampU16(reqLevel), clampU16(quality), clampU16(grade), clampU16(drop)
 		for i, v := range classes {
 			it.Classes[i] = v != 0
 		}
@@ -268,15 +289,27 @@ func loadDefs() (*Defs, error) {
 	rows.Close()
 
 	rows, err = pool.QueryContext(c, `SELECT MobID, ISNULL(MobName,''), Level, HP, Money1, Money2, Attackspecial3,
-		Exp, Attack1, AI, ChaseRange FROM dbo.Mobs`)
+		Exp, Attack1, AI, ChaseRange, Dex, Wis, Luc, Defense, Magic, Attacktime3, Attrib, NormalTime, NormalStep,
+		ChaseTime, ChaseStep, AttackType1, AttackTime1, Attackrange1, Attack1, Attackplus1, Attackattrib1, Attackok1,
+		Attacktype2, Attacktime2, Attackrange2, Attack2, Attackplus2, Attackattrib2, Attackok2,
+		Attacktype3, Attacktime3, Attackrange3, Attack3, Attackplus3, Attackattrib3, Attackok3 FROM dbo.Mobs`)
 	if err != nil {
 		return nil, fmt.Errorf("load Mobs: %w", err)
 	}
 	for rows.Next() {
 		var mobID, level, hp, money1, money2, exp, attack, chase int64
+		var dex, wis, luc, def, magic, shield, attrib, ntime, nstep, ctime, cstep int64
+		var a [3][7]int64
 		var special, ai uint8
 		var name string
-		if err := rows.Scan(&mobID, &name, &level, &hp, &money1, &money2, &special, &exp, &attack, &ai, &chase); err != nil {
+		dest := []any{&mobID, &name, &level, &hp, &money1, &money2, &special, &exp, &attack, &ai, &chase,
+			&dex, &wis, &luc, &def, &magic, &shield, &attrib, &ntime, &nstep, &ctime, &cstep}
+		for i := range a {
+			for j := range a[i] {
+				dest = append(dest, &a[i][j])
+			}
+		}
+		if err := rows.Scan(dest...); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Mobs: %w", err)
 		}
@@ -286,7 +319,15 @@ func loadDefs() (*Defs, error) {
 		d.Mobs[uint16(mobID)] = &MobDef{MobID: uint16(mobID), Name: strings.TrimRight(name, " "),
 			Level: max(clampU16(level), 1), MaxHP: uint32(max(hp, 1)), MoneyMin: uint32(max(money1, 0)),
 			MoneyMax: uint32(max(money2, 0)), RespawnSeconds: MobRespawnSeconds(special),
-			Exp: uint32(max(exp, 0)), Attack: uint32(max(attack, 0)), AI: ai, ChaseRange: float32(max(chase, 0))}
+			Exp: uint32(max(exp, 0)), Attack: uint32(max(attack, 0)), AI: ai, ChaseRange: float32(max(chase, 0)),
+			Dex: clampU16(dex), Wis: clampU16(wis), Luc: clampU16(luc), Defense: clampU16(def), Magic: clampU16(magic),
+			ShieldDefense: uint32(max(shield, 0)), Attrib: clampU8(attrib), NormalTimeMS: uint32(max(ntime, 0)),
+			NormalStep: clampU16(nstep), ChaseTimeMS: uint32(max(ctime, 0)), ChaseStep: clampU16(cstep)}
+		for i := range a {
+			d.Mobs[uint16(mobID)].Attacks[i] = MobAttack{Type: clampU16(a[i][0]), TimeMS: uint32(max(a[i][1], 0)),
+				Range: clampU16(a[i][2]), Attack: clampU16(a[i][3]), Plus: clampU16(a[i][4]), Attrib: clampU8(a[i][5]),
+				OK: clampU8(a[i][6])}
+		}
 	}
 	rows.Close()
 

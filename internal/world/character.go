@@ -71,10 +71,14 @@ func satMul(a, b uint32) uint32 {
 type EquipmentStats struct {
 	Str, Rec, Int, Wis, Dex, Luc uint32
 	MaxHP, MaxMP, MaxSP          uint32
-	MinAttack, MaxAttack         uint32
-	MinMagic, MaxMagic           uint32
-	Defense, Resistance          uint32
-	Absorption                   uint32
+	// CUser::GemEquipmentAdd/ItemEquipmentAdd: Effect1 is the item attack
+	// and Effect2 its random variance (weapons and accessories), Effect3
+	// physical and Effect4 magic defense (everything but weapons).
+	ItemAttack, Variance uint32
+	Defense, Resistance  uint32
+	Absorption           uint32
+	AttackAttr           uint8 // the weapon's (or its gem's) element
+	RangedWeapon         bool
 }
 
 const gemItemType = 30
@@ -117,18 +121,35 @@ func ParseCraftName(name string) (CraftStats, bool) {
 
 func pos16(v int16) uint32 { return uint32(max(v, 0)) }
 
+func isAccessoryType(t uint8) bool { return t == 22 || t == 23 || t == 40 }
+
 func (e *EquipmentStats) addItemDef(itemType uint8, d *db.ItemDef) {
-	maxEffect, minEffect := pos16(d.Effect1), pos16(d.Effect2)
-	if itemType == 12 { // staff: magic weapon
-		e.MinMagic, e.MaxMagic = satAdd(e.MinMagic, minEffect), satAdd(e.MaxMagic, maxEffect)
-	} else {
-		e.MinAttack, e.MaxAttack = satAdd(e.MinAttack, minEffect), satAdd(e.MaxAttack, maxEffect)
+	weapon := IsWeaponItemType(itemType)
+	if weapon || isAccessoryType(itemType) || itemType == gemItemType {
+		e.ItemAttack, e.Variance = satAdd(e.ItemAttack, pos16(d.Effect1)), satAdd(e.Variance, pos16(d.Effect2))
 	}
-	e.Defense = satAdd(e.Defense, pos16(d.Effect3))
-	e.Resistance = satAdd(e.Resistance, pos16(d.Effect4))
+	if !weapon {
+		e.Defense, e.Resistance = satAdd(e.Defense, pos16(d.Effect3)), satAdd(e.Resistance, pos16(d.Effect4))
+	}
 	e.MaxHP, e.MaxSP, e.MaxMP = satAdd(e.MaxHP, pos16(d.ConstHP)), satAdd(e.MaxSP, pos16(d.ConstSP)), satAdd(e.MaxMP, pos16(d.ConstMP))
 	e.Str, e.Dex, e.Rec = satAdd(e.Str, pos16(d.ConstStr)), satAdd(e.Dex, pos16(d.ConstDex)), satAdd(e.Rec, pos16(d.ConstRec))
 	e.Int, e.Wis, e.Luc = satAdd(e.Int, pos16(d.ConstInt)), satAdd(e.Wis, pos16(d.ConstWis)), satAdd(e.Luc, pos16(d.ConstLuc))
+}
+
+// realType is GetItemRType (0x004bdad0): item types grouped by family.
+func realType(t uint8) uint8 {
+	groups := [][]uint8{{1, 45}, {2, 46}, {3, 47}, {4, 48}, {5, 49, 50}, {6, 51, 52}, {7, 53, 54}, {8, 55, 56}, {9, 57},
+		{10, 58}, {11, 59}, {12, 60, 61}, {13, 62, 63}, {14, 64}, {15, 65}, {16, 31, 66, 72, 81, 87},
+		{17, 32, 67, 73, 82, 88}, {18, 33, 68, 74, 83, 89}, {19, 34, 69, 75, 84, 90}, {20, 35, 70, 76, 85, 91},
+		{21, 36, 71, 77, 86, 92}, {22, 37}, {23, 38}, {24, 39}, {40, 41}, {25, 44, 100}, {27, 28, 29}}
+	for i, g := range groups {
+		for _, v := range g {
+			if v == t {
+				return uint8(i + 1)
+			}
+		}
+	}
+	return 0
 }
 
 // GetEquipmentStats sums every bag-0 item, its gems and craft bonuses.
@@ -140,16 +161,29 @@ func GetEquipmentStats(items []db.Item) EquipmentStats {
 		if it.Bag != 0 {
 			continue
 		}
-		if d := defs.Item(it.Type, it.TypeID); d != nil {
+		d := defs.Item(it.Type, it.TypeID)
+		if d != nil {
 			e.addItemDef(it.Type, d)
+		}
+		attr := uint8(0)
+		if d != nil {
+			attr = d.Attrib
 		}
 		for _, gem := range it.Gems {
 			if gem == 0 {
 				continue
 			}
-			if d := defs.Item(gemItemType, gem); d != nil {
-				e.addItemDef(gemItemType, d)
+			if g := defs.Item(gemItemType, gem); g != nil {
+				e.addItemDef(gemItemType, g)
+				if g.Attrib != 0 && attr == 0 {
+					attr = g.Attrib
+				}
 			}
+		}
+		if it.Slot == weaponSlot && IsWeaponItemType(it.Type) {
+			e.AttackAttr = attr
+			rt := realType(it.Type)
+			e.RangedWeapon = rt == 11 || rt == 13 || rt == 14
 		}
 		if c, ok := ParseCraftName(it.CraftName); ok {
 			e.Str, e.Dex, e.Rec = satAdd(e.Str, c.Str), satAdd(e.Dex, c.Dex), satAdd(e.Rec, c.Rec)
@@ -158,9 +192,7 @@ func GetEquipmentStats(items []db.Item) EquipmentStats {
 			if c.EnchantLevel > 0 {
 				step := min(c.EnchantLevel, 20)
 				if IsWeaponItemType(it.Type) {
-					b := weaponEnchantAttackBonus[step]
-					e.MinAttack, e.MaxAttack = satAdd(e.MinAttack, b), satAdd(e.MaxAttack, b)
-					e.MinMagic, e.MaxMagic = satAdd(e.MinMagic, b), satAdd(e.MaxMagic, b)
+					e.ItemAttack = satAdd(e.ItemAttack, weaponEnchantAttackBonus[step])
 				} else if IsArmorItemType(it.Type) {
 					e.Absorption = satAdd(e.Absorption, armorEnchantAbsorption[step])
 				}
@@ -178,12 +210,24 @@ type CharacterStats struct {
 	Str, Rec, Int, Wis, Dex, Luc    uint32
 	MaxHP, MaxMP, MaxSP             uint32
 	CurrentHP, CurrentMP, CurrentSP uint32
+	// Display ranges for 0x0526: attack to attack + variance.
 	MinAttack, MaxAttack            uint32
 	MinMagic, MaxMagic              uint32
 	Defense, Resistance, Absorption uint32
+	// CUser::SetAttack per category (melee, ranged, magic).
+	Level        uint16
+	Attack       [3]int32
+	Accuracy     [3]int32
+	Evasion      [3]int32
+	Guard        [3]int32 // defense per category
+	Critical     int32
+	Variance     uint32
+	AttackAttr   uint8
+	RangedWeapon bool
 }
 
 func StatsFor(ch *db.Character, e EquipmentStats) CharacterStats {
+	var s0 CharacterStats
 	var bStr, bRec, bInt, bWis, bDex, bLuc uint32
 	baseHP, baseMP, baseSP := uint32(100), uint32(100), uint32(100)
 	curHP, curMP, curSP := uint32(100), uint32(100), uint32(100)
@@ -191,8 +235,9 @@ func StatsFor(ch *db.Character, e EquipmentStats) CharacterStats {
 		bStr, bRec, bInt, bWis, bDex, bLuc = uint32(ch.Str), uint32(ch.Rec), uint32(ch.Int), uint32(ch.Wis), uint32(ch.Dex), uint32(ch.Luc)
 		baseHP, baseMP, baseSP = basePools(ch)
 		curHP, curMP, curSP = ch.CurrentHP, ch.CurrentMP, ch.CurrentSP
+		s0.Level = ch.Level
 	}
-	var s CharacterStats
+	s := s0
 	s.Str, s.Rec, s.Int = satAdd(bStr, e.Str), satAdd(bRec, e.Rec), satAdd(bInt, e.Int)
 	s.Wis, s.Dex, s.Luc = satAdd(bWis, e.Wis), satAdd(bDex, e.Dex), satAdd(bLuc, e.Luc)
 	// basePools already counts the character's own REC/WIS/DEX; equipment
@@ -204,18 +249,7 @@ func StatsFor(ch *db.Character, e EquipmentStats) CharacterStats {
 	s.CurrentHP = min(satAdd(satAdd(curHP, e.MaxHP), dHP), s.MaxHP)
 	s.CurrentMP = min(satAdd(satAdd(curMP, e.MaxMP), dMP), s.MaxMP)
 	s.CurrentSP = min(satAdd(satAdd(curSP, e.MaxSP), dSP), s.MaxSP)
-	// CUser::SetAttack (0x00454280): physical attack STR*1.3 + DEX*0.2,
-	// magic INT*1.3 + WIS*0.2, single precision, added to the weapon's
-	// range; defense adds REC and resistance WIS. (The ranged formula,
-	// LUC*0.3 + STR + DEX*0.2, is not modeled yet.)
-	dAtk := uint32(max(float32(s.Str)*1.3+float32(s.Dex)*0.2, 0))
-	dMag := uint32(max(float32(s.Int)*1.3+float32(s.Wis)*0.2, 0))
-	s.MinAttack = satAdd(e.MinAttack, dAtk)
-	s.MaxAttack = max(satAdd(e.MaxAttack, dAtk), s.MinAttack)
-	s.MinMagic = satAdd(e.MinMagic, dMag)
-	s.MaxMagic = max(satAdd(e.MaxMagic, dMag), s.MinMagic)
-	s.Defense = satAdd(e.Defense, s.Rec)
-	s.Resistance = satAdd(e.Resistance, s.Wis)
+	setAttack(&s, e)
 	s.Absorption = e.Absorption
 	return s
 }

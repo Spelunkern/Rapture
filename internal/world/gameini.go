@@ -192,6 +192,10 @@ func LoadGameConfig(log *logx.Logger) error {
 	if err := loadItemEnchantIni(log); err != nil {
 		return fmt.Errorf("ItemEnchant.ini: %w", err)
 	}
+	if err := loadSequenceItems(log); err != nil {
+		return fmt.Errorf("SequenceItemCreate.ini: %w", err)
+	}
+	buildDropCatalog()
 	return nil
 }
 

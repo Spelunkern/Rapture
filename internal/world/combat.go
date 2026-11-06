@@ -12,6 +12,8 @@ const (
 	autoAttackRangeGrace  = 2.0
 	autoAttackCancelRange = 80.0
 	attackSuccessNormal   = 0
+	attackResultCritical  = 1
+	attackResultMiss      = 3
 	deathTypeMob          = 0x02
 )
 
@@ -53,16 +55,6 @@ func equippedWeaponCombat(items []db.Item) (weaponCombat, bool) {
 	return weaponCombat{d.Type, d.TypeID, at, r, delay}, true
 }
 
-func basicAutoAttackDamage(s CharacterStats) uint32 {
-	lo, hi := min(s.MinAttack, s.MaxAttack), max(s.MinAttack, s.MaxAttack)
-	return max(satAdd(lo, hi)/2, 1)
-}
-
-func basicMagicAttackDamage(s CharacterStats) uint32 {
-	lo, hi := min(s.MinMagic, s.MaxMagic), max(s.MinMagic, s.MaxMagic)
-	return max(satAdd(lo, hi)/2, 1)
-}
-
 func sendNear(mapID uint16, x, z, radius float32, frame []byte, label string) {
 	for _, p := range PlayersNear(mapID, x, z, radius) {
 		p.Send(frame, label)
@@ -101,17 +93,37 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 		return true
 	}
 	stats := StatsFor(ch, s.equipment())
-	result, ok := DamageMob(ch.MapID, target, basicAutoAttackDamage(stats))
+	def := db.MustDefs().Mobs[mob.MobID]
+	if def == nil {
+		return false
+	}
+	mc := mobCombatFor(def)
+	kind := attackMelee
+	if stats.RangedWeapon {
+		kind = attackRanged
+	}
+	s.lastAutoAttackAt, s.lastCombatAt = time.Now(), time.Now()
+	SetMobAggro(ch.MapID, target, ch.ID)
+	// CUser::AttackSuccess, then CUser::AttackDamage; 0x0503 result is
+	// 0 normal, 1 critical, 3 miss.
+	if !playerHits(&stats, &mc, kind) {
+		sendNear(ch.MapID, mob.PosX, mob.PosZ, CombatRadius,
+			buildCharacterMobAttack(ch.ID, mob.ID, attackResultMiss, 0), "0x0503 character mob auto attack (miss)")
+		return true
+	}
+	damage, crit := playerDamage(&stats, &mc, kind, 0, stats.AttackAttr)
+	result, ok := DamageMob(ch.MapID, target, uint32(damage))
 	if !ok {
 		return false
 	}
-	SetMobAggro(ch.MapID, target, ch.ID)
-	s.lastAutoAttackAt, s.lastCombatAt = time.Now(), time.Now()
-	s.log.Printf("Rapture World auto attack character_id=%d mob_global_id=%d mob_id=%d atk=%d-%d delay=%s range=%.2f distance=%.2f damage=%d hp=%d/%d killed=%t",
-		ch.ID, result.Mob.ID, result.Mob.MobID, stats.MinAttack, stats.MaxAttack, wc.Delay, wc.Range, distance,
-		result.DamageHP, result.Mob.CurrentHP, result.Mob.MaxHP, result.Killed)
+	code := uint8(attackSuccessNormal)
+	if crit {
+		code = attackResultCritical
+	}
+	s.log.Printf("Rapture World auto attack mob_global_id=%d mob_id=%d kind=%d damage=%d crit=%t hp=%d/%d killed=%t",
+		result.Mob.ID, result.Mob.MobID, kind, result.DamageHP, crit, result.Mob.CurrentHP, result.Mob.MaxHP, result.Killed)
 	sendNear(ch.MapID, result.Mob.PosX, result.Mob.PosZ, CombatRadius,
-		buildCharacterMobAttack(ch.ID, result.Mob.ID, attackSuccessNormal, result.DamageHP), "0x0503 character mob auto attack")
+		buildCharacterMobAttack(ch.ID, result.Mob.ID, code, result.DamageHP), "0x0503 character mob auto attack")
 	return s.resolveMobDamage(&result)
 }
 
@@ -127,7 +139,7 @@ func (s *Session) resolveMobDamage(r *MobDamageResult) bool {
 	}
 	sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, buildMobDeath(m.ID, ch.ID), "0x0606 mob death")
 	// The killer's live Y tracks terrain better than the svmap area average.
-	for _, p := range rollMobDrops(ch.MapID, m.MobID, m.MoneyMin, m.MoneyMax, ch.ID, m.PosX, ch.PosY, m.PosZ, s.logger) {
+	for _, p := range rollMobDrops(ch.MapID, m, ch.ID, ch.PosY, s.logger) {
 		sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 mob drop")
 	}
 	if m.Exp > 0 {
@@ -148,9 +160,27 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 		return false
 	}
 	s.lastCombatAt = time.Now()
+	def := db.MustDefs().Mobs[d.MobID]
+	if def == nil {
+		return false
+	}
+	// CMob::AttackSuccess / CMob::AttackDamage with the first attack slot.
+	mc := mobCombatFor(def)
+	slot := &def.Attacks[0]
+	kind := int(min(slot.Type, 2))
 	var damage uint32
-	if d.Attack > 0 {
-		damage = max(satSub(d.Attack, satAdd(stats.Defense, stats.Absorption)), 1)
+	result := uint8(attackSuccessNormal)
+	if !mobHits(&mc, &stats, kind) {
+		result = attackResultMiss
+	} else {
+		v, crit := mobDamage(&mc, slot, &stats)
+		damage = uint32(max(v, 0))
+		if stats.Absorption > 0 {
+			damage = max(satSub(damage, stats.Absorption), 1)
+		}
+		if crit {
+			result = attackResultCritical
+		}
 	}
 	newEffective := satSub(stats.CurrentHP, damage)
 	ch.CurrentHP = satSub(ch.CurrentHP, stats.CurrentHP-newEffective)
@@ -159,14 +189,10 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 		ch.Deaths++
 	}
 	s.persist()
-	result := uint8(0)
-	if killed {
-		result = 1
-	}
 	sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius,
 		buildMobAttackCharacter(result, d.MobGlobalID, ch.ID, uint16(min(damage, 65535))), "0x0605 mob attack character")
-	s.log.Printf("Rapture World mob attack character_id=%d mob_global_id=%d mob_id=%d raw_attack=%d defense=%d absorption=%d damage=%d hp=%d/%d killed=%t",
-		ch.ID, d.MobGlobalID, d.MobID, d.Attack, stats.Defense, stats.Absorption, damage, newEffective, stats.MaxHP, killed)
+	s.log.Printf("Rapture World mob attack mob_global_id=%d mob_id=%d result=%d damage=%d hp=%d/%d killed=%t",
+		d.MobGlobalID, d.MobID, result, damage, newEffective, stats.MaxHP, killed)
 	refreshed := StatsFor(ch, equip)
 	s.send(buildCurrentHitpoints(&refreshed), "0x0521 current hp after mob attack")
 	if killed {

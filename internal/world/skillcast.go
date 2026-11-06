@@ -256,21 +256,26 @@ func (s *Session) resolveSkill(target uint32, number uint8, op packet.Opcode, ca
 			return
 		}
 	}
-	base := basicAutoAttackDamage(stats)
+	// Skills.TypeAttack 3 is magic; otherwise the weapon decides melee or
+	// ranged. The skill's DamageHP adds to the attack before
+	// CUser::AttackDamage, as the original seeds damage[0].
+	kind := attackMelee
 	if def.TypeAttack == typeAttackMagic {
-		base = basicMagicAttackDamage(stats)
+		kind = attackMagic
+	} else if stats.RangedWeapon {
+		kind = attackRanged
 	}
-	damage := uint32(max(int64(base)+int64(def.DamageHP), 1))
+	extra := def.DamageHP
 	s.startCooldown(k, def)
 	s.spendDelta(uint32(def.MPCost), uint32(def.SPCost))
 	s.persist()
 	s.send(buildSkillUsedSpMp(uint32(def.SPCost), uint32(def.MPCost)), "0x050C skill used sp/mp")
-	s.log.Printf("Rapture World skill use skill_id=%d level=%d target_type=%d targets=%d damage=%d", k.SkillID, k.Level, def.TargetType, len(targets), damage)
+	s.log.Printf("Rapture World skill use skill_id=%d level=%d target_type=%d targets=%d kind=%d", k.SkillID, k.Level, def.TargetType, len(targets), kind)
 	if len(targets) == 0 {
 		s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill use (no targets hit)")
 	}
 	for _, t := range targets {
-		s.skillHit(t, damage, def, k, op)
+		s.skillHit(t, &stats, kind, extra, def, k, op)
 	}
 }
 
@@ -285,16 +290,32 @@ func mobsWithinRange(mapID uint16, x, z float32, r uint8) []uint32 {
 	return out
 }
 
-func (s *Session) skillHit(target, damage uint32, def *db.SkillDef, k db.CharacterSkill, op packet.Opcode) {
+func (s *Session) skillHit(target uint32, stats *CharacterStats, kind int, extra int32, def *db.SkillDef, k db.CharacterSkill, op packet.Opcode) {
 	ch := s.char
-	r, ok := DamageMob(ch.MapID, target, damage)
+	mob, ok := MobByID(ch.MapID, target)
+	md := db.MustDefs().Mobs[mob.MobID]
+	if !ok || md == nil {
+		return
+	}
+	mc := mobCombatFor(md)
+	SetMobAggro(ch.MapID, target, ch.ID)
+	s.lastCombatAt = time.Now()
+	if !playerHits(stats, &mc, kind) {
+		sendNear(ch.MapID, mob.PosX, mob.PosZ, CombatRadius,
+			buildSkillUseResult(op, attackResultMiss, ch.ID, mob.ID, k.SkillID, k.Level, 0, 0, 0), "skill use (miss)")
+		return
+	}
+	damage, crit := playerDamage(stats, &mc, kind, extra, stats.AttackAttr)
+	r, ok := DamageMob(ch.MapID, target, uint32(damage))
 	if !ok {
 		return
 	}
-	SetMobAggro(ch.MapID, target, ch.ID)
-	s.lastCombatAt = time.Now()
+	code := uint8(skillResultNormal)
+	if crit {
+		code = attackResultCritical
+	}
 	sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, CombatRadius,
-		buildSkillUseResult(op, skillResultNormal, ch.ID, r.Mob.ID, k.SkillID, k.Level, r.DamageHP, 0, 0), "skill use")
+		buildSkillUseResult(op, code, ch.ID, r.Mob.ID, k.SkillID, k.Level, r.DamageHP, 0, 0), "skill use")
 	s.resolveMobDamage(&r)
 	if r.Killed {
 		return
