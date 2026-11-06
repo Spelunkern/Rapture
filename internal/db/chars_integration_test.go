@@ -25,7 +25,8 @@ func TestCharacterLifecycle(t *testing.T) {
 		DELETE FROM dbo.Chars WHERE CharName='ItTestChar'`)
 
 	id, err := CreateCharacter(account, NewCharacter{Slot: 0, Race: 0, Class: 0, Name: "ItTestChar",
-		MapID: 1, PosX: 500, PosY: 50, PosZ: 500}, 100, 100, 100)
+		MapID: 1, PosX: 500, PosY: 50, PosZ: 500, Str: 14, Dex: 12, Rec: 9, Int: 8, Wis: 7, Luc: 15,
+		HP: 100, MP: 100, SP: 100})
 	if err != nil {
 		t.Fatal(err)
 	}

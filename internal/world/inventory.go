@@ -281,8 +281,7 @@ func (s *Session) handleUseItem(p []byte) {
 		s.send(buildUseItemResult(ch.ID, &res), "0x050A use item")
 		return
 	case specialResetStats:
-		ch.Str, ch.Rec, ch.Int, ch.Wis, ch.Dex, ch.Luc = baseStat, baseStat, baseStat, baseStat, baseStat, baseStat
-		ch.StatPoint = ch.Level * statPointsPerLevel
+		resetStats(ch)
 		res, err := s.consumeOne(i)
 		if err != nil {
 			s.log.Printf("Rapture World failed to consume item: %v", err)

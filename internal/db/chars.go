@@ -36,12 +36,15 @@ type Character struct {
 	PendingDelete, RenamePending      bool
 }
 
-// NewCharacter is a character-creation request.
+// NewCharacter is a character to create: the client's request plus the
+// starting stats, pools and position the world server derives for it.
 type NewCharacter struct {
 	Slot, Race, Mode, Hair, Face, Height, Class, Gender uint8
 	Name                                                string
 	MapID                                               uint16
 	PosX, PosY, PosZ                                    float32
+	Str, Dex, Rec, Int, Wis, Luc                        uint16
+	HP, MP, SP                                          uint16
 }
 
 // DeleteWindow is how long a deleted character stays restorable.
@@ -205,7 +208,9 @@ func NameTaken(name string) (bool, error) {
 
 // CreateCharacter runs usp_Create_Char_R. The procedure itself rejects
 // duplicate names (return -2) and fixes SkillPoint at 5.
-func CreateCharacter(account Account, nc NewCharacter, hp, mp, sp int16) (uint32, error) {
+// The parameters mirror the original CUser::ProcessCharacterCreate: level
+// 1, no stat or skill points, Vg 200.
+func CreateCharacter(account Account, nc NewCharacter) (uint32, error) {
 	pool, err := Pool(GameData)
 	if err != nil {
 		return 0, err
@@ -218,13 +223,13 @@ func CreateCharacter(account Account, nc NewCharacter, hp, mp, sp int16) (uint32
 		sql.Named("UserUID", account.UserUID), sql.Named("CharName", nc.Name), sql.Named("Slot", nc.Slot),
 		sql.Named("Family", nc.Race), sql.Named("Grow", nc.Mode), sql.Named("Hair", nc.Hair),
 		sql.Named("Face", nc.Face), sql.Named("Size", nc.Height), sql.Named("Job", nc.Class),
-		sql.Named("Sex", nc.Gender), sql.Named("Level", int16(1)), sql.Named("Statpoint", int16(10)),
-		sql.Named("Skillpoint", int16(0)), sql.Named("Str", int16(10)), sql.Named("Dex", int16(10)),
-		sql.Named("Rec", int16(10)), sql.Named("Int", int16(10)), sql.Named("Luc", int16(10)),
-		sql.Named("Wis", int16(10)), sql.Named("Hp", hp), sql.Named("Mp", mp), sql.Named("Sp", sp),
+		sql.Named("Sex", nc.Gender), sql.Named("Level", int16(1)), sql.Named("Statpoint", int16(0)),
+		sql.Named("Skillpoint", int16(0)), sql.Named("Str", int16(nc.Str)), sql.Named("Dex", int16(nc.Dex)),
+		sql.Named("Rec", int16(nc.Rec)), sql.Named("Int", int16(nc.Int)), sql.Named("Luc", int16(nc.Luc)),
+		sql.Named("Wis", int16(nc.Wis)), sql.Named("Hp", int16(nc.HP)), sql.Named("Mp", int16(nc.MP)), sql.Named("Sp", int16(nc.SP)),
 		sql.Named("Map", int16(nc.MapID)), sql.Named("Dir", int16(0)), sql.Named("Exp", int32(0)),
 		sql.Named("Money", int32(0)), sql.Named("Posx", nc.PosX), sql.Named("Posy", nc.PosY),
-		sql.Named("Posz", nc.PosZ), sql.Named("Hg", int16(0)), sql.Named("Vg", int16(0)),
+		sql.Named("Posz", nc.PosZ), sql.Named("Hg", int16(0)), sql.Named("Vg", int16(200)),
 		sql.Named("Cg", uint8(0)), sql.Named("Og", uint8(0)), sql.Named("Ig", uint8(0)), &status)
 	if err != nil {
 		return 0, fmt.Errorf("usp_Create_Char_R: %w", err)

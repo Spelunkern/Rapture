@@ -163,6 +163,12 @@ func TestWorldSessionAgainstSQLServer(t *testing.T) {
 		if ok, err := db.DeleteCharacter(testAccount, charID); !ok || err != nil {
 			t.Errorf("cleanup delete failed: %v", err)
 		}
+		// Remove the rows too, so test runs do not pile up pending deletions.
+		pool, _ := db.Pool(db.GameData)
+		if _, err := pool.Exec(`DELETE FROM dbo.CharItems WHERE CharID = @p1; DELETE FROM dbo.CharSkills WHERE CharID = @p1;
+			DELETE FROM dbo._DeletedChars WHERE CharID = @p1; DELETE FROM dbo.Chars WHERE CharID = @p1`, int32(charID)); err != nil {
+			t.Errorf("cleanup purge failed: %v", err)
+		}
 	}()
 
 	sel := msg(packet.SelectCharacter, 0, 0, 0, 0)

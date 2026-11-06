@@ -137,14 +137,19 @@ through the EP4.5 databases and their procedures instead.
   (attacks any player who enters `Mobs.ChaseRange`). A character reduced to
   0 HP dies and is gated (no move/attack/cast) until revived with the
   client's resurrect button or `/town`.
-- **Passive regen**: while alive, a character restores 5% of max HP/MP/SP
-  every 10 seconds, unconditionally (not paused by combat).
-- **Experience/leveling** is driven by `PS_GameDefs.dbo.ExpDefs` (exp
-  required per level/growth stage). Killing mobs awards exp (per-mob amount
-  from `Mobs.Exp`); leveling up sets HP/MP/SP from a flat, hardcoded
-  per-level curve (not DB-driven) and fully heals the character. Base stats
-  (STR/DEX/REC/INT/LUC/WIS) do **not** grow automatically with level in
-  this implementation — only HP/MP/SP scale with level.
+- **Recovery** follows the original server: every 5 seconds, out of combat,
+  a sitting character recovers 5% of its max HP/MP/SP; standing characters
+  only recover through equipment and skill bonuses.
+- **Experience/leveling** follows the original `ps_game.exe` rules (as
+  recovered by the Eternity reconstruction): `Chars.Exp` is cumulative and
+  `PS_GameDefs.dbo.ExpDefs` gives each level's total; a mob grants
+  `Mobs.Exp × (1 + 0.2 × (mob level − your level + 1))`, nothing if it is
+  more than 9 levels above you. Each level adds +1 to the class's main stat,
+  stat points (5 normal, 7 hard, 9 ultimate) and skill points (3, 4, 5), and
+  raises HP/MP/SP per `StatusDefs` (×1.1 hard, ×1.5 ultimate).
+- **New characters** get the original per-class starting stats plus the
+  race bonus, start at their race's `Map.ini` position, and receive the
+  `BaseItemsDefs` items with the weapon already equipped.
 
 ## 8. Troubleshooting
 

@@ -8,13 +8,6 @@ import (
 const (
 	defaultCharacterID = 1
 	basePoolPerLevel   = 100
-	baseStat           = 10
-	baseMinAttack      = 15
-	baseMaxAttack      = 15
-	baseMinMagic       = 15
-	baseMaxMagic       = 15
-	baseDefense        = 10
-	baseResistance     = 10
 	hpPerReaction      = 5
 	spPerDexterity     = 5
 	mpPerWisdom        = 5
@@ -26,7 +19,6 @@ const (
 	specialChangeName           = 51
 	specialResetStats           = 34
 	specialRecreationRune       = 62
-	statPointsPerLevel          = 5
 
 	InventoryFirstBag  = 1
 	InventoryLastBag   = 5
@@ -51,18 +43,6 @@ func isConsumableType(t uint8) bool {
 		}
 	}
 	return false
-}
-
-// basePools are the base max HP/MP/SP for a level and job from
-// PS_GameDefs.dbo.StatusDefs, falling back to the highest defined level.
-func basePools(level uint16, job uint8) (hp, mp, sp uint32) {
-	status := db.MustDefs().Status
-	for l := max(level, 1); l >= 1; l-- {
-		if st, ok := status[db.StatusKey{Level: l, Job: job}]; ok {
-			return st.HP, st.MP, st.SP
-		}
-	}
-	return basePoolPerLevel, basePoolPerLevel, basePoolPerLevel
 }
 
 func satAdd(a, b uint32) uint32 {
@@ -204,32 +184,38 @@ type CharacterStats struct {
 }
 
 func StatsFor(ch *db.Character, e EquipmentStats) CharacterStats {
-	bStr, bRec, bInt, bWis, bDex, bLuc := uint32(baseStat), uint32(baseStat), uint32(baseStat), uint32(baseStat), uint32(baseStat), uint32(baseStat)
+	var bStr, bRec, bInt, bWis, bDex, bLuc uint32
 	baseHP, baseMP, baseSP := uint32(100), uint32(100), uint32(100)
 	curHP, curMP, curSP := uint32(100), uint32(100), uint32(100)
 	if ch != nil {
 		bStr, bRec, bInt, bWis, bDex, bLuc = uint32(ch.Str), uint32(ch.Rec), uint32(ch.Int), uint32(ch.Wis), uint32(ch.Dex), uint32(ch.Luc)
-		baseHP, baseMP, baseSP = basePools(ch.Level, ch.Class)
+		baseHP, baseMP, baseSP = basePools(ch)
 		curHP, curMP, curSP = ch.CurrentHP, ch.CurrentMP, ch.CurrentSP
 	}
 	var s CharacterStats
 	s.Str, s.Rec, s.Int = satAdd(bStr, e.Str), satAdd(bRec, e.Rec), satAdd(bInt, e.Int)
 	s.Wis, s.Dex, s.Luc = satAdd(bWis, e.Wis), satAdd(bDex, e.Dex), satAdd(bLuc, e.Luc)
-	dHP, dMP, dSP := satMul(s.Rec, hpPerReaction), satMul(s.Wis, mpPerWisdom), satMul(s.Dex, spPerDexterity)
+	// basePools already counts the character's own REC/WIS/DEX; equipment
+	// stats add 5 per point on top.
+	dHP, dMP, dSP := satMul(e.Rec, hpPerReaction), satMul(e.Wis, mpPerWisdom), satMul(e.Dex, spPerDexterity)
 	s.MaxHP = satAdd(satAdd(baseHP, e.MaxHP), dHP)
 	s.MaxMP = satAdd(satAdd(baseMP, e.MaxMP), dMP)
 	s.MaxSP = satAdd(satAdd(baseSP, e.MaxSP), dSP)
 	s.CurrentHP = min(satAdd(satAdd(curHP, e.MaxHP), dHP), s.MaxHP)
 	s.CurrentMP = min(satAdd(satAdd(curMP, e.MaxMP), dMP), s.MaxMP)
 	s.CurrentSP = min(satAdd(satAdd(curSP, e.MaxSP), dSP), s.MaxSP)
-	dAtk := satAdd(satMul(s.Str, 13), satMul(s.Dex, 2)) / 10
-	dMag := satAdd(satMul(s.Int, 13), satMul(s.Wis, 2)) / 10
-	s.MinAttack = satAdd(satAdd(baseMinAttack, e.MinAttack), dAtk)
-	s.MaxAttack = max(satAdd(satAdd(baseMaxAttack, e.MaxAttack), dAtk), s.MinAttack)
-	s.MinMagic = satAdd(satAdd(baseMinMagic, e.MinMagic), dMag)
-	s.MaxMagic = max(satAdd(satAdd(baseMaxMagic, e.MaxMagic), dMag), s.MinMagic)
-	s.Defense = satAdd(satAdd(baseDefense, e.Defense), s.Rec)
-	s.Resistance = satAdd(satAdd(baseResistance, e.Resistance), s.Wis)
+	// CUser::SetAttack (0x00454280): physical attack STR*1.3 + DEX*0.2,
+	// magic INT*1.3 + WIS*0.2, single precision, added to the weapon's
+	// range; defense adds REC and resistance WIS. (The ranged formula,
+	// LUC*0.3 + STR + DEX*0.2, is not modeled yet.)
+	dAtk := uint32(max(float32(s.Str)*1.3+float32(s.Dex)*0.2, 0))
+	dMag := uint32(max(float32(s.Int)*1.3+float32(s.Wis)*0.2, 0))
+	s.MinAttack = satAdd(e.MinAttack, dAtk)
+	s.MaxAttack = max(satAdd(e.MaxAttack, dAtk), s.MinAttack)
+	s.MinMagic = satAdd(e.MinMagic, dMag)
+	s.MaxMagic = max(satAdd(e.MaxMagic, dMag), s.MinMagic)
+	s.Defense = satAdd(e.Defense, s.Rec)
+	s.Resistance = satAdd(e.Resistance, s.Wis)
 	s.Absorption = e.Absorption
 	return s
 }

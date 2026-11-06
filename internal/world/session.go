@@ -19,8 +19,7 @@ import (
 
 const (
 	loopTick          = 100 * time.Millisecond
-	passiveRegenTick  = 10 * time.Second
-	passiveRegenPct   = 5
+	recoveryInterval  = 5 * time.Second
 	characterListSize = MaxCharacterSlots
 )
 
@@ -66,6 +65,8 @@ type Session struct {
 	positionDirty    bool
 	lastPositionSave time.Time
 	lastRegenAt      time.Time
+	regenSitting     bool
+	lastCombatAt     time.Time
 	lastChatAt       time.Time
 }
 
@@ -184,7 +185,7 @@ func (s *Session) sendStatPackets() {
 // normalize derives the base pools from StatusDefs (Chars only stores the
 // current HP/MP/SP) and clamps the current values.
 func normalize(ch *db.Character) {
-	ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch.Level, ch.Class)
+	ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
 	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = min(ch.CurrentHP, ch.MaxHP), min(ch.CurrentMP, ch.MaxMP), min(ch.CurrentSP, ch.MaxSP)
 }
 
@@ -215,7 +216,7 @@ func (s *Session) tick(idle bool) {
 		}
 	}
 	s.processBuffs()
-	s.passiveRegen()
+	s.recoveryTick()
 	s.processPendingCast()
 	if idle && s.autoAttack && !s.autoAttackSwing(s.autoAttackTarget) {
 		s.autoAttack = false
@@ -240,26 +241,42 @@ func (s *Session) applyTradeRefresh(r *tradeRefresh) {
 	s.send(buildSetMoney(s.char.Money), "0x0213 trade refresh money")
 }
 
-// passiveRegen restores 5% of max HP/MP/SP every 10 s while alive.
-func (s *Session) passiveRegen() {
-	if time.Since(s.lastRegenAt) < passiveRegenTick {
+// recoveryTick is the original 5-second recovery: nothing in combat,
+// 5% of each max while sitting, and while standing only flat equipment
+// recovery (not modeled yet, so none). Like the original, the posture
+// seen at one tick decides the next tick's amount. Viewers get 0x0505
+// (deltas) and the character 0x0521 when a pool tops out or it sits.
+func (s *Session) recoveryTick() {
+	if time.Since(s.lastRegenAt) < recoveryInterval {
 		return
 	}
-	s.lastRegenAt = s.lastRegenAt.Add(passiveRegenTick)
-	if s.dead {
+	s.lastRegenAt = time.Now()
+	sitting := s.regenSitting
+	if s.player != nil {
+		s.regenSitting = s.player.IsSitting()
+	}
+	if s.dead || s.inCombat() || !sitting {
 		return
 	}
 	st := s.stats()
 	if st.CurrentHP == 0 {
 		return
 	}
-	hp, mp, sp := s.healDelta(st.MaxHP*passiveRegenPct/100, st.MaxMP*passiveRegenPct/100, st.MaxSP*passiveRegenPct/100)
+	hp, mp, sp := s.healDelta(sittingRecovery(st.MaxHP), sittingRecovery(st.MaxMP), sittingRecovery(st.MaxSP))
 	if hp+mp+sp == 0 {
 		return
 	}
 	s.persist()
 	after := s.stats()
-	s.send(buildCurrentHitpoints(&after), "0x0521 passive regen tick")
+	sendNear(s.char.MapID, s.char.PosX, s.char.PosZ, ViewportRadius,
+		buildCharacterReviveHitpoints(s.char.ID, hp, mp, sp), "0x0505 recover")
+	s.send(buildCurrentHitpoints(&after), "0x0521 recover set")
+}
+
+// inCombat approximates the original attack mode: swinging, or a hit
+// given or taken within the last recovery interval.
+func (s *Session) inCombat() bool {
+	return s.autoAttack || time.Since(s.lastCombatAt) < recoveryInterval
 }
 
 // deadGated lists the inputs ignored while dead (revive is 0x0553).
@@ -521,8 +538,15 @@ func (s *Session) handleCreateCharacter(p []byte) {
 		reject("slot out of range")
 		return
 	}
-	if strings.TrimSpace(nc.Name) == "" {
-		reject("empty name")
+	// CUser::PacketCharacter: spaces are dropped and at least two
+	// characters must remain; the family/job pair and mode must be valid.
+	nc.Name = strings.ReplaceAll(nc.Name, " ", "")
+	if len(nc.Name) < 2 {
+		reject("name too short")
+		return
+	}
+	if !allowedJob(nc.Race, nc.Class) || nc.Mode > s.maxMode {
+		reject("invalid race, class or mode")
 		return
 	}
 	if _, used, err := db.CharacterIDInSlot(s.accountID, nc.Slot); err != nil || used {
@@ -533,29 +557,21 @@ func (s *Session) handleCreateCharacter(p []byte) {
 		reject("name in use")
 		return
 	}
-	if nc.Race > 3 {
-		reject("invalid race")
-		return
-	}
-	// Map.ini start position per race; StatusDefs level-1 pools per job.
+	// Map.ini start position per race; CUser::ProcessCharacterCreate stats
+	// and pools.
 	start := mapConfig.Start[nc.Race]
 	nc.MapID, nc.PosX, nc.PosY, nc.PosZ = start.MapID, start.X, start.Y, start.Z
-	hp, mp, sp := basePools(1, nc.Class)
-	id, err := db.CreateCharacter(s.account, nc, int16(hp), int16(mp), int16(sp))
+	nc.Str, nc.Dex, nc.Rec, nc.Int, nc.Wis, nc.Luc = startingStats(nc.Race, nc.Class)
+	nc.HP, nc.MP, nc.SP = newCharacterPools(nc.Race, nc.Class, nc.Mode, nc.Rec, nc.Dex, nc.Wis)
+	id, err := db.CreateCharacter(s.account, nc)
 	if err != nil {
 		s.log.Printf("Rapture World create character failed: %v", err)
 		reject("database")
 		return
 	}
-	// BaseItemsDefs: the family/job starter items, in bag 1 at their slots.
-	for _, b := range db.MustDefs().BaseItems[db.BaseItemKey{Family: nc.Race, Job: nc.Class}] {
-		quality := b.Quality
-		if def := db.MustDefs().Item(b.Type, b.TypeID); def != nil && quality == 0 {
-			quality = def.Quality
-		}
-		it := db.Item{Bag: 1, Slot: b.Slot, Type: b.Type, TypeID: b.TypeID, Quality: quality, Count: max(b.Count, 1)}
+	for _, it := range starterItems(nc.Race, nc.Class) {
 		if err := db.AddCharacterItem(id, &it); err != nil {
-			s.log.Printf("Rapture World starter item %d/%d failed: %v", b.Type, b.TypeID, err)
+			s.log.Printf("Rapture World starter item %d/%d failed: %v", it.Type, it.TypeID, err)
 		}
 	}
 	s.log.Printf("Rapture World created character id=%d name=%q map=%d", id, nc.Name, nc.MapID)

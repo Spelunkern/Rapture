@@ -292,6 +292,7 @@ func (s *Session) skillHit(target, damage uint32, def *db.SkillDef, k db.Charact
 		return
 	}
 	SetMobAggro(ch.MapID, target, ch.ID)
+	s.lastCombatAt = time.Now()
 	sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, CombatRadius,
 		buildSkillUseResult(op, skillResultNormal, ch.ID, r.Mob.ID, k.SkillID, k.Level, r.DamageHP, 0, 0), "skill use")
 	s.resolveMobDamage(&r)

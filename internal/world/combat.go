@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Spelunkern/Rapture/internal/db"
+	"github.com/Spelunkern/Rapture/internal/packet"
 )
 
 const (
@@ -105,7 +106,7 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 		return false
 	}
 	SetMobAggro(ch.MapID, target, ch.ID)
-	s.lastAutoAttackAt = time.Now()
+	s.lastAutoAttackAt, s.lastCombatAt = time.Now(), time.Now()
 	s.log.Printf("Rapture World auto attack character_id=%d mob_global_id=%d mob_id=%d atk=%d-%d delay=%s range=%.2f distance=%.2f damage=%d hp=%d/%d killed=%t",
 		ch.ID, result.Mob.ID, result.Mob.MobID, stats.MinAttack, stats.MaxAttack, wc.Delay, wc.Range, distance,
 		result.DamageHP, result.Mob.CurrentHP, result.Mob.MaxHP, result.Killed)
@@ -146,6 +147,7 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 	if stats.CurrentHP == 0 {
 		return false
 	}
+	s.lastCombatAt = time.Now()
 	var damage uint32
 	if d.Attack > 0 {
 		damage = max(satSub(d.Attack, satAdd(stats.Defense, stats.Absorption)), 1)
@@ -196,20 +198,8 @@ func (s *Session) persist() {
 
 // --- experience ---
 
-// LevelCap is the highest level exposed; ExpDefs has rows up to 80.
+// LevelCap is the last level in StatusDefs and ExpDefs.
 const LevelCap = 60
-
-const expGainRatePercent = 100
-
-// scaledKillExp scales Mobs.Exp by the level difference (zero beyond -8/+6).
-func scaledKillExp(charLevel, mobLevel uint16, mobExp uint32) uint32 {
-	diff := int64(charLevel) - int64(mobLevel)
-	if diff < -8 || diff > 6 {
-		return 0
-	}
-	v := int64(mobExp) * (-24*diff + 167) / 100 * expGainRatePercent / 100
-	return uint32(min(max(v, 0), int64(^uint32(0))))
-}
 
 // applyExpGain adds exp. Chars.Exp is the cumulative total and ExpDefs
 // gives, per level and growth mode, the total needed to reach the next
@@ -226,11 +216,11 @@ func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
 		if req == 0 || ch.Exp < req {
 			break
 		}
-		ch.Level++
+		levelUp(ch)
 		levels++
 	}
 	if levels > 0 {
-		ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch.Level, ch.Class)
+		ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
 		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
 	}
 	return levels
@@ -252,12 +242,47 @@ func (s *Session) grantKillExp(mobID, mobLevel uint16, mobExp uint32) {
 	if ch == nil {
 		return
 	}
-	scaled := scaledKillExp(ch.Level, mobLevel, mobExp)
-	levels := applyExpGain(ch, scaled)
+	gained := mobExperience(mobLevel, uint16(min(mobExp, 65535)), ch.Level)
+	levels := applyExpGain(ch, gained)
 	s.persist()
 	s.log.Printf("Rapture World exp character_id=%d mob_id=%d mob_level=%d base_exp=%d gained=%d level=%d exp=%d levels_gained=%d",
-		ch.ID, mobID, mobLevel, mobExp, scaled, ch.Level, ch.Exp, levels)
-	s.sendStatPackets()
+		ch.ID, mobID, mobLevel, mobExp, gained, ch.Level, ch.Exp, levels)
+	if gained > 0 {
+		s.send(buildExpGain(gained), "0x0207 exp gained")
+	}
+	if levels > 0 {
+		// The level-up notice goes to the character (0x0508) and to the
+		// players around it (0x051E), within 60 units.
+		s.send(buildLevelUp(packet.LevelUpSelf, ch), "0x0508 level up")
+		others := buildLevelUp(packet.LevelUpOther, ch)
+		for _, o := range PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, 60) {
+			o.Send(others, "0x051E level up (nearby)")
+		}
+		s.sendStatPackets()
+	}
+}
+
+// buildExpGain (0x0207): exp gained and a second word the original sends
+// as 0.
+func buildExpGain(amount uint32) []byte {
+	w := packet.New(packet.ExpGain)
+	w.U32(amount)
+	w.U32(0)
+	return w.MustFinish()
+}
+
+// buildLevelUp (0x0508 self / 0x051E others): character id, level, stat
+// points, skill points, exp at the level's start and for the next level.
+func buildLevelUp(op packet.Opcode, ch *db.Character) []byte {
+	prev, next := expBounds(ch)
+	w := packet.New(op)
+	w.U32(ch.ID)
+	w.U16(ch.Level)
+	w.U16(ch.StatPoint)
+	w.U16(ch.SkillPoint)
+	w.U32(prev)
+	w.U32(next)
+	return w.MustFinish()
 }
 
 // grantOfflineKillExp credits a DoT kill to a caster who went offline.
@@ -266,7 +291,7 @@ func grantOfflineKillExp(characterID uint32, mobID, mobLevel uint16, mobExp uint
 	if err != nil {
 		return
 	}
-	scaled := scaledKillExp(ch.Level, mobLevel, mobExp)
+	scaled := mobExperience(mobLevel, uint16(min(mobExp, 65535)), ch.Level)
 	applyExpGain(&ch, scaled)
 	if err := db.SaveCharacter(&ch); err != nil {
 		log.Printf("Rapture World offline exp save failed character_id=%d: %v", characterID, err)
