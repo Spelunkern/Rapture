@@ -591,6 +591,20 @@ func (s *Session) handleItemBagToBag(p []byte) {
 		s.handleWarehouseMove(srcBag, srcSlot, destBag, destSlot)
 		return
 	}
+	// Anything entering an equipment slot must pass CUser::EnableEquipment;
+	// a refused move echoes the unchanged slots.
+	if !s.equipAllowed(srcBag, srcSlot, destBag, destSlot) {
+		var src, dest *db.Item
+		if i := findItem(s.items, srcBag, srcSlot); i >= 0 {
+			src = &s.items[i]
+		}
+		if i := findItem(s.items, destBag, destSlot); i >= 0 {
+			dest = &s.items[i]
+		}
+		s.log.Printf("Rapture World refused equip (%d,%d)->(%d,%d)", srcBag, srcSlot, destBag, destSlot)
+		s.send(buildBagToBag(srcBag, srcSlot, src, destBag, destSlot, dest), "0x0204 item move refused")
+		return
+	}
 	frame, ok := s.moveItem(srcBag, srcSlot, destBag, destSlot)
 	if !ok {
 		return
@@ -609,4 +623,28 @@ func (s *Session) handleItemBagToBag(p []byte) {
 	if srcBag == 0 || destBag == 0 {
 		s.sendStatPackets()
 	}
+}
+
+// equipAllowed checks both directions of a move that touches the
+// equipment bag.
+func (s *Session) equipAllowed(srcBag, srcSlot, destBag, destSlot uint8) bool {
+	defs := db.MustDefs()
+	check := func(bag, slot uint8, item int) bool {
+		if bag != 0 || item < 0 {
+			return true
+		}
+		it := s.items[item]
+		others := make([]db.Item, 0, len(s.items))
+		for i, o := range s.items {
+			if i != item && !(o.Bag == bag && o.Slot == slot) {
+				others = append(others, o)
+			}
+		}
+		return canEquip(s.char, defs.Item(it.Type, it.TypeID), slot, others)
+	}
+	if srcBag == 0 && destBag == 0 && srcSlot == destSlot {
+		return true
+	}
+	return check(destBag, destSlot, findItem(s.items, srcBag, srcSlot)) &&
+		check(srcBag, srcSlot, findItem(s.items, destBag, destSlot))
 }

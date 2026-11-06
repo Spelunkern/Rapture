@@ -218,3 +218,96 @@ func resetStats(ch *db.Character) {
 	ch.Luc += probe.Luc
 	ch.StatPoint = probe.StatPoint
 }
+
+// equipSlotRealType is the real item type each equipment slot takes in
+// CUser::EnableEquipment (0x0045b450); 0 means any weapon, -1 no check.
+var equipSlotRealType = map[uint8]int{0: 16, 1: 17, 2: 18, 3: 20, 4: 21, 5: 0, 6: 19, 7: 24, 8: 23,
+	9: 22, 10: 22, 11: 25, 12: 25}
+
+func isWeaponReal(rt uint8) bool  { return rt > 0 && rt < 16 }
+func isOneHandReal(rt uint8) bool { return rt == 1 || rt == 3 || rt == 7 || rt == 9 }
+
+// canEquip is CUser::EnableEquipment: level, slot type, two-handed
+// weapons against shields, race (Items.Country), class, mode (Items.Grow)
+// and the sex-only items (Special 64/65).
+func canEquip(ch *db.Character, def *db.ItemDef, slot uint8, items []db.Item) bool {
+	if def == nil || ch.Level < def.ReqLevel {
+		return false
+	}
+	rt := realType(def.Type)
+	equippedReal := func(s uint8) (uint8, bool) {
+		if it := equippedItem(items, s); it != nil {
+			return realType(it.Type), true
+		}
+		return 0, false
+	}
+	switch want, ok := equipSlotRealType[slot]; {
+	case slot == 5:
+		if !isWeaponReal(rt) {
+			return false
+		}
+		if _, shield := equippedReal(6); shield && !isOneHandReal(rt) {
+			return false
+		}
+	case slot == 6:
+		if int(rt) != want {
+			return false
+		}
+		if w, weapon := equippedReal(5); weapon && !isOneHandReal(w) {
+			return false
+		}
+	case slot == 13:
+		if def.Type != mountItemType {
+			return false
+		}
+	case ok && int(rt) != want:
+		return false
+	}
+	race := ch.Race
+	switch def.Country {
+	case 0, 1:
+		if race != def.Country {
+			return false
+		}
+	case 2:
+		if race != 0 && race != 1 {
+			return false
+		}
+	case 3:
+		if race != 3 {
+			return false
+		}
+	case 4:
+		if race != 2 {
+			return false
+		}
+	case 5:
+		if race != 2 && race != 3 {
+			return false
+		}
+	}
+	if int(ch.Class) >= len(def.Classes) || !def.Classes[ch.Class] {
+		return false
+	}
+	switch ch.Mode {
+	case growEasy:
+		if def.Grow != 0 {
+			return false
+		}
+	case growNormal:
+		if def.Grow > 1 {
+			return false
+		}
+	case growHard:
+		if def.Grow == 3 {
+			return false
+		}
+	}
+	switch def.Special {
+	case 64:
+		return ch.Gender != 1
+	case 65:
+		return ch.Gender != 0
+	}
+	return true
+}

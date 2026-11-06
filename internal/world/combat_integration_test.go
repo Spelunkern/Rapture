@@ -90,3 +90,47 @@ func TestNewCharacterCombat(t *testing.T) {
 			def.Attacks[0].Attack, def.Attacks[0].Plus, hits*100/2000, dmg/int32(max(hits, 1)), mhits*100/2000, mdmg/int32(max(mhits, 1)))
 	}
 }
+
+func TestEquipRules(t *testing.T) {
+	os.Chdir("../..")
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	defs := db.MustDefs()
+	for family := uint8(0); family < 4; family++ {
+		for job := uint8(0); job < 6; job++ {
+			if !allowedJob(family, job) {
+				continue
+			}
+			ch := db.Character{Level: 1, Race: family, Class: job, Mode: 1}
+			for _, it := range starterItems(family, job) {
+				if it.Bag == 0 && !canEquip(&ch, defs.Item(it.Type, it.TypeID), it.Slot, nil) {
+					t.Errorf("family %d job %d cannot equip starter %d/%d in slot %d", family, job, it.Type, it.TypeID, it.Slot)
+				}
+			}
+		}
+	}
+	for _, name := range []string{"Interloper", "Valiant", "Bulwark", "Shade", "Sylvan", "Arcanist", "Reaper", "Ironwall", "Stalker", "Viper", "Hexen", "Seer"} {
+		id, uid, found, _ := db.CharacterByName(name)
+		if !found {
+			continue
+		}
+		ch, _ := db.CharacterDetail(uid, id)
+		items, _ := db.CharacterItems(id)
+		for i, it := range items {
+			if it.Bag != 0 {
+				continue
+			}
+			others := append(append([]db.Item{}, items[:i]...), items[i+1:]...)
+			if !canEquip(&ch, defs.Item(it.Type, it.TypeID), it.Slot, others) {
+				d := defs.Item(it.Type, it.TypeID)
+				t.Logf("%s (race %d job %d mode %d sex %d) fails %d/%d %q slot %d: reqlvl %d country %d grow %d classes %v special %d",
+					name, ch.Race, ch.Class, ch.Mode, ch.Gender, it.Type, it.TypeID, d.Name, it.Slot, d.ReqLevel, d.Country, d.Grow, d.Classes, d.Special)
+			}
+		}
+	}
+}
