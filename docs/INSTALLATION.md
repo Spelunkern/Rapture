@@ -2,7 +2,7 @@
 
 This guide covers everything needed to get Rapture running from a fresh
 clone: prerequisites, build, database setup, starting the servers, and
-day-to-day usage (GM commands, trade, experience/leveling).
+day-to-day usage (chat commands, trade, experience/leveling).
 
 ## 1. Prerequisites
 
@@ -16,10 +16,6 @@ Rapture runs on **both Windows and Linux** from the same Go code.
 - **The 5.4 client** (`Game.exe`), configured to connect to your server's
   IP (see [Client Setup](#5-client-setup)).
 
-> The world server is still being ported from the former Rust code; until
-> it lands, the client can log in and see the server list but cannot enter
-> the game.
-
 ## 2. Clone & Build
 
 ```sh
@@ -29,7 +25,7 @@ tools/build.sh                                            # Linux
 powershell -ExecutionPolicy Bypass -File tools\build.ps1  # Windows
 ```
 
-This builds `build/rapture_login`, `build/rapture_world` (when present) and
+This builds `build/rapture_login`, `build/rapture_world` and
 `build/rapture_console` (`.exe` on Windows).
 
 ## 3. Database
@@ -114,31 +110,13 @@ server's LAN/public IP if connecting from elsewhere — a Linux-hosted server
 is reached the same way, just make sure ports `30800`/`30810` are open). No
 client-side patch beyond the server IP is expected.
 
-## 6. Usage: GM Commands
+## 6. Usage: Chat Commands
 
-GM commands are typed in chat like normal messages (the client strips a
-leading `/`, so `/cmove` and `cmove` both work). All of them require the
-account to be flagged as GM (see [Accounts](#accounts) above) except
-`town`, which is a normal player command.
-
-| Command | Syntax | Effect |
-|---|---|---|
-| `getitem` | `getitem <type> <typeId> [count]` | Creates an item in your inventory (default count 1) |
-| `cmove` | `cmove <mapId> [x y z]` | Teleport to another map, optionally to exact coordinates (falls back to a spawn area if omitted/invalid) |
-| `bmove` | `bmove <x> <y> <z>` | Teleport within the current map |
-| `town` | `town` | Return to the nearest town spawn for your faction (no GM required) |
-| `mmake` | `mmake <mobId> <count> [area]` | Spawn `count` mobs scattered within (25 + area) meters |
-| `mera` | `mera [area]` | Remove every mob within (25 + area) meters |
-| `nmake` | `nmake <type> <typeId>` | Spawn one NPC at your position |
-| `nera` | `nera [area]` | Remove every NPC within (5 + area) meters |
-| `mobreload` | `mobreload <mapId>` | Clear and respawn a map's `.svmap`-defined mobs |
-| `npcreload` | `npcreload <mapId>` | Same, for NPCs |
-| `set` | `set [charname] <level\|grow\|money\|statpoint\|skillpoint\|str\|dex\|rec\|int\|luc\|wis\|kills\|deaths> <amount>` | Set a stat/attribute on yourself or another character by name |
-| `char` | `char on\|off` | Toggle GM visibility to non-admins (`off` = visible, `on` = invisible, the default) |
-| `amove` | `amove <charname>` | Teleport yourself to another character's location |
-| `asummon` | `asummon <charname>` | Teleport another (online) character to your location |
-| `iclear` | `iclear [charname]` | Clear inventory (self or named character) |
-| `eclear` | `eclear [charname]` | Clear equipped items (self or named character) |
+The only chat command is `/town` (or `town`): it returns you to the nearest
+spawn area of your faction on the current map, and it also works while dead.
+The temporary GM commands of the former Rust server (`getitem`, `cmove`,
+`mmake`, `set`, ...) were not carried over; administer characters and items
+through the EP4.5 databases and their procedures instead.
 
 ## 7. Usage: Trade, Combat & Experience
 
@@ -150,11 +128,11 @@ account to be flagged as GM (see [Accounts](#accounts) above) except
   and mobs fight back with their own basic attack. `Mobs.AI = 0` is
   passive (only retaliates once attacked); `AI >= 1` is aggressive
   (attacks any player who enters `Mobs.ChaseRange`). A character reduced to
-  0 HP dies and is gated (no move/attack/cast) until revived; `/town` is
-  the current revive path.
+  0 HP dies and is gated (no move/attack/cast) until revived with the
+  client's resurrect button or `/town`.
 - **Passive regen**: while alive, a character restores 5% of max HP/MP/SP
   every 10 seconds, unconditionally (not paused by combat).
-- **Experience/leveling** is driven by `gamedata.db`'s `ExpDefs` table (exp
+- **Experience/leveling** is driven by `PS_GameDefs.dbo.ExpDefs` (exp
   required per level/growth stage). Killing mobs awards exp (per-mob amount
   from `Mobs.Exp`); leveling up sets HP/MP/SP from a flat, hardcoded
   per-level curve (not DB-driven) and fully heals the character. Base stats

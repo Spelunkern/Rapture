@@ -1,0 +1,342 @@
+package db
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+)
+
+// PS_GameDefs is static game content. Like the original server, Rapture
+// loads it once at world startup and serves lookups from memory.
+
+type ItemKey struct{ Type, TypeID uint8 }
+
+// ItemDef is one PS_GameDefs.dbo.Items row.
+type ItemDef struct {
+	ItemID                                 int32
+	Name                                   string
+	Type, TypeID                           uint8
+	ReqLevel                               uint16
+	Country                                uint8
+	Classes                                [6]bool // Attackfighter..Defensemage, indexed by Job
+	Grow                                   uint8
+	ReqStr, ReqDex, ReqRec, ReqInt, ReqWis int16
+	ReqLuc                                 int32
+	ReqIg                                  uint8
+	Range                                  int16
+	AttackTime                             uint8
+	Special                                uint8
+	Slot                                   uint8
+	Quality                                uint16
+	Effect1, Effect2, Effect3, Effect4     int16
+	ConstHP, ConstSP, ConstMP              int16
+	ConstStr, ConstDex, ConstRec           int16
+	ConstInt, ConstWis, ConstLuc           int16
+	Buy, Sell                              int32
+	Grade                                  uint16
+	Server                                 uint8
+	Count                                  uint8
+}
+
+// MaxStack is the stack size (Items.Count, at least 1).
+func (d *ItemDef) MaxStack() uint8 { return max(d.Count, 1) }
+
+type SkillKey struct {
+	SkillID uint16
+	Level   uint8
+}
+
+// SkillDef is one PS_GameDefs.dbo.Skills row. ClassEligible is indexed by
+// Chars.Job: Attackfighter, Defensefighter, Patrolrogue, Shootrogue,
+// Attackmage, Defensemage. EP4.5 has three AbilityType/Value pairs.
+type SkillDef struct {
+	SkillID                                  uint16
+	SkillLevel                               uint8
+	Name                                     string
+	Country                                  uint8
+	ReqLevel                                 uint16
+	Grow                                     uint8
+	SkillPointCost                           uint8
+	PrevSkillID                              uint16
+	ClassEligible                            [6]bool
+	MPCost, SPCost                           uint16
+	ResetTimeSeconds                         uint16
+	DamageHP, AddDamageHP                    int32
+	HealHP, HealSP, HealMP                   int32
+	TypeDetail                               uint16
+	KeepTime                                 uint16
+	TimeHealHP, TimeHealSP, TimeHealMP       int32
+	ReadyTime                                uint8
+	AbilityType                              [3]uint8
+	AbilityValue                             [3]int16
+	TimeDamageHP, TimeDamageSP, TimeDamageMP int32
+	AttackRange                              uint8
+	TypeAttack                               uint8
+	TargetType, ApplyRange, MultiAttack      uint8
+}
+
+// MobDef is the subset of PS_GameDefs.dbo.Mobs the world uses.
+type MobDef struct {
+	MobID              uint16
+	Name               string
+	Level              uint16
+	MaxHP              uint32
+	MoneyMin, MoneyMax uint32
+	RespawnSeconds     uint64 // 0: does not respawn
+	Exp                uint32
+	Attack             uint32
+	AI                 uint8
+	ChaseRange         float32
+}
+
+type MobDrop struct {
+	MobID     uint16
+	ItemOrder uint8
+	Grade     uint16
+	DropRate  uint32
+}
+
+type ProductItem struct{ Type, TypeID, Count uint8 }
+
+type Product struct {
+	Code    string
+	Name    string
+	BuyCost uint32
+	Items   []ProductItem
+}
+
+type ExpKey struct {
+	Level uint16
+	Grow  uint8 // ExpDefs.Grow, 1-4 (Chars.Grow + 1)
+}
+
+// Defs holds every PS_GameDefs table the world needs.
+type Defs struct {
+	Items        map[ItemKey]*ItemDef
+	ItemsByGrade map[uint16][]*ItemDef
+	Skills       map[SkillKey]*SkillDef
+	Mobs         map[uint16]*MobDef
+	MobDrops     map[uint16][]MobDrop
+	Exp          map[ExpKey]uint32
+	Products     map[string]*Product
+}
+
+var (
+	defsOnce sync.Once
+	defs     *Defs
+	defsErr  error
+)
+
+// Definitions returns the cached definitions, loading them on first use.
+func Definitions() (*Defs, error) {
+	defsOnce.Do(func() { defs, defsErr = loadDefs() })
+	return defs, defsErr
+}
+
+// MustDefs is for code paths that run only after a successful startup load.
+func MustDefs() *Defs {
+	d, err := Definitions()
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
+func clampU8(v int64) uint8 {
+	return uint8(min(max(v, 0), 255))
+}
+
+func clampU16(v int64) uint16 {
+	return uint16(min(max(v, 0), 65535))
+}
+
+// MobRespawnSeconds maps Mobs.Attackspecial3 to the respawn delay.
+func MobRespawnSeconds(special uint8) uint64 {
+	table := []uint64{40, 40, 60, 3 * 60, 8 * 60, 12 * 60, 15 * 60, 30 * 60, 45 * 60, 60 * 60,
+		12 * 3600, 24 * 3600, 3 * 86400, 4 * 86400, 6 * 86400, 7 * 86400}
+	if int(special) < len(table) {
+		return table[special]
+	}
+	return 0
+}
+
+func loadDefs() (*Defs, error) {
+	pool, err := Pool(GameDefs)
+	if err != nil {
+		return nil, err
+	}
+	d := &Defs{Items: map[ItemKey]*ItemDef{}, ItemsByGrade: map[uint16][]*ItemDef{},
+		Skills: map[SkillKey]*SkillDef{}, Mobs: map[uint16]*MobDef{}, MobDrops: map[uint16][]MobDrop{},
+		Exp: map[ExpKey]uint32{}, Products: map[string]*Product{}}
+	c, cancel := longCtx()
+	defer cancel()
+
+	rows, err := pool.QueryContext(c, `SELECT ItemID, ISNULL(ItemName,''), Type, TypeID, Reqlevel, Country,
+		Attackfighter, Defensefighter, Patrolrogue, Shootrogue, Attackmage, Defensemage, Grow,
+		ReqStr, ReqDex, ReqRec, ReqInt, ReqWis, Reqluc, ReqIg, Range, AttackTime, Special, Slot, Quality,
+		Effect1, Effect2, Effect3, Effect4, ConstHP, ConstSP, ConstMP, ConstStr, ConstDex, ConstRec,
+		ConstInt, ConstWis, ConstLuc, Buy, Sell, Grade, Server, Count FROM dbo.Items`)
+	if err != nil {
+		return nil, fmt.Errorf("load Items: %w", err)
+	}
+	for rows.Next() {
+		var it ItemDef
+		var reqLevel, quality, grade int64
+		var classes [6]uint8
+		if err := rows.Scan(&it.ItemID, &it.Name, &it.Type, &it.TypeID, &reqLevel, &it.Country,
+			&classes[0], &classes[1], &classes[2], &classes[3], &classes[4], &classes[5], &it.Grow,
+			&it.ReqStr, &it.ReqDex, &it.ReqRec, &it.ReqInt, &it.ReqWis, &it.ReqLuc, &it.ReqIg, &it.Range,
+			&it.AttackTime, &it.Special, &it.Slot, &quality, &it.Effect1, &it.Effect2, &it.Effect3, &it.Effect4,
+			&it.ConstHP, &it.ConstSP, &it.ConstMP, &it.ConstStr, &it.ConstDex, &it.ConstRec, &it.ConstInt,
+			&it.ConstWis, &it.ConstLuc, &it.Buy, &it.Sell, &grade, &it.Server, &it.Count); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan Items: %w", err)
+		}
+		it.Name = strings.TrimRight(it.Name, " ")
+		it.ReqLevel, it.Quality, it.Grade = clampU16(reqLevel), clampU16(quality), clampU16(grade)
+		for i, v := range classes {
+			it.Classes[i] = v != 0
+		}
+		item := it
+		d.Items[ItemKey{it.Type, it.TypeID}] = &item
+		if item.Grade > 0 && item.Type > 0 && item.TypeID > 0 {
+			d.ItemsByGrade[item.Grade] = append(d.ItemsByGrade[item.Grade], &item)
+		}
+	}
+	rows.Close()
+
+	rows, err = pool.QueryContext(c, `SELECT SkillID, SkillLevel, ISNULL(SkillName,''), Country, ReqLevel, Grow,
+		SkillPoint, PrevSkillID, Attackfighter, Defensefighter, Patrolrogue, Shootrogue, Attackmage, Defensemage,
+		SP, MP, ResetTime, ReadyTime, DamageHP, AddDamageHP, HealHP, HealSP, HealMP, TypeDetail, KeepTime,
+		TimeHealHP, TimeHealSP, TimeHealMP, AbilityType1, AbilityValue1, AbilityType2, AbilityValue2,
+		AbilityType3, AbilityValue3, TimeDamageHP, TimeDamageSP, TimeDamageMP, AttackRange, TypeAttack,
+		TargetType, ApplyRange, MultiAttack FROM dbo.Skills`)
+	if err != nil {
+		return nil, fmt.Errorf("load Skills: %w", err)
+	}
+	for rows.Next() {
+		var s SkillDef
+		var skillID, reqLevel, prev, sp, mp, reset, typeDetail, keep int64
+		var classes [6]uint8
+		if err := rows.Scan(&skillID, &s.SkillLevel, &s.Name, &s.Country, &reqLevel, &s.Grow, &s.SkillPointCost,
+			&prev, &classes[0], &classes[1], &classes[2], &classes[3], &classes[4], &classes[5], &sp, &mp,
+			&reset, &s.ReadyTime, &s.DamageHP, &s.AddDamageHP, &s.HealHP, &s.HealSP, &s.HealMP, &typeDetail,
+			&keep, &s.TimeHealHP, &s.TimeHealSP, &s.TimeHealMP, &s.AbilityType[0], &s.AbilityValue[0],
+			&s.AbilityType[1], &s.AbilityValue[1], &s.AbilityType[2], &s.AbilityValue[2], &s.TimeDamageHP,
+			&s.TimeDamageSP, &s.TimeDamageMP, &s.AttackRange, &s.TypeAttack, &s.TargetType, &s.ApplyRange,
+			&s.MultiAttack); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan Skills: %w", err)
+		}
+		s.SkillID, s.ReqLevel, s.PrevSkillID = clampU16(skillID), clampU16(reqLevel), clampU16(prev)
+		s.SPCost, s.MPCost, s.ResetTimeSeconds = clampU16(sp), clampU16(mp), clampU16(reset)
+		s.TypeDetail, s.KeepTime = clampU16(typeDetail), clampU16(keep)
+		for i, v := range classes {
+			s.ClassEligible[i] = v != 0
+		}
+		skill := s
+		d.Skills[SkillKey{s.SkillID, s.SkillLevel}] = &skill
+	}
+	rows.Close()
+
+	rows, err = pool.QueryContext(c, `SELECT MobID, ISNULL(MobName,''), Level, HP, Money1, Money2, Attackspecial3,
+		Exp, Attack1, AI, ChaseRange FROM dbo.Mobs`)
+	if err != nil {
+		return nil, fmt.Errorf("load Mobs: %w", err)
+	}
+	for rows.Next() {
+		var mobID, level, hp, money1, money2, exp, attack, chase int64
+		var special, ai uint8
+		var name string
+		if err := rows.Scan(&mobID, &name, &level, &hp, &money1, &money2, &special, &exp, &attack, &ai, &chase); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan Mobs: %w", err)
+		}
+		if mobID <= 0 {
+			continue
+		}
+		d.Mobs[uint16(mobID)] = &MobDef{MobID: uint16(mobID), Name: strings.TrimRight(name, " "),
+			Level: max(clampU16(level), 1), MaxHP: uint32(max(hp, 1)), MoneyMin: uint32(max(money1, 0)),
+			MoneyMax: uint32(max(money2, 0)), RespawnSeconds: MobRespawnSeconds(special),
+			Exp: uint32(max(exp, 0)), Attack: uint32(max(attack, 0)), AI: ai, ChaseRange: float32(max(chase, 0))}
+	}
+	rows.Close()
+
+	rows, err = pool.QueryContext(c, `SELECT MobID, ItemOrder, Grade, DropRate FROM dbo.MobItems
+		WHERE Grade > 0 AND DropRate > 0 ORDER BY MobID, ItemOrder`)
+	if err != nil {
+		return nil, fmt.Errorf("load MobItems: %w", err)
+	}
+	for rows.Next() {
+		var mobID, grade, rate int64
+		var order uint8
+		if err := rows.Scan(&mobID, &order, &grade, &rate); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan MobItems: %w", err)
+		}
+		if mobID > 0 {
+			d.MobDrops[uint16(mobID)] = append(d.MobDrops[uint16(mobID)],
+				MobDrop{MobID: uint16(mobID), ItemOrder: order, Grade: clampU16(grade), DropRate: uint32(rate)})
+		}
+	}
+	rows.Close()
+
+	rows, err = pool.QueryContext(c, `SELECT Level, Grow, Exp FROM dbo.ExpDefs`)
+	if err != nil {
+		return nil, fmt.Errorf("load ExpDefs: %w", err)
+	}
+	for rows.Next() {
+		var level, exp int64
+		var grow uint8
+		if err := rows.Scan(&level, &grow, &exp); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan ExpDefs: %w", err)
+		}
+		d.Exp[ExpKey{clampU16(level), grow}] = uint32(max(exp, 0))
+	}
+	rows.Close()
+
+	var columns strings.Builder
+	for i := 1; i <= 24; i++ {
+		fmt.Fprintf(&columns, ", ISNULL(ItemID%d,0), ISNULL(ItemCount%d,0)", i, i)
+	}
+	rows, err = pool.QueryContext(c, `SELECT ISNULL(ProductCode,''), ISNULL(ProductName,''), ISNULL(BuyCost,0)`+
+		columns.String()+` FROM dbo.ProductList`)
+	if err != nil {
+		return nil, fmt.Errorf("load ProductList: %w", err)
+	}
+	for rows.Next() {
+		var p Product
+		var cost int64
+		ids := make([]int64, 24)
+		counts := make([]uint8, 24)
+		dest := []any{&p.Code, &p.Name, &cost}
+		for i := range 24 {
+			dest = append(dest, &ids[i], &counts[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan ProductList: %w", err)
+		}
+		p.Code, p.Name, p.BuyCost = strings.TrimRight(p.Code, " "), strings.TrimRight(p.Name, " "), uint32(max(cost, 0))
+		for i := range 24 {
+			if ids[i] > 0 && counts[i] > 0 {
+				p.Items = append(p.Items, ProductItem{clampU8(ids[i] / 1000), clampU8(ids[i] % 1000), counts[i]})
+			}
+		}
+		product := p
+		if product.Code != "" {
+			d.Products[product.Code] = &product
+		}
+	}
+	rows.Close()
+	return d, nil
+}
+
+// Item returns the definition for (type, typeID), or nil.
+func (d *Defs) Item(itemType, typeID uint8) *ItemDef { return d.Items[ItemKey{itemType, typeID}] }
+
+// Skill returns the definition for (skillID, level), or nil.
+func (d *Defs) Skill(skillID uint16, level uint8) *SkillDef {
+	return d.Skills[SkillKey{skillID, level}]
+}

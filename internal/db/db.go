@@ -71,3 +71,8 @@ func Open(databases ...string) error {
 func ctx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), Timeout)
 }
+
+// longCtx bounds bulk startup loads.
+func longCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 2*time.Minute)
+}

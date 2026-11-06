@@ -10,13 +10,12 @@ Rapture is written in Go and runs on both Windows and Linux. It stores data
 in SQL Server, using the original EP4.5 databases (`PS_UserData`,
 `PS_GameData`, `PS_GameDefs`, ...) and their stored procedures.
 
-**Status:** the Rust implementation was replaced by Go in November 2026. The
-login server is ported and works against SQL Server; the world server is
-being ported module by module and is not playable yet.
+**Status:** the Rust implementation was replaced by Go in November 2026.
+Login and world both run on SQL Server with the EP4.5 databases.
 
 **New here?** See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full
 installation and usage guide (Windows and Linux, prerequisites, database,
-running the servers, GM commands, trade/experience). This README is a quick
+running the servers, chat commands, trade/experience). This README is a quick
 reference.
 
 ## Goals
@@ -65,7 +64,9 @@ replaced. Requires Docker.
 ## Layout
 
 - `cmd/rapture_login`: login server, TCP `127.0.0.1:30800`.
-- `cmd/rapture_world`: world server, TCP `127.0.0.1:30810` (being ported).
+- `cmd/rapture_world`: world server, TCP `127.0.0.1:30810`.
+- `internal/world`: the game itself (maps, entities, combat, skills, items,
+  trade, item mall, the per-connection session).
 - `cmd/rapture_console`: terminal console that starts and stops both.
 - `internal/`: packets, crypto, logging, configuration, the SQL Server
   access layer (`internal/db`) and the login-to-world session handoff.
@@ -90,7 +91,14 @@ BSD 3-Clause. See [LICENSE](LICENSE).
   `UserLoginStatus` rows), the original status-to-result mapping, server list
   and the session handoff to world. Covered by crypto parity tests against
   the former Rust implementation and a SQL Server integration test.
-- **World (Go):** being ported from the former Rust server (character
-  select/creation, movement, combat, skills, inventory, trade, warehouse,
-  item mall, GM commands). The Rust sources remain in git history before
-  the Go switch.
+- **World (Go):** character select/creation/deletion/rename, maps from
+  `.svmap` (NPCs, mob spawns, portals, spawn areas), movement and
+  visibility, mob AI (roam, aggro, chase, respawn), auto-attack and skills
+  (damage, heals, buffs, DoTs, cast times), death and revive, experience,
+  inventory, drops, NPC shop selling, warehouse, enchanting, gems,
+  recreation runes, mounts, player trade and the item mall (buy, gifts,
+  gift box). Character, item, skill, quick-slot and buff state goes through
+  the original `PS_GameData` procedures; definitions come from
+  `PS_GameDefs`. The temporary GM commands were dropped; `/town` remains.
+  Covered by a SQL Server integration test that plays a synthetic client.
+  The Rust sources remain in git history before the Go switch.
