@@ -39,6 +39,8 @@ type pendingDamage struct {
 	MobGlobalID uint32
 	MobID       uint16
 	Attack      uint32
+	Slot        uint8
+	First       bool // the skill's selected target (0x060D), else 0x060B
 }
 
 // ConnectedPlayer is a player in the world, reachable from any session for
@@ -279,9 +281,9 @@ func (p *ConnectedPlayer) TakeTradeRefresh() *tradeRefresh {
 	return r
 }
 
-func (p *ConnectedPlayer) QueueDamage(mobGlobalID uint32, mobID uint16, attack uint32) {
+func (p *ConnectedPlayer) QueueDamage(d pendingDamage) {
 	p.mailMu.Lock()
-	p.damage = append(p.damage, pendingDamage{mobGlobalID, mobID, attack})
+	p.damage = append(p.damage, d)
 	p.mailMu.Unlock()
 }
 

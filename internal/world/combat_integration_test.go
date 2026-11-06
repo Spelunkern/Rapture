@@ -40,10 +40,10 @@ func TestCombatNumbers(t *testing.T) {
 			for range 2000 {
 				if playerHits(&st, &mc, attackMelee) {
 					hits++
-					d, _ := playerDamage(&st, &mc, attackMelee, 0, st.AttackAttr)
+					d, _ := playerDamage(&st, &mc, attackMelee, st.AttackAttr, false)
 					dmg += d
 				}
-				if mobHits(&mc, &st, int(def.Attacks[0].Type)) {
+				if mobHits(&mc, &st, attackMelee) {
 					mhits++
 					d, _ := mobDamage(&mc, &def.Attacks[0], &st)
 					mdmg += d
@@ -81,10 +81,10 @@ func TestNewCharacterCombat(t *testing.T) {
 		for range 2000 {
 			if playerHits(&st, &mc, attackMelee) {
 				hits++
-				d, _ := playerDamage(&st, &mc, attackMelee, 0, st.AttackAttr)
+				d, _ := playerDamage(&st, &mc, attackMelee, st.AttackAttr, false)
 				dmg += d
 			}
-			if mobHits(&mc, &st, int(def.Attacks[0].Type)) {
+			if mobHits(&mc, &st, attackMelee) {
 				mhits++
 				d, _ := mobDamage(&mc, &def.Attacks[0], &st)
 				mdmg += d
@@ -138,5 +138,68 @@ func TestEquipRules(t *testing.T) {
 					name, ch.Race, ch.Class, ch.Mode, ch.Gender, it.Type, it.TypeID, d.Name, it.Slot, d.ReqLevel, d.Country, d.Grow, d.Classes, d.Special)
 			}
 		}
+	}
+}
+
+// TestSkillCombat runs every player attack skill (levels 1-3) and every
+// mob skill through the original success and damage modes against a real
+// mob and character, checking the results stay in the original limits.
+func TestSkillCombat(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	id, uid, found, err := db.CharacterByName("Arcanist")
+	if err != nil || !found {
+		t.Skip("Arcanist not found")
+	}
+	ch, _ := db.CharacterDetail(uid, id)
+	items, _ := db.CharacterItems(id)
+	st := StatsFor(&ch, GetEquipmentStats(items))
+	md := db.MustDefs().Mobs[103]
+	mc := mobCombatFor(md)
+	modes := map[uint8]int{}
+	players, mobs := 0, 0
+	for _, def := range db.MustDefs().Skills {
+		if def.TypeEffect != typeEffectAttack && def.TypeEffect != typeEffectDebuff {
+			continue
+		}
+		if def.Kind > 2 || def.DefenceType > 2 {
+			t.Fatalf("skill %d/%d not normalized: kind %d defence %d", def.SkillID, def.SkillLevel, def.Kind, def.DefenceType)
+		}
+		if def.MobSkill {
+			mobs++
+			dmg, _ := mobSkillDamage(&mc, md, def, &st, md.MaxHP)
+			_ = mobSkillHits(&mc, md, def, &st)
+			if dmg[0] > maxDamage || (def.DamageType != 0 && dmg[0] < 0) {
+				t.Errorf("mob skill %d mode %d damage %v", def.SkillID, def.DamageType, dmg)
+			}
+			continue
+		}
+		players++
+		modes[def.DamageType]++
+		target := skillTarget{MaxHP: md.MaxHP, HP: md.MaxHP, MaxMP: md.MaxMP, MaxSP: md.MaxSP, MP: md.MaxMP, SP: md.MaxSP}
+		dmg, _ := playerSkillDamage(&st, &mc, def, target, [3]uint32{st.CurrentHP, st.CurrentSP, st.CurrentMP}, false)
+		_ = playerSkillHits(&st, &mc, md, def)
+		weapon := def.DamageType == 1 || def.DamageType == 2 || def.DamageType > 5
+		if dmg[0] > maxDamage || (weapon && dmg[0] < 1) || (!weapon && def.DamageType != 0 && def.DamageHP != 0 && dmg[0] < 1) {
+			t.Errorf("skill %d/%d mode %d damage %v", def.SkillID, def.SkillLevel, def.DamageType, dmg)
+		}
+	}
+	t.Logf("player attack/debuff skills %d by mode %v, mob skills %d", players, modes, mobs)
+	if players == 0 || mobs == 0 {
+		t.Fatal("no skills loaded")
+	}
+	var e EquipmentStats
+	e.WeaponType = 5
+	applyPassives(&e, []db.CharacterSkill{})
+	if e.ItemAttack != 0 {
+		t.Fatal("passives without skills changed the attack")
 	}
 }

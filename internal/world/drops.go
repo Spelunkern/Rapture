@@ -162,7 +162,8 @@ func sequenceItem(level uint16, objectID uint32) *db.ItemDef {
 	return nil
 }
 
-// dropPosition scatters loot within half a unit of the mob.
+// dropPosition is CMob::GetDropPosRand: within half a unit of the mob, with
+// Y 0 (the server has no terrain heights; the client places it).
 func dropPosition(x, z float32) (float32, float32) {
 	return x + float32(rand.IntN(1000))/1000 - 0.5, z + float32(rand.IntN(1000))/1000 - 0.5
 }
@@ -172,12 +173,12 @@ func dropPosition(x, z float32) (float32, float32) {
 //
 // With two or more party members in range, the gold is split evenly among
 // them instead of dropped (at least 1 each).
-func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, y float32, party []*ConnectedPlayer, log logPrinter) [][]byte {
+func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, party []*ConnectedPlayer, log logPrinter) [][]byte {
 	defs := db.MustDefs()
 	var packets [][]byte
 	place := func(def *db.ItemDef, money uint32) {
 		x, z := dropPosition(mob.PosX, mob.PosZ)
-		mi := MapItem{ID: nextMapItemID(), OwnerID: ownerID, DroppedAt: time.Now(), PosX: x, PosY: y, PosZ: z}
+		mi := MapItem{ID: nextMapItemID(), OwnerID: ownerID, DroppedAt: time.Now(), PosX: x, PosZ: z}
 		if def != nil {
 			mi.Item = db.Item{Type: def.Type, TypeID: def.TypeID, Quality: def.Quality, Count: 1}
 		} else {

@@ -175,8 +175,12 @@ func (s *Session) send(frame []byte, label string) {
 	}
 }
 
-func (s *Session) equipment() EquipmentStats { return addBuffs(GetEquipmentStats(s.items), s.buffs) }
-func (s *Session) stats() CharacterStats     { return StatsFor(s.char, s.equipment()) }
+func (s *Session) equipment() EquipmentStats {
+	e := GetEquipmentStats(s.items)
+	applyPassives(&e, s.skills)
+	return addBuffs(e, s.buffs)
+}
+func (s *Session) stats() CharacterStats { return StatsFor(s.char, s.equipment()) }
 
 func (s *Session) sendStatPackets() {
 	if s.char == nil {
@@ -229,6 +233,7 @@ func (s *Session) tick(idle bool) {
 			if s.applyIncomingMobDamage(d) {
 				s.dead, s.autoAttack, s.cast = true, false, nil
 				s.lastAutoAttackAt = time.Time{}
+				s.clearBuffsOnDeath()
 			}
 		}
 	}

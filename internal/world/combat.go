@@ -76,6 +76,12 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 		s.log.Printf("Rapture World cancelled auto attack without valid weapon character_id=%d mob_global_id=%d", ch.ID, target)
 		return false
 	}
+	stats := StatsFor(ch, s.equipment())
+	// CUser::GetAttackSpeedNow: the swing index moves with gems, passives
+	// and buffs (0..9 over g_ConstUserAttackSpeed).
+	if idx := min(max(int32(wc.AttackTime)-1+stats.AttackSpeed, 0), 9); idx != int32(wc.AttackTime)-1 {
+		wc.Delay, _ = weaponAttackDelay(uint8(idx + 1))
+	}
 	if !s.lastAutoAttackAt.IsZero() && time.Since(s.lastAutoAttackAt) < wc.Delay {
 		return true
 	}
@@ -84,15 +90,21 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 		s.log.Printf("Rapture World cancelled auto attack unknown or dead mob character_id=%d mob_global_id=%d", ch.ID, target)
 		return false
 	}
+	// CUser::EnableAttackRange: weapon reach + mob size + 2.3, plus the
+	// movement allowance (at least 2 units).
+	size := float32(0)
+	if md := db.MustDefs().Mobs[mob.MobID]; md != nil {
+		size = float32(md.Size)
+	}
+	reach := wc.Range + float32(stats.Range) + size + 2.3 + autoAttackRangeGrace
 	distance := DistanceXZ(ch.PosX, ch.PosZ, mob.PosX, mob.PosZ)
-	if distance > wc.Range+autoAttackRangeGrace {
+	if distance > reach {
 		if distance > autoAttackCancelRange {
 			s.log.Printf("Rapture World cancelled auto attack target too far character_id=%d mob_global_id=%d distance=%.2f", ch.ID, target, distance)
 			return false
 		}
 		return true
 	}
-	stats := StatsFor(ch, s.equipment())
 	def := db.MustDefs().Mobs[mob.MobID]
 	if def == nil {
 		return false
@@ -111,7 +123,8 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 			buildCharacterMobAttack(ch.ID, mob.ID, attackResultMiss, 0), "0x0503 character mob auto attack (miss)")
 		return true
 	}
-	damage, crit := playerDamage(&stats, &mc, kind, 0, stats.AttackAttr)
+	closeRanged := DistanceXZ(ch.PosX, ch.PosZ, mob.PosX, mob.PosZ) <= closeRangeDistance
+	damage, crit := playerDamage(&stats, &mc, kind, stats.AttackAttr, closeRanged)
 	result, ok := DamageMob(ch.MapID, target, uint32(damage))
 	if !ok {
 		return false
@@ -138,12 +151,13 @@ func (s *Session) resolveMobDamage(r *MobDamageResult) bool {
 		return true
 	}
 	sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, buildMobDeath(m.ID, ch.ID), "0x0606 mob death")
-	// The killer's live Y tracks terrain better than the svmap area average.
-	rewardKill(s.player, ch.ID, ch.MapID, m, ch.PosY, s.logger)
+	rewardKill(s.player, ch.ID, ch.MapID, m, s.logger)
 	return false
 }
 
-// applyIncomingMobDamage applies one queued mob hit; true when it killed.
+// applyIncomingMobDamage applies one queued mob attack; true when it
+// killed. Slot attacks with a skill (Attacktype = a level-100 Skills row)
+// go through CMob::AttackUser(skill); others are CMob::Attack.
 func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 	ch := s.char
 	if ch == nil {
@@ -159,13 +173,17 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 	if def == nil {
 		return false
 	}
-	// CMob::AttackSuccess / CMob::AttackDamage with the first attack slot.
 	mc := mobCombatFor(def)
-	slot := &def.Attacks[0]
-	kind := int(min(slot.Type, 2))
+	slot := &def.Attacks[min(d.Slot, 2)]
+	if slot.Type != 0 {
+		if sk := db.MustDefs().Skill(slot.Type, 100); sk != nil {
+			return s.applyMobSkill(d, def, &mc, sk, &stats)
+		}
+	}
+	// CMob::AttackSuccess / CMob::AttackDamage: normal attacks are melee.
 	var damage uint32
 	result := uint8(attackSuccessNormal)
-	if !mobHits(&mc, &stats, kind) {
+	if !mobHits(&mc, &stats, attackMelee) {
 		result = attackResultMiss
 	} else {
 		v, crit := mobDamage(&mc, slot, &stats)
@@ -177,32 +195,136 @@ func (s *Session) applyIncomingMobDamage(d pendingDamage) bool {
 			result = attackResultCritical
 		}
 	}
-	newEffective := satSub(stats.CurrentHP, damage)
-	ch.CurrentHP = satSub(ch.CurrentHP, stats.CurrentHP-newEffective)
-	killed := damage > 0 && newEffective == 0
+	killed := s.takeMobDamage(d, damage, &stats)
+	sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius,
+		buildMobAttackCharacter(result, d.MobGlobalID, ch.ID, uint16(min(damage, 65535))), "0x0605 mob attack character")
+	s.log.Printf("Rapture World mob attack mob_global_id=%d mob_id=%d slot=%d result=%d damage=%d killed=%t",
+		d.MobGlobalID, d.MobID, d.Slot, result, damage, killed)
+	s.afterMobDamage(d, killed)
+	return killed
+}
+
+// applyMobSkill is a mob skill on this player: 0x060D on the selected
+// target, 0x060B on area or repeated hits, 0x060C for a drain (the mob
+// heals), then 0x060E for the skill's AddDamage.
+func (s *Session) applyMobSkill(d pendingDamage, md *db.MobDef, mc *mobCombat, sk *db.SkillDef, stats *CharacterStats) bool {
+	ch := s.char
+	mob, _ := MobByID(ch.MapID, d.MobGlobalID)
+	hits := 1
+	if sk.TypeDetail == detailMulti {
+		hits = int(sk.MultiAttack)
+	}
+	killed := false
+	for i := 0; i < hits && !killed; i++ {
+		first := d.First && sk.TypeDetail != detailMulti
+		drain := first && sk.TypeDetail == detailDrain
+		var damage [3]int32
+		result := uint8(attackSuccessNormal)
+		if !mobSkillHits(mc, md, sk, stats) {
+			result = attackResultMiss
+		} else {
+			var crit bool
+			damage, crit = mobSkillDamage(mc, md, sk, stats, mob.CurrentHP)
+			if crit {
+				result = attackResultCritical
+			}
+		}
+		hp := uint32(max(damage[0], 0))
+		killed = s.takeMobDamage(d, hp, stats)
+		words := [3]uint16{uint16(min(hp, 65535)), uint16(min(max(damage[1], 0), 65535)), uint16(min(max(damage[2], 0), 65535))}
+		var frame []byte
+		switch {
+		case drain:
+			if r, ok := HealMob(ch.MapID, d.MobGlobalID, hp); ok {
+				sendNear(ch.MapID, r.PosX, r.PosZ, CombatRadius, buildMobCurrentHP(r.ID, r.CurrentHP), "0x0610 mob hp after drain")
+			}
+			frame = buildMobSkillPacket(0x060C, result, d.MobGlobalID, ch.ID, sk, words, &words)
+		case first:
+			frame = buildMobSkillPacket(0x060D, result, d.MobGlobalID, ch.ID, sk, words, nil)
+		default:
+			frame = buildMobSkillPacket(0x060B, result, d.MobGlobalID, ch.ID, sk, words, nil)
+		}
+		sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius, frame, "mob skill on character")
+		s.log.Printf("Rapture World mob skill mob_global_id=%d mob_id=%d skill_id=%d result=%d damage=%d killed=%t",
+			d.MobGlobalID, d.MobID, sk.SkillID, result, hp, killed)
+		if !killed && !drain && result != attackResultMiss && sk.AddDamageHP != 0 {
+			add := uint32(uint16(sk.AddDamageHP))
+			killed = s.takeMobDamage(d, add, stats)
+			w := packet.New(0x060E)
+			w.U32(d.MobGlobalID)
+			w.U32(ch.ID)
+			w.U16(sk.SkillID)
+			w.U8(sk.SkillLevel)
+			w.U16(uint16(min(add, 65535)))
+			w.U16(uint16(sk.AddDamageSP))
+			w.U16(uint16(sk.AddDamageMP))
+			sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius, w.MustFinish(), "0x060E mob skill extra damage")
+		}
+		refreshed := s.stats()
+		stats = &refreshed
+	}
+	s.afterMobDamage(d, killed)
+	return killed
+}
+
+// buildMobSkillPacket: result, mob id, target id, a byte the client reads
+// before the skill id (0x060B/0x060C only), skill id, level, HP/SP/MP
+// damage and, for 0x060C, the healed HP/SP/MP.
+func buildMobSkillPacket(op packet.Opcode, result uint8, mobID, target uint32, sk *db.SkillDef, damage [3]uint16, healed *[3]uint16) []byte {
+	w := packet.New(op)
+	w.U8(result)
+	w.U32(mobID)
+	w.U32(target)
+	if op != 0x060D {
+		w.U8(0)
+	}
+	w.U16(sk.SkillID)
+	w.U8(sk.SkillLevel)
+	for _, v := range damage {
+		w.U16(v)
+	}
+	if healed != nil {
+		for _, v := range healed {
+			w.U16(v)
+		}
+	}
+	return w.MustFinish()
+}
+
+// takeMobDamage lowers the character's HP; true when it died.
+func (s *Session) takeMobDamage(d pendingDamage, damage uint32, stats *CharacterStats) bool {
+	ch := s.char
+	cur := s.stats()
+	if cur.CurrentHP == 0 || damage == 0 {
+		return false
+	}
+	newEffective := satSub(cur.CurrentHP, damage)
+	ch.CurrentHP = satSub(ch.CurrentHP, cur.CurrentHP-newEffective)
+	killed := newEffective == 0
 	if killed {
 		ch.Deaths++
 	}
 	s.persist()
-	sendNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius,
-		buildMobAttackCharacter(result, d.MobGlobalID, ch.ID, uint16(min(damage, 65535))), "0x0605 mob attack character")
-	s.log.Printf("Rapture World mob attack mob_global_id=%d mob_id=%d result=%d damage=%d hp=%d/%d killed=%t",
-		d.MobGlobalID, d.MobID, result, damage, newEffective, stats.MaxHP, killed)
-	refreshed := StatsFor(ch, equip)
-	s.send(buildCurrentHitpoints(&refreshed), "0x0521 current hp after mob attack")
-	if killed {
-		state, death := buildCharacterDeathState(ch.ID), buildCharacterDeath(ch.ID, deathTypeMob, d.MobGlobalID)
-		for _, p := range PlayersNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius) {
-			p.Send(state, "0x051C character death state")
-			p.Send(death, "0x0504 character death")
-		}
-		ClearMobAggro(ch.MapID, d.MobGlobalID)
-		if s.player != nil {
-			s.player.SetAlive(false)
-		}
-		s.log.Printf("Rapture World character died character_id=%d killer_mob_global_id=%d mob_id=%d", ch.ID, d.MobGlobalID, d.MobID)
-	}
 	return killed
+}
+
+func (s *Session) afterMobDamage(d pendingDamage, killed bool) {
+	ch := s.char
+	refreshed := s.stats()
+	s.send(buildCurrentHitpoints(&refreshed), "0x0521 current hp after mob attack")
+	if !killed {
+		return
+	}
+	state, death := buildCharacterDeathState(ch.ID), buildCharacterDeath(ch.ID, deathTypeMob, d.MobGlobalID)
+	for _, p := range PlayersNear(ch.MapID, ch.PosX, ch.PosZ, CombatRadius) {
+		p.Send(state, "0x051C character death state")
+		p.Send(death, "0x0504 character death")
+	}
+	ClearMobAggro(ch.MapID, d.MobGlobalID)
+	if s.player != nil {
+		s.player.SetAlive(false)
+	}
+	s.log.Printf("Rapture World character died character_id=%d killer_mob_global_id=%d mob_id=%d", ch.ID, d.MobGlobalID, d.MobID)
 }
 
 // persist saves the active character (usp_Save_Char_Info_E) and refreshes
@@ -263,7 +385,7 @@ func expBounds(ch *db.Character) (prev, next uint32) {
 // split across the party (or dropped for a solo killer) and each share of
 // exp queued to its recipient's session. An offline DoT caster gets the
 // solo exp straight in the database.
-func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMob, y float32, log logPrinter) {
+func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMob, log logPrinter) {
 	var party []*ConnectedPlayer
 	if killer != nil {
 		party = partyMembersNear(killer, mapID, m.PosX, m.PosZ)
@@ -272,12 +394,12 @@ func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMo
 	if len(recipients) == 0 && killer != nil {
 		recipients = []*ConnectedPlayer{killer}
 	}
-	for _, p := range rollMobDrops(mapID, m, killerID, y, party, log) {
+	for _, p := range rollMobDrops(mapID, m, killerID, party, log) {
 		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 mob drop")
 	}
 	if def := questItemDrop(m, recipients); def != nil {
 		x, z := dropPosition(m.PosX, m.PosZ)
-		mi := MapItem{ID: nextMapItemID(), OwnerID: killerID, DroppedAt: time.Now(), PosX: x, PosY: y, PosZ: z,
+		mi := MapItem{ID: nextMapItemID(), OwnerID: killerID, DroppedAt: time.Now(), PosX: x, PosZ: z,
 			Item: db.Item{Type: def.Type, TypeID: def.TypeID, Quality: def.Quality, Count: 1}}
 		addMapItem(mapID, mi)
 		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, buildMapAddItem(&mi), "0x0401 quest item drop")

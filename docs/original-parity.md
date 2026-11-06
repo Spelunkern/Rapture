@@ -15,18 +15,20 @@ gaps; **invented** is still a Rapture rule to replace.
 | Start position, rebirth points | `Map.ini`, `CMap::LoadGameMapConfig` 0x004270a0 | done |
 | Character creation | `CUser::ProcessCharacterCreate` 0x00480e90, `CGameData::LoadBaseItem` 0x004bf800 | done |
 | Base HP/MP/SP | `CUser::InitEquipment` 0x00454560, `StatusDefs` | done |
-| Attack, defense, accuracy, evasion, critical | `CUser::SetAttack` 0x00454280 | done (weapon-mastery and skill bonuses not modeled) |
+| Attack, defense, accuracy, evasion, critical | `CUser::SetAttack` 0x00454280, `CUser::SetSkillAbility` 0x00485e00, `CUser::AddSkillPassive` 0x00489a80 | done: buff abilities 1-9, 13-18, 20-31; passives detail 1 (weapon mastery, with the original running-total quirk), 4, 8, 9 (cross road), 10 (shield); gem reach/speed; armour (slot 1) element. Abilities 10-12, 19, 32-46 and passive details 2, 5, 6 not modeled |
 | Level-up | stat/skill points by mode, +1 main stat | done |
 | Exp per kill | `CMob::GetExp` 0x00491690 | done (no event multiplier) |
 | Recovery | 5 s tick, 5% sitting, none in combat | partial: no equipment/skill recovery bonuses |
 | Lapisia enchant | `ItemEnchant.ini` | partial: gold cost to be configured |
-| Hit chance | `CUser::AttackSuccess` / `CMob::AttackSuccess` | done |
-| Damage | `CUser::AttackDamage` 0x0044d540, `CMob::AttackDamage` 0x004a2920, element table `CGameData::m_AttackAttr` 0x00542260 | partial: no close-range bow penalty, armour element or skill damage modes |
-| Mob stats | `Mobs` Dex/Wis/Luc/Defense/Magic/Attrib/Size, three attack slots | partial: only the first attack slot is used |
+| Hit chance | `CUser::AttackSuccess` 0x0044d010 / `CMob::AttackSuccess` 0x004a23f0 | done: skills check the mob's ResistState/ResistSkill and SuccessType 1-3; the magic term reads WIS on both sides (CUser +0x122c, stMOBInfo +0x3a), SuccessType 3 reads LUC (Eternity labels these DEX). Player block/mirror buffs not modeled |
+| Damage | `CUser::AttackDamage` 0x0044d540, `CMob::AttackDamage` 0x004a2920 / 0x004a3070, element table `CGameData::m_AttackAttr` 0x00542260 | done: skill DamageType 0-5, skill AttrType element, detail 24 ignores the defender element, bow x0.7 within 3 units unless cross road, mob normal attacks use element row 0 against the armour element; the random terms and the mob critical read LUC (+0x1234 / stMOBInfo +0x3c, Eternity labels them WIS) |
+| Mob stats and attacks | `Mobs` Dex/Wis/Luc/Defense/Magic/Attrib/Size, `CMob::AttackAI` 0x004a1ab0 | done: slots 3 to 1 by Attackok (3: HP 20-40%, 4: HP <= 5%, 5: HP < 20%), per-slot cooldowns, AttackTypeN is a mob skill (Skills level 100): attack (0x060D first hit, 0x060B area/repeat, 0x060C drain, 0x060E AddDamage), self heal; areas 6/7 by ApplyRange. Mob debuffs on players and Attackok 6 targeting not modeled |
 | Mob movement | `update_mob_ai_idle`, `NormalTime/NormalStep/ChaseTime/ChaseStep`, reach `Size + Attackrange + 0.3` | done (no pathfinding around walls) |
 | Mob respawn | `Attackspecial3`, random ±60 min for selector ≥ 9 | partial |
-| Drops | `MobItems` orders 1..9 (1-6 per cent, 7-9 per million), grade pick with `Drop` limits, `SequenceItemCreate.ini`, 30% gold `Money1 + rand(Money2)` | done (no party split) |
-| Quest item drops | `Mobs.QuestItemID` | missing |
+| Drops | `MobItems` orders 1..9 (1-6 per cent, 7-9 per million), grade pick with `Drop` limits, `SequenceItemCreate.ini`, 30% gold `Money1 + rand(Money2)`, `CMob::GetDropPosRand` 0x00490c70 | done: positions within half a unit with Y 0, as the original sends them (the client places them on the ground); no party split |
+| Skills | `CGameData::LoadConstSkill` 0x004bffe0, `CUser::SkillAttackSelect` / `SkillAttackRange` / `SkillAttackRangeSelect`, `CUser::AttackMob(skill)` 0x0044fd90, `CUser::HealUser` 0x00450670 | done: load-time normalization (kind = clamp(TypeAttack,1,3)-1, AttrType, StateType, MultiAttack, FixRange hours, detail 93/122), dispatch by TypeEffect, details 21-27 (22 multi-hit, 23 sacrifice, 27 drain with 0x0518), area announce 0x0511, AddDamage 0x051A, cost reductions (cost 1 spends the whole pool), heal + 2 x WIS, buffs 82/91/94/95, ClearApplySkillByDeath. Debuff effects on mobs other than damage over time (stat down, stun, root) not modeled |
+| Death | `CUser::Death` 0x004586a0, `CUser::KillSoul` 0x004599e0, `CUser::ExpDrop` 0x0045ad50 | done: buffs cleared, revive at the bind point with half HP/MP/SP, 5% of the level's exp lost above level 10 (amulet reductions not modeled) |
+| Attack range and speed | `CUser::EnableAttackRange`, `g_ConstUserAttackSpeed` 0x005424e0 | done: weapon reach + mob size + 2.3 + movement allowance (taken as its 2-unit floor); swing index moved by gems, passives and buffs |
 | Equip requirements | `CUser::EnableEquipment` 0x0045b450 | done |
 | NPC shop buy | `CUser::PacketShop` 0x0046af10, `NpcQuest.SData` | done (no guild-house discounts) |
 | Gatekeepers | `CUser::PacketMaininterface` case 0x020C, `NpcQuest.SData` | done (no guild-house rates; teleport is immediate) |
@@ -62,3 +64,12 @@ export JAVA_HOME=~/.cache/phoenix-reverse/ghidra/jdk-21.0.12.1+1
   ~/Projects/Eternity/work/ghidra-12.1.3 Eternity -process ps_game.exe \
   -readOnly -noanalysis -scriptPath tools/ghidra -postScript Decomp.java "CUser::AttackDamage"
 ```
+
+Other scripts in `tools/ghidra`: `ListFuncs.java <substring>` lists functions
+with their address and size, `Fields.java <struct>` prints a PDB structure's
+fields, and `Insns.java <address>... <filter>` prints a function's
+instructions containing the filter text (for example `"0x12"` to see which
+`CUser` fields it reads). The PDB's `CUser` field names are shifted against
+the shipped binary; field meanings above come from the instruction offsets
+(Str 0x1220, Dex 0x1224, Int 0x1228, Wis 0x122c, Rec 0x1230, Luc 0x1234,
+HP 0x1238, MP 0x123c, SP 0x1240), cross-checked with `CUser::SetAttack`.

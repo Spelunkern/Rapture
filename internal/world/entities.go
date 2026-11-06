@@ -85,6 +85,8 @@ type MapMob struct {
 	ChaseRange         float32
 	AggroTarget        uint32 // 0: none
 	lastAttackAt       time.Time
+	nextAttackAt       time.Time    // CMob m_dwNextAttackTime
+	slotReadyAt        [3]time.Time // per attack slot (AttackAI)
 	returningHome      bool
 	def                *db.MobDef
 	nextMoveAt         time.Time // idle wander
@@ -521,6 +523,8 @@ type MobAttackAction struct {
 	MobID             uint16
 	Attack            uint32
 	TargetCharacterID uint32
+	Slot              uint8
+	MobX, MobZ        float32
 }
 
 // mapPacket is a packet to broadcast near (x, z) on a map.
@@ -612,7 +616,7 @@ func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapP
 			m.PosX, m.PosZ, m.homeX, m.homeZ = x, z, x, z
 			m.CurrentHP = max(m.MaxHP, 1)
 			m.respawnAt = time.Time{}
-			m.AggroTarget, m.lastAttackAt, m.returningHome = 0, time.Time{}, false
+			m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, false
 			respawned++
 			if buckets.nearAny(m.PosX, m.PosZ, ViewportRadius) {
 				out = append(out, mapPacket{mapID, m.PosX, m.PosZ, buildMobEnter(m, true)})
@@ -688,7 +692,7 @@ func ClearMobAggro(mapID uint16, id uint32) {
 	defer s.mu.Unlock()
 	for i := range s.entities.Mobs {
 		if m := &s.entities.Mobs[i]; m.ID == id {
-			m.AggroTarget, m.lastAttackAt, m.returningHome = 0, time.Time{}, true
+			m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, true
 		}
 	}
 }
@@ -723,7 +727,7 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 					}
 				}
 				if !valid {
-					m.AggroTarget, m.lastAttackAt, m.returningHome = 0, time.Time{}, true
+					m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, true
 				}
 			}
 			if m.AggroTarget == 0 && !m.returningHome && m.AI >= 1 && m.ChaseRange > 0 {
@@ -781,11 +785,23 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 			}
 			d := DistanceXZ(m.PosX, m.PosZ, target.PosX, target.PosZ)
 			if d < m.attackReach() {
-				if m.lastAttackAt.IsZero() || now.Sub(m.lastAttackAt) >= m.attackInterval() {
-					m.lastAttackAt = now
-					actions++
-					tick.Attacks = append(tick.Attacks, MobAttackAction{m.ID, m.MobID, m.Attack, m.AggroTarget})
+				if now.Before(m.nextAttackAt) {
+					continue
 				}
+				slot, ok := m.pickAttackSlot(now, d)
+				if !ok {
+					// No slot ready: CMob::AttackAI waits 2.5 s.
+					m.nextAttackAt = now.Add(mobAttackIdle)
+					continue
+				}
+				m.lastAttackAt = now
+				if heal := m.useSlot(slot, now); heal != nil {
+					actions++
+					tick.Restores = append(tick.Restores, mapPacket{mapID, m.PosX, m.PosZ, heal})
+					continue
+				}
+				actions++
+				tick.Attacks = append(tick.Attacks, MobAttackAction{m.ID, m.MobID, m.Attack, m.AggroTarget, slot, m.PosX, m.PosZ})
 				continue
 			}
 			if !m.lastAttackAt.IsZero() && now.Sub(m.lastAttackAt) < mobAttackPause {
@@ -961,6 +977,76 @@ func (m *MapMob) attackReach() float32 {
 		return MobAttackRange
 	}
 	return float32(m.def.Size) + float32(m.def.Attacks[0].Range) + 0.3
+}
+
+// mobAttackIdle is AttackAI's wait when no slot is ready (2500 ms plus
+// g_ConstMobAttackSpeed, 0 at normal speed).
+const mobAttackIdle = 2500 * time.Millisecond
+
+// pickAttackSlot is CMob::AttackAI's scan: slots 3 to 1, the first one in
+// use (Attackok), off its own cooldown, within its HP condition (3: HP
+// 20-40%, 4: HP at most 5%, 5: HP under 20%) and in reach.
+func (m *MapMob) pickAttackSlot(now time.Time, distance float32) (uint8, bool) {
+	if m.def == nil {
+		return 0, true
+	}
+	maxHP := float64(float32(m.MaxHP))
+	threshold := func(f float32) uint32 { return uint32(int32(maxHP * float64(f))) }
+	for slot := 2; slot >= 0; slot-- {
+		a := &m.def.Attacks[slot]
+		if a.OK == 0 || now.Before(m.slotReadyAt[slot]) {
+			continue
+		}
+		switch a.OK {
+		case 3:
+			if m.CurrentHP > threshold(0.4) || m.CurrentHP < threshold(0.2) {
+				continue
+			}
+		case 4:
+			if m.CurrentHP > threshold(0.05) {
+				continue
+			}
+		case 5:
+			if m.CurrentHP >= threshold(0.2) {
+				continue
+			}
+		}
+		reach := float32(m.def.Size) + float32(a.Range) + 0.3
+		if a.Type != 0 {
+			if sk := db.MustDefs().Skill(a.Type, 100); sk != nil {
+				if sk.TypeEffect == 2 {
+					return uint8(slot), true // self heal: no reach needed
+				}
+				reach = float32(m.def.Size) + float32(sk.AttackRange) + 0.3
+			}
+		}
+		if distance > reach {
+			continue
+		}
+		return uint8(slot), true
+	}
+	return 0, false
+}
+
+// useSlot starts a slot's cooldown and the next attack time. A mob heal
+// skill (TypeEffect 2) applies at once and returns its HP packet.
+func (m *MapMob) useSlot(slot uint8, now time.Time) []byte {
+	a := &m.def.Attacks[slot]
+	if a.Type != 0 {
+		if sk := db.MustDefs().Skill(a.Type, 100); sk != nil {
+			m.slotReadyAt[slot] = now.Add(time.Duration(sk.ResetTimeSeconds) * time.Second)
+			m.nextAttackAt = now.Add(mobAttackIdle)
+			if sk.TypeEffect == 2 {
+				m.CurrentHP = min(satAdd(m.CurrentHP, uint32(max(sk.HealHP, 0))), m.MaxHP)
+				return buildMobCurrentHP(m.ID, m.CurrentHP)
+			}
+			return nil
+		}
+	}
+	// CMob::Attack: the slot waits its own AttackTime, the mob slot 1's.
+	m.slotReadyAt[slot] = now.Add(time.Duration(a.TimeMS) * time.Millisecond)
+	m.nextAttackAt = now.Add(m.attackInterval())
+	return nil
 }
 
 func (m *MapMob) attackInterval() time.Duration {
@@ -1143,4 +1229,19 @@ func buildMobCurrentHP(mobID, hp uint32) []byte {
 	w.U32(mobID)
 	w.U32(hp)
 	return w.MustFinish()
+}
+
+// HealMob restores HP to a living mob (a drain's heal); returns the mob.
+func HealMob(mapID uint16, id, amount uint32) (MapMob, bool) {
+	s := shard(mapID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.entities.Mobs {
+		m := &s.entities.Mobs[i]
+		if m.ID == id && m.CurrentHP > 0 {
+			m.CurrentHP = min(satAdd(m.CurrentHP, amount), m.MaxHP)
+			return *m, true
+		}
+	}
+	return MapMob{}, false
 }

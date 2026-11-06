@@ -78,7 +78,47 @@ type EquipmentStats struct {
 	Defense, Resistance  uint32
 	Absorption           uint32
 	AttackAttr           uint8 // the weapon's (or its gem's) element
+	DefenseAttr          uint8 // the armour's (slot 1) element, CUser::SetAttrDef
 	RangedWeapon         bool
+	// CUser::SetSkillAbility / AddSkillPassive / gems: per-category
+	// (melee, ranged, magic) additions and other modifiers.
+	Mods        [3]CategoryMods
+	Critical    int32
+	Range       int32 // added to the weapon's reach
+	AttackSpeed int32 // added to the swing-speed index
+	MoveSpeed   int32
+	CrossRoad   int32 // passive detail 9: no close-range bow penalty
+	SPCostCut   int32 // ability 13 / 14: percent off skill costs
+	MPCostCut   int32
+	WeaponType  uint8 // real type of the equipped weapon (0 none)
+	ShieldType  uint8 // real type of the equipped shield (0 none)
+}
+
+// CategoryMods are SetSkillAbility's per-category additions.
+type CategoryMods struct{ Accuracy, Attack, Defense, Evasion int32 }
+
+// itemElement is CUser::SetAttrAtk / SetAttrDef: the item's element, or
+// its gems' when it has none; two different elements cancel to 0.
+func itemElement(it *db.Item, d *db.ItemDef) uint8 {
+	value := uint8(0)
+	if d != nil && d.Attrib <= 8 {
+		value = d.Attrib
+	}
+	defs := db.MustDefs()
+	for _, gem := range it.Gems {
+		if gem == 0 {
+			continue
+		}
+		g := defs.Item(gemItemType, gem)
+		if g == nil || g.Attrib == 0 || g.Attrib == value || g.Attrib > 8 {
+			continue
+		}
+		if value != 0 {
+			return 0
+		}
+		value = g.Attrib
+	}
+	return value
 }
 
 const gemItemType = 30
@@ -165,25 +205,28 @@ func GetEquipmentStats(items []db.Item) EquipmentStats {
 		if d != nil {
 			e.addItemDef(it.Type, d)
 		}
-		attr := uint8(0)
-		if d != nil {
-			attr = d.Attrib
-		}
 		for _, gem := range it.Gems {
 			if gem == 0 {
 				continue
 			}
 			if g := defs.Item(gemItemType, gem); g != nil {
 				e.addItemDef(gemItemType, g)
-				if g.Attrib != 0 && attr == 0 {
-					attr = g.Attrib
-				}
+				// CUser::GemEquipmentAdd: gems also add reach and speed.
+				e.Range += int32(g.Range)
+				e.AttackSpeed += int32(g.AttackTime)
 			}
 		}
 		if it.Slot == weaponSlot && IsWeaponItemType(it.Type) {
-			e.AttackAttr = attr
+			e.AttackAttr = itemElement(it, d)
 			rt := realType(it.Type)
+			e.WeaponType = rt
 			e.RangedWeapon = rt == 11 || rt == 13 || rt == 14
+		}
+		if it.Slot == 1 {
+			e.DefenseAttr = itemElement(it, d)
+		}
+		if it.Slot == 6 {
+			e.ShieldType = realType(it.Type)
 		}
 		if c, ok := ParseCraftName(it.CraftName); ok {
 			e.Str, e.Dex, e.Rec = satAdd(e.Str, c.Str), satAdd(e.Dex, c.Dex), satAdd(e.Rec, c.Rec)
@@ -223,7 +266,13 @@ type CharacterStats struct {
 	Critical     int32
 	Variance     uint32
 	AttackAttr   uint8
+	DefenseAttr  uint8
 	RangedWeapon bool
+	CrossRoad    int32
+	Range        int32
+	AttackSpeed  int32
+	SPCostCut    int32
+	MPCostCut    int32
 }
 
 func StatsFor(ch *db.Character, e EquipmentStats) CharacterStats {

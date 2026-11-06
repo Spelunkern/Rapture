@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -99,8 +100,9 @@ func (s *Session) applyTeleport(mapID uint16, x, y, z float32, label string) {
 	}
 }
 
-// resurrect revives at the nearest faction spawn with full HP/MP/SP using
-// the captured sequence 0x0406, teleport, 0x0551, 0x0505.
+// resurrect is CUser::KillSoul: the death's exp loss (ExpDrop), then
+// rebirth at the bind point with half HP/MP/SP, using the captured
+// sequence 0x0406, teleport, 0x0551, 0x0505.
 func (s *Session) resurrect() bool {
 	ch := s.char
 	if ch == nil {
@@ -114,16 +116,22 @@ func (s *Session) resurrect() bool {
 	} else if area, ok := FindNearestSpawnArea(ch.MapID, s.faction, ch.PosX, ch.PosZ); ok {
 		x, y, z = area.Center()
 	}
+	lost := expDrop(ch, deathExpPercent)
 	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
+	full := StatsFor(ch, s.equipment())
+	ch.CurrentHP = satSub(ch.CurrentHP, full.CurrentHP-full.MaxHP/2)
+	ch.CurrentMP = satSub(ch.CurrentMP, full.CurrentMP-full.MaxMP/2)
+	ch.CurrentSP = satSub(ch.CurrentSP, full.CurrentSP-full.MaxSP/2)
+	s.persist()
 	stats := StatsFor(ch, s.equipment())
 	s.send(buildCharacterReviveInit(ch.ID), "0x0406 revive init")
 	s.applyTeleport(mapID, x, y, z, "resurrect")
 	s.send(buildCharacterResurrect(ch.ID, x, y, z), "0x0551 resurrect reposition")
-	s.send(buildCharacterReviveHitpoints(ch.ID, stats.MaxHP, stats.MaxMP, stats.MaxSP), "0x0505 revive hitpoints")
+	s.send(buildCharacterReviveHitpoints(ch.ID, stats.CurrentHP, stats.CurrentMP, stats.CurrentSP), "0x0505 revive hitpoints")
 	if s.player != nil {
 		s.player.SetAlive(true)
 	}
-	s.log.Printf("Rapture World resurrected character_id=%d map=%d pos=(%.2f, %.2f, %.2f)", ch.ID, mapID, x, y, z)
+	s.log.Printf("Rapture World resurrected character_id=%d map=%d pos=(%.2f, %.2f, %.2f) exp_lost=%d", ch.ID, mapID, x, y, z, lost)
 	return true
 }
 
@@ -205,4 +213,25 @@ func (s *Session) executeTown() {
 	}
 	s.send(buildChatNormal(ch.ID, fmt.Sprintf("Returned to nearest town spawn (%.2f, %.2f, %.2f).", ch.PosX, ch.PosY, ch.PosZ)),
 		"0x1101 town command result")
+}
+
+// deathExpPercent is CUser::Death's drop: 5% (amulet benefits that lower
+// it to 1% or 0% are not modeled yet).
+const deathExpPercent = 5
+
+// expDrop is CUser::ExpDrop (0x0045ad50): above level 10, percent of the
+// level's exp span, never below the level's start.
+func expDrop(ch *db.Character, percent int) uint32 {
+	if ch.Level <= 10 || percent <= 0 {
+		return 0
+	}
+	prev, next := expBounds(ch)
+	loss := int64(math.RoundToEven(float64(float32(percent)) / 100 * float64(float32(int32(next-prev)))))
+	room := int64(ch.Exp) - int64(prev)
+	if room < 1 {
+		return 0
+	}
+	loss = min(loss, room)
+	ch.Exp -= uint32(loss)
+	return uint32(loss)
 }

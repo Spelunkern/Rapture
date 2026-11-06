@@ -75,6 +75,31 @@ type SkillDef struct {
 	AttackRange                              uint8
 	TypeAttack                               uint8
 	TargetType, ApplyRange, MultiAttack      uint8
+
+	// CGameData::LoadConstSkill (0x004bffe0) normalizes these on load.
+	Kind         uint8 // clamp(TypeAttack, 1, 3) - 1: 0 melee, 1 ranged, 2 magic
+	TypeEffect   uint8 // 0 passive, 1 attack, 2 heal, 3 debuff, 4 buff, ...
+	DamageType   uint8 // AttackDamage mode 0..5
+	DamageSP     int32
+	DamageMP     int32
+	AddDamageSP  int32
+	AddDamageMP  int32
+	AttrType     uint8 // element override, 0 when > 8
+	StateType    uint8 // 0 when > 15
+	SuccessType  uint8
+	SuccessValue uint8
+	Weapon1      uint8 // passive weapon types, at most 19
+	Weapon2      uint8
+	WeaponValue  uint8
+	DefenceType  uint8 // clamp(DefenceType, 1, 3) - 1
+	DefenceValue uint8
+	Aggro        uint16 // Arrow
+	LimitHP      uint8
+	KeepSeconds  uint32 // KeepTime, in hours when FixRange is 1
+	KeepOnDeath  bool   // FixRange != 0: survives CUser::ClearApplySkillByDeath
+	NeedWeapon   [15]bool
+	NeedShield   bool
+	MobSkill     bool // SkillLevel 100 rows are mob skills
 }
 
 // MobAttack is one of a mob's three attack slots (AttackTypeN..AttackokN).
@@ -84,7 +109,8 @@ type MobAttack struct {
 	Range        uint16
 	Attack, Plus uint16 // base damage and random variance
 	Attrib       uint8
-	OK           uint8
+	Special      uint8
+	OK           uint8 // 0 unused, 1/2 always, 3 HP 20-40%, 4 HP <= 5%, 5 HP < 20%, 6 target the weakest attacker
 }
 
 // MobDef is the subset of PS_GameDefs.dbo.Mobs the world uses.
@@ -93,6 +119,7 @@ type MobDef struct {
 	Name               string
 	Level              uint16
 	MaxHP              uint32
+	MaxMP, MaxSP       uint32
 	MoneyMin, MoneyMax uint32 // Money1 (base) and Money2 (random range)
 	RespawnSeconds     uint64 // 0: does not respawn
 	Exp                uint32
@@ -110,6 +137,8 @@ type MobDef struct {
 	ChaseTimeMS        uint32
 	ChaseStep          uint16
 	Attacks            [3]MobAttack
+	ResistState        [15]uint8 // immune to skills of StateType i+1 when non-zero
+	ResistSkill        [6]uint16 // immune to these skill IDs
 }
 
 type MobDrop struct {
@@ -200,6 +229,48 @@ func clampU16(v int64) uint16 {
 	return uint16(min(max(v, 0), 65535))
 }
 
+// normalizeSkill applies CGameData::LoadConstSkill's load-time rules.
+func normalizeSkill(s *SkillDef, defenceType, fixRange uint8, keep uint32, aggro uint16, need [15]uint8, shield uint8) {
+	s.MobSkill = s.SkillLevel == 100
+	s.Weapon1, s.Weapon2 = min(s.Weapon1, 19), min(s.Weapon2, 19)
+	kind := s.TypeAttack
+	if kind == 0 {
+		kind = 1
+	}
+	s.Kind = min(kind, 3) - 1
+	if defenceType == 0 {
+		defenceType = 1
+	}
+	s.DefenceType = min(defenceType, 3) - 1
+	if s.AttrType > 8 {
+		s.AttrType = 0
+	}
+	if s.StateType > 15 {
+		s.StateType = 0
+	}
+	for i := range s.AbilityType {
+		if s.AbilityType[i] != 0 && s.AbilityValue[i] == 0 {
+			s.AbilityValue[i] = 1
+		}
+	}
+	switch s.TypeDetail {
+	case 93:
+		s.TypeEffect = 4
+	case 122:
+		s.TypeEffect = 6
+	}
+	s.MultiAttack = min(s.MultiAttack, 60)
+	s.KeepSeconds, s.KeepOnDeath = keep, fixRange != 0
+	if fixRange == 1 {
+		s.KeepSeconds = keep * 3600
+	}
+	s.Aggro = aggro
+	for i, v := range need {
+		s.NeedWeapon[i] = v != 0
+	}
+	s.NeedShield = shield != 0
+}
+
 // MobRespawnSeconds maps Mobs.Attackspecial3 to the respawn delay.
 func MobRespawnSeconds(special uint8) uint64 {
 	table := []uint64{40, 40, 60, 3 * 60, 8 * 60, 12 * 60, 15 * 60, 30 * 60, 45 * 60, 60 * 60,
@@ -261,21 +332,34 @@ func loadDefs() (*Defs, error) {
 		SP, MP, ResetTime, ReadyTime, DamageHP, AddDamageHP, HealHP, HealSP, HealMP, TypeDetail, KeepTime,
 		TimeHealHP, TimeHealSP, TimeHealMP, AbilityType1, AbilityValue1, AbilityType2, AbilityValue2,
 		AbilityType3, AbilityValue3, TimeDamageHP, TimeDamageSP, TimeDamageMP, AttackRange, TypeAttack,
-		TargetType, ApplyRange, MultiAttack FROM dbo.Skills`)
+		TargetType, ApplyRange, MultiAttack, TypeEffect, DamageType, DamageSP, DamageMP, AddDamageSP, AddDamageMP,
+		AttrType, StateType, SuccessType, SuccessValue, Weapon1, Weapon2, Weaponvalue, DefenceType, DefenceValue,
+		Arrow, LimitHP, FixRange, NeedWeapon1, NeedWeapon2, NeedWeapon3, NeedWeapon4, NeedWeapon5, NeedWeapon6,
+		NeedWeapon7, NeedWeapon8, NeedWeapon9, NeedWeapon10, NeedWeapon11, NeedWeapon12, NeedWeapon13, NeedWeapon14,
+		NeedWeapon15, Shield FROM dbo.Skills`)
 	if err != nil {
 		return nil, fmt.Errorf("load Skills: %w", err)
 	}
 	for rows.Next() {
 		var s SkillDef
-		var skillID, reqLevel, prev, sp, mp, reset, typeDetail, keep int64
+		var skillID, reqLevel, prev, sp, mp, reset, typeDetail, keep, aggro int64
 		var classes [6]uint8
-		if err := rows.Scan(&skillID, &s.SkillLevel, &s.Name, &s.Country, &reqLevel, &s.Grow, &s.SkillPointCost,
+		var defenceType, fixRange, shield uint8
+		var need [15]uint8
+		extra := []any{&s.TypeEffect, &s.DamageType, &s.DamageSP, &s.DamageMP, &s.AddDamageSP, &s.AddDamageMP,
+			&s.AttrType, &s.StateType, &s.SuccessType, &s.SuccessValue, &s.Weapon1, &s.Weapon2, &s.WeaponValue,
+			&defenceType, &s.DefenceValue, &aggro, &s.LimitHP, &fixRange}
+		for i := range need {
+			extra = append(extra, &need[i])
+		}
+		extra = append(extra, &shield)
+		if err := rows.Scan(append([]any{&skillID, &s.SkillLevel, &s.Name, &s.Country, &reqLevel, &s.Grow, &s.SkillPointCost,
 			&prev, &classes[0], &classes[1], &classes[2], &classes[3], &classes[4], &classes[5], &sp, &mp,
 			&reset, &s.ReadyTime, &s.DamageHP, &s.AddDamageHP, &s.HealHP, &s.HealSP, &s.HealMP, &typeDetail,
 			&keep, &s.TimeHealHP, &s.TimeHealSP, &s.TimeHealMP, &s.AbilityType[0], &s.AbilityValue[0],
 			&s.AbilityType[1], &s.AbilityValue[1], &s.AbilityType[2], &s.AbilityValue[2], &s.TimeDamageHP,
 			&s.TimeDamageSP, &s.TimeDamageMP, &s.AttackRange, &s.TypeAttack, &s.TargetType, &s.ApplyRange,
-			&s.MultiAttack); err != nil {
+			&s.MultiAttack}, extra...)...); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Skills: %w", err)
 		}
@@ -285,6 +369,7 @@ func loadDefs() (*Defs, error) {
 		for i, v := range classes {
 			s.ClassEligible[i] = v != 0
 		}
+		normalizeSkill(&s, defenceType, fixRange, uint32(max(keep, 0)), clampU16(aggro), need, shield)
 		skill := s
 		d.Skills[SkillKey{s.SkillID, s.SkillLevel}] = &skill
 	}
@@ -294,7 +379,11 @@ func loadDefs() (*Defs, error) {
 		Exp, Attack1, AI, ChaseRange, Dex, Wis, Luc, Defense, Magic, Attacktime3, Attrib, ISNULL(Size,0), ISNULL(QuestItemID,0), NormalTime, NormalStep,
 		ChaseTime, ChaseStep, AttackType1, AttackTime1, Attackrange1, Attack1, Attackplus1, Attackattrib1, Attackok1,
 		Attacktype2, Attacktime2, Attackrange2, Attack2, Attackplus2, Attackattrib2, Attackok2,
-		Attacktype3, Attacktime3, Attackrange3, Attack3, Attackplus3, Attackattrib3, Attackok3 FROM dbo.Mobs`)
+		Attacktype3, Attacktime3, Attackrange3, Attack3, Attackplus3, Attackattrib3, Attackok3,
+		Attackspecial1, Attackspecial2, Attackspecial3,
+		ResistState1, ResistState2, ResistState3, ResistState4, ResistState5, ResistState6, ResistState7, ResistState8,
+		ResistState9, ResistState10, ResistState11, ResistState12, ResistState13, ResistState14, ResistState15,
+		ResistSkill1, ResistSkill2, ResistSkill3, ResistSkill4, ResistSkill5, ResistSkill6, MP, SP FROM dbo.Mobs`)
 	if err != nil {
 		return nil, fmt.Errorf("load Mobs: %w", err)
 	}
@@ -311,6 +400,20 @@ func loadDefs() (*Defs, error) {
 				dest = append(dest, &a[i][j])
 			}
 		}
+		var specials [3]int64
+		var resistState [15]int64
+		var resistSkill [6]int64
+		for i := range specials {
+			dest = append(dest, &specials[i])
+		}
+		for i := range resistState {
+			dest = append(dest, &resistState[i])
+		}
+		for i := range resistSkill {
+			dest = append(dest, &resistSkill[i])
+		}
+		var mobMP, mobSP int64
+		dest = append(dest, &mobMP, &mobSP)
 		if err := rows.Scan(dest...); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Mobs: %w", err)
@@ -328,7 +431,15 @@ func loadDefs() (*Defs, error) {
 		for i := range a {
 			d.Mobs[uint16(mobID)].Attacks[i] = MobAttack{Type: clampU16(a[i][0]), TimeMS: uint32(max(a[i][1], 0)),
 				Range: clampU16(a[i][2]), Attack: clampU16(a[i][3]), Plus: clampU16(a[i][4]), Attrib: clampU8(a[i][5]),
-				OK: clampU8(a[i][6])}
+				Special: clampU8(specials[i]), OK: clampU8(a[i][6])}
+		}
+		m := d.Mobs[uint16(mobID)]
+		m.MaxMP, m.MaxSP = uint32(max(mobMP, 0)), uint32(max(mobSP, 0))
+		for i, v := range resistState {
+			m.ResistState[i] = clampU8(v)
+		}
+		for i, v := range resistSkill {
+			m.ResistSkill[i] = clampU16(v)
 		}
 	}
 	rows.Close()

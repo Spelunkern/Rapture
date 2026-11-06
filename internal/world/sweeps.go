@@ -3,6 +3,7 @@ package world
 import (
 	"time"
 
+	"github.com/Spelunkern/Rapture/internal/db"
 	"github.com/Spelunkern/Rapture/internal/logx"
 )
 
@@ -35,13 +36,41 @@ func StartSweeps(log *logx.Logger) {
 		}
 		tick := TickMobCombat(snaps, 256)
 		for _, a := range tick.Attacks {
-			if p := FindPlayerByID(a.TargetCharacterID); p != nil {
-				p.QueueDamage(a.MobGlobalID, a.MobID, a.Attack)
-			}
+			queueMobAttack(a)
 		}
 		broadcastMapPackets(tick.Moves, ViewportRadius, "0x0603 mob chase move")
 		broadcastMapPackets(tick.Restores, CombatRadius, "0x0610 mob hp restore on reset")
 	})
+}
+
+// queueMobAttack hands a mob's attack to its target, or for an area mob
+// skill (TargetType 6 around the mob, 7 around the target) to every living
+// player within ApplyRange.
+func queueMobAttack(a MobAttackAction) {
+	target := FindPlayerByID(a.TargetCharacterID)
+	if target == nil {
+		return
+	}
+	first := pendingDamage{a.MobGlobalID, a.MobID, a.Attack, a.Slot, true}
+	def := db.MustDefs().Mobs[a.MobID]
+	if def == nil || def.Attacks[a.Slot].Type == 0 {
+		target.QueueDamage(first)
+		return
+	}
+	sk := db.MustDefs().Skill(def.Attacks[a.Slot].Type, 100)
+	if sk == nil || (sk.TargetType != targetTypeEnemiesNearCaster && sk.TargetType != targetTypeEnemiesNearTarget) {
+		target.QueueDamage(first)
+		return
+	}
+	x, z := a.MobX, a.MobZ
+	if sk.TargetType == targetTypeEnemiesNearTarget {
+		x, z = target.PositionXZ()
+	}
+	for _, p := range PlayersNear(target.MapID(), x, z, float32(sk.ApplyRange)) {
+		if p.IsAlive() {
+			p.QueueDamage(pendingDamage{a.MobGlobalID, a.MobID, a.Attack, a.Slot, false})
+		}
+	}
 }
 
 func every(d time.Duration, fn func()) {
@@ -87,11 +116,6 @@ func runDotSweep(log *logx.Logger) {
 		}
 		log.Printf("Rapture World dot kill character_id=%d mob_global_id=%d mob_id=%d", o.CasterID, m.ID, m.MobID)
 		sendNear(o.MapID, m.PosX, m.PosZ, CombatRadius, buildMobDeath(m.ID, o.CasterID), "0x0606 mob death (dot)")
-		caster := FindPlayerByID(o.CasterID)
-		var y float32
-		if caster != nil {
-			y = caster.Snapshot().PosY
-		}
-		rewardKill(caster, o.CasterID, o.MapID, m, y, log)
+		rewardKill(FindPlayerByID(o.CasterID), o.CasterID, o.MapID, m, log)
 	}
 }

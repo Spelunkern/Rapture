@@ -15,6 +15,7 @@ func TestPacketLayoutsMatchClient(t *testing.T) {
 	ch := &db.Character{ID: 1, Name: "A", Level: 1}
 	st := &CharacterStats{}
 	m, n, mi, it := &MapMob{ID: 1}, &MapNpc{ID: 1}, &MapItem{ID: 1}, &db.Item{}
+	sk := &db.SkillDef{SkillID: 1, SkillLevel: 100}
 	cases := []struct {
 		name  string
 		frame []byte
@@ -58,6 +59,11 @@ func TestPacketLayoutsMatchClient(t *testing.T) {
 		{"0x0508 0058fa30", buildLevelUp(packet.LevelUpSelf, ch), 18},
 		{"0x051e 0058fac0", buildLevelUp(packet.LevelUpOther, ch), 18},
 		{"0x0517 00590370", buildSkillUseResult(packet.SkillUse, 0, 1, 1, 1, 1, 1, 1, 1), 18},
+		{"0x0518 slot_168", buildSkillDrainResult(0, 1, 1, 1, 1, [3]uint16{}, [3]uint16{}), 24},
+		{"0x0519 00590520", buildSkillUseResult(opSkillOther, 0, 1, 1, 1, 1, 1, 1, 1), 18},
+		{"0x060b slot_17c", buildMobSkillPacket(0x060B, 0, 1, 1, sk, [3]uint16{}, nil), 19},
+		{"0x060c slot_180", buildMobSkillPacket(0x060C, 0, 1, 1, sk, [3]uint16{}, &[3]uint16{}), 25},
+		{"0x060d 00590970", buildMobSkillPacket(0x060D, 0, 1, 1, sk, [3]uint16{}, nil), 18},
 		{"0x051c 00591a30", buildCharacterDeathState(1), 6},
 		{"0x051f 0058fb50", buildMaxHPMPSP(ch, st), 16},
 		{"0x0521 00595090", buildCurrentHitpoints(st), 12},

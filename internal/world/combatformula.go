@@ -47,7 +47,8 @@ func truncInt(v float64) int32 {
 
 func clampInt(v, lo, hi int32) int32 { return min(max(v, lo), hi) }
 
-// setAttack is CUser::SetAttack (0x00454280) on top of the equipment.
+// setAttack is CUser::SetAttack (0x00454280) on top of the equipment and
+// the skill/passive additions per category.
 func setAttack(s *CharacterStats, e EquipmentStats) {
 	dex, str, wis, intel, luck := float32(s.Dex), float32(s.Str), float32(s.Wis), float32(s.Int), float32(s.Luc)
 	halfDex := dex * 0.5
@@ -55,17 +56,22 @@ func setAttack(s *CharacterStats, e EquipmentStats) {
 	fifthDex := dex * 0.2
 	item := float32(e.ItemAttack)
 	level := float32(s.Level)
-	s.Critical = truncInt(float64(luck * 0.19))
+	s.Critical = truncInt(float64(luck*0.19 + float32(e.Critical)))
 	for c := 0; c < 2; c++ {
-		s.Accuracy[c] = truncInt(float64(level + halfDex))
-		s.Evasion[c] = truncInt(float64(defenseBase + level))
-		s.Guard[c] = int32(s.Rec) + int32(e.Defense)
+		m := e.Mods[c]
+		s.Accuracy[c] = truncInt(float64(float32(m.Accuracy) + level + halfDex))
+		s.Evasion[c] = truncInt(float64(float32(m.Evasion) + defenseBase + level))
+		s.Guard[c] = m.Defense + int32(s.Rec) + int32(e.Defense)
 	}
-	s.Attack[attackMelee] = truncInt(float64(str*1.3 + item + fifthDex))
-	s.Attack[attackRanged] = truncInt(float64(luck*0.3 + item + str + fifthDex))
-	s.Attack[attackMagic] = truncInt(float64(intel*1.3 + wis*0.2 + item))
-	s.Guard[attackMagic] = int32(e.Resistance) + int32(s.Wis)
+	s.Attack[attackMelee] = truncInt(float64(str*1.3 + float32(e.Mods[0].Attack) + item + fifthDex))
+	s.Attack[attackRanged] = truncInt(float64(luck*0.3 + float32(e.Mods[1].Attack) + item + str + fifthDex))
+	magic := e.Mods[2]
+	s.Attack[attackMagic] = truncInt(float64(intel*1.3 + wis*0.2 + float32(magic.Attack) + item))
+	s.Accuracy[attackMagic], s.Evasion[attackMagic] = magic.Accuracy, magic.Evasion
+	s.Guard[attackMagic] = magic.Defense + int32(e.Resistance) + int32(s.Wis)
 	s.Variance, s.AttackAttr, s.RangedWeapon = e.Variance, e.AttackAttr, e.RangedWeapon
+	s.DefenseAttr, s.CrossRoad, s.Range, s.AttackSpeed = e.DefenseAttr, e.CrossRoad, e.Range, e.AttackSpeed
+	s.SPCostCut, s.MPCostCut = e.SPCostCut, e.MPCostCut
 
 	physical := attackMelee
 	if e.RangedWeapon {
@@ -112,6 +118,7 @@ func mobCombatFor(d *db.MobDef) mobCombat {
 
 // magicResisted is the magic branch shared by both directions: a miss when
 // the roll is under the level/dex resistance chance (1..90).
+// The stat term reads WIS on both sides (CUser +0x122c, stMOBInfo +0x3a).
 func magicResisted(attLevel, defLevel, defEvasion, attDex, defDex, attAccuracy int32) bool {
 	denominator := float64(float32(attLevel + defLevel))
 	levelTerm := float64(float32((f32(defLevel-attLevel-2)*100+f32(defLevel))/denominator*float64(float32(1.1)) + f32(defEvasion)))
@@ -125,7 +132,7 @@ func magicResisted(attLevel, defLevel, defEvasion, attDex, defDex, attAccuracy i
 // playerHits is CUser::AttackSuccess for a normal attack on a mob.
 func playerHits(s *CharacterStats, m *mobCombat, kind int) bool {
 	if kind == attackMagic {
-		return !magicResisted(int32(s.Level), m.Level, m.Evasion[2], int32(s.Dex), m.Dex, s.Accuracy[2])
+		return !magicResisted(int32(s.Level), m.Level, m.Evasion[2], int32(s.Wis), m.Wis, s.Accuracy[2])
 	}
 	level := float64(float32(s.Level))
 	levels := float64(float32(int32(s.Level) + m.Level))
@@ -136,26 +143,37 @@ func playerHits(s *CharacterStats, m *mobCombat, kind int) bool {
 	return rand.Int32N(100) < chance
 }
 
-// playerDamage is CUser::AttackDamage against a mob; extra is added to the
-// attack first (a skill's damage). Returns damage and whether it crit.
-func playerDamage(s *CharacterStats, m *mobCombat, kind int, extra int32, element uint8) (int32, bool) {
+// closeRangePenalty is the bow rule in CUser::AttackDamage: a ranged hit
+// within 3 units does 70%, unless a cross-road passive (detail 9) is learned.
+const closeRangeDistance = 3.0
+
+// weaponDamage is the weapon branch of CUser::AttackDamage (0x0044d540)
+// against a mob. damage[0] seeds the attack (skill modes 1 and 2); element
+// is the attacking element and defElement the mob's (0 for detail 24).
+func weaponDamage(s *CharacterStats, m *mobCombat, kind int, damage *[3]int32, element, defElement uint8, closeRanged bool) bool {
 	levelRaw := store((f32(m.Level-int32(s.Level)-1)*100 + f32(m.Level)) / 100 * 10)
 	level := float64(min(max(levelRaw, 1), 95))
-	attack := store(f32(s.Attack[kind] + extra))
+	attack := store(f32(int32(uint32(s.Attack[kind]) + uint32(damage[0]))))
 	if s.Variance > 0 {
 		attack = store(float64(attack) + f32(int32(rand.Uint32N(s.Variance))))
 	}
-	factor := float32(1)
-	if element < 9 && m.Attrib < 9 {
-		factor = attackElement[element][m.Attrib]
+	penalty := kind == attackRanged && closeRanged && s.CrossRoad == 0
+	if penalty {
+		attack = store(float64(attack) * float64(float32(0.7)))
 	}
-	wisRoll := func() int32 {
-		if s.Wis == 0 {
+	factor := float32(1)
+	if element < 9 && defElement < 9 {
+		factor = attackElement[element][defElement]
+	}
+	// The two random terms read the attacker's LUC (CUser +0x1234; the
+	// same field SetAttack uses for luck).
+	luckRoll := func() int32 {
+		if s.Luc == 0 {
 			return 0
 		}
-		return int32(rand.Uint32N(s.Wis)) + 1
+		return int32(rand.Uint32N(s.Luc)) + 1
 	}
-	first := wisRoll()
+	first := luckRoll()
 	defense := f32(m.Guard[kind])
 	attackPart := (float64(attack) - float64(attack)/100*level) * float64(factor)
 	defensePart := defense + defense/100*level
@@ -166,10 +184,123 @@ func playerDamage(s *CharacterStats, m *mobCombat, kind int, extra int32, elemen
 	critChance := clampInt(truncInt(f32(s.Critical)/100*100-f32(m.Luck)*float64(float32(0.034))), 5, 99)
 	crit := rand.Int32N(100) < critChance
 	if crit {
-		bonus := store(f32(wisRoll()) * float64(float32(1.4)))
+		bonus := store(f32(luckRoll()) * float64(float32(1.4)))
 		value = store(float64(value)*1.5 + float64(bonus) - float64(bonus)/100*level)
+		if penalty {
+			value = store(float64(value) * float64(float32(0.7)))
+		}
 	}
-	return damageLimits(truncInt(float64(value))), crit
+	damage[0] = truncInt(float64(value))
+	return crit
+}
+
+// playerDamage is CUser::AttackDamage for a normal attack. Returns the
+// HP damage and whether it crit.
+func playerDamage(s *CharacterStats, m *mobCombat, kind int, element uint8, closeRanged bool) (int32, bool) {
+	var damage [3]int32
+	crit := weaponDamage(s, m, kind, &damage, element, m.Attrib, closeRanged)
+	return damageLimits(damage[0]), crit
+}
+
+// skillTarget is what a skill's damage modes read from the mob.
+type skillTarget struct {
+	MaxHP, MaxMP, MaxSP uint32
+	HP, MP, SP          uint32
+}
+
+// playerSkillDamage is CUser::AttackDamage with a skill: DamageType 0 is the
+// raw DamageHP/SP/MP, 1 adds them to the weapon attack, 2 multiplies the
+// weapon damage by them, 3 multiplies the caster's own HP/SP/MP, 4 and 5 are
+// a percentage of the mob's maximum or current HP/MP/SP. The element is the
+// skill's AttrType when set; detail 24 ignores the mob's element.
+func playerSkillDamage(s *CharacterStats, m *mobCombat, def *db.SkillDef, t skillTarget, caster [3]uint32, closeRanged bool) ([3]int32, bool) {
+	values := [3]int32{def.DamageHP, def.DamageSP, def.DamageMP}
+	for i := range values {
+		values[i] = int32(uint16(values[i]))
+	}
+	var damage [3]int32
+	capAll := func() {
+		for i := range damage {
+			damage[i] = min(damage[i], maxDamage)
+		}
+	}
+	switch def.DamageType {
+	case 0:
+		return values, false
+	case 3:
+		for i, v := range values {
+			if v != 0 {
+				damage[i] = max(int32(caster[i]*uint32(v)), 1)
+			}
+		}
+		capAll()
+		return damage, false
+	case 4, 5:
+		source := [3]uint32{t.MaxHP, t.MaxMP, t.MaxSP}
+		if def.DamageType == 5 {
+			source = [3]uint32{t.HP, t.MP, t.SP}
+		}
+		for i, v := range values {
+			if v != 0 {
+				product := math.Trunc(f32(v) / 100 * float64(float32(source[i])))
+				damage[i] = max(int32(uint32(int64(product))), 1)
+			}
+		}
+		capAll()
+		return damage, false
+	case 1:
+		damage = values
+	}
+	element := s.AttackAttr
+	if def.AttrType != 0 {
+		element = def.AttrType
+	}
+	defElement := m.Attrib
+	if def.TypeDetail == 24 {
+		defElement = 0
+	}
+	crit := weaponDamage(s, m, int(def.Kind), &damage, element, defElement, closeRanged)
+	if def.DamageType == 2 {
+		for i, v := range values {
+			if v != 0 {
+				damage[i] = int32(uint32(damage[i]) * uint32(v))
+			}
+		}
+	}
+	capAll()
+	if damage[0] < 11 {
+		damage[0] = rand.Int32N(10) + 1
+	}
+	return damage, crit
+}
+
+// playerSkillHits is CUser::AttackSuccess with a skill: mobs resist a
+// skill's StateType or its ID outright; SuccessType 1-3 roll SuccessValue
+// (2 and 3 add WIS or LUC against the mob's, as an integer ratio);
+// otherwise the normal hit chance of the skill's category applies.
+func playerSkillHits(s *CharacterStats, m *mobCombat, md *db.MobDef, def *db.SkillDef) bool {
+	if def.StateType != 0 && md.ResistState[def.StateType-1] != 0 {
+		return false
+	}
+	for _, id := range md.ResistSkill {
+		if id == def.SkillID {
+			return false
+		}
+	}
+	if def.SuccessType >= 1 && def.SuccessType <= 3 {
+		chance := int32(def.SuccessValue)
+		if def.SuccessType != 1 {
+			mine, theirs := int32(s.Wis), int32(md.Wis)
+			if def.SuccessType == 3 {
+				mine, theirs = int32(s.Luc), int32(md.Luc)
+			}
+			if mine+theirs != 0 {
+				chance += mine / (mine + theirs) * 100
+			}
+		}
+		return rand.Int32N(100) < chance
+	}
+	return playerHits(s, m, int(def.Kind))
 }
 
 func damageLimits(v int32) int32 {
@@ -183,7 +314,7 @@ func damageLimits(v int32) int32 {
 // mobHits is CMob::AttackSuccess against a player.
 func mobHits(m *mobCombat, s *CharacterStats, kind int) bool {
 	if kind == attackMagic {
-		return !magicResisted(m.Level, int32(s.Level), s.Evasion[2], m.Dex, int32(s.Dex), m.Accuracy[2])
+		return !magicResisted(m.Level, int32(s.Level), s.Evasion[2], m.Wis, int32(s.Wis), m.Accuracy[2])
 	}
 	level := float64(float32(m.Level))
 	levels := float64(float32(int32(s.Level) + m.Level))
@@ -194,35 +325,135 @@ func mobHits(m *mobCombat, s *CharacterStats, kind int) bool {
 	return rand.Int32N(100) < chance
 }
 
-// mobDamage is CMob::AttackDamage with one of its attack slots. The
-// player's armour element is not modeled, so the element factor is 1.
+// mobDamage is CMob::AttackDamage (0x004a2920) for a normal attack: the
+// slot's Attack + rand(Attackplus) on top of the category attack, element
+// row 0 against the player's armour element.
 func mobDamage(m *mobCombat, a *db.MobAttack, s *CharacterStats) (int32, bool) {
-	kind := int(min(a.Type, 2))
+	var damage [3]int32
+	attack := store(f32(int32(a.Attack)) + f32(m.Attack[attackMelee]))
+	crit := mobWeaponDamage(m, attackMelee, attack, a.Plus, 0, s.DefenseAttr, s, &damage)
+	return damageLimits(damage[0]), crit
+}
+
+// mobWeaponDamage is the shared weapon branch of CMob::AttackDamage.
+func mobWeaponDamage(m *mobCombat, kind int, attack float32, plus uint16, element, defElement uint8, s *CharacterStats, damage *[3]int32) bool {
 	levelRaw := store((f32(m.Level-int32(s.Level)-1)*100 + f32(m.Level)) / 100 * 10)
 	level := float64(min(max(levelRaw, 1), 95))
-	attack := store(f32(int32(a.Attack)) + f32(m.Attack[kind]))
-	if a.Plus > 0 {
-		attack = store(float64(attack) + f32(int32(rand.Uint32N(uint32(a.Plus)))))
+	if plus > 0 {
+		attack = store(float64(attack) + f32(int32(rand.Uint32N(uint32(plus)))))
 	}
-	wisRoll := func() int32 {
-		if m.Wis <= 0 {
+	factor := float32(1)
+	if element < 9 && defElement < 9 {
+		factor = attackElement[element][defElement]
+	}
+	// The mob's LUC (stMOBInfo +0x3c).
+	luckRoll := func() int32 {
+		if m.Luck <= 0 {
 			return 0
 		}
-		return rand.Int32N(m.Wis) + 1
+		return rand.Int32N(m.Luck) + 1
 	}
-	first := wisRoll()
+	first := luckRoll()
 	defense := f32(s.Guard[kind])
-	attackPart := float64(attack) + float64(attack)/100*level
+	attackPart := (float64(attack) + float64(attack)/100*level) * float64(factor)
 	defensePart := defense - defense/100*level
 	value := store(attackPart - defensePart + f32(first)*float64(float32(0.1)))
 	if value < 0 {
 		value = 0
 	}
-	critChance := clampInt(truncInt(f32(m.Critical)/100*100-f32(int32(s.Wis))*float64(float32(0.034))), 5, 99)
+	// CMob::CriticalSuccess: minus the player's LUC (+0x1234) x 0.034.
+	critChance := clampInt(truncInt(f32(m.Critical)/100*100-f32(int32(s.Luc))*float64(float32(0.034))), 5, 99)
 	crit := rand.Int32N(100) < critChance
 	if crit {
-		bonus := store(f32(wisRoll()) * float64(float32(1.4)))
+		bonus := store(f32(luckRoll()) * float64(float32(1.4)))
 		value = store(float64(value)*1.5 + float64(bonus)/100*level + float64(bonus))
 	}
-	return damageLimits(truncInt(float64(value))), crit
+	damage[0] = truncInt(float64(value))
+	return crit
+}
+
+// mobSkillDamage is CMob::AttackDamage (0x004a3070) with a mob skill
+// (Skills rows of level 100): the same DamageType modes as the player's,
+// with the mob's own resources for mode 3 and the player's pools for 4
+// and 5. The weapon branch uses attack slot 1's Attack/Attackplus and
+// element (the skill's AttrType when set).
+func mobSkillDamage(m *mobCombat, md *db.MobDef, def *db.SkillDef, s *CharacterStats, mobHP uint32) ([3]int32, bool) {
+	values := [3]int32{int32(uint16(def.DamageHP)), int32(uint16(def.DamageSP)), int32(uint16(def.DamageMP))}
+	var damage [3]int32
+	capAll := func() {
+		for i := range damage {
+			damage[i] = min(damage[i], maxDamage)
+		}
+	}
+	switch def.DamageType {
+	case 0:
+		return values, false
+	case 3:
+		own := [3]uint32{mobHP, md.MaxSP, md.MaxMP}
+		for i, v := range values {
+			if v != 0 {
+				damage[i] = max(int32(own[i]*uint32(v)), 1)
+			}
+		}
+		capAll()
+		return damage, false
+	case 4, 5:
+		source := [3]uint32{s.MaxHP, s.MaxSP, s.MaxMP}
+		if def.DamageType == 5 {
+			source = [3]uint32{s.CurrentHP, s.CurrentSP, s.CurrentMP}
+		}
+		for i, v := range values {
+			if v != 0 {
+				product := math.Trunc(f32(v) / 100 * float64(float32(source[i])))
+				damage[i] = max(int32(uint32(int64(product))), 1)
+			}
+		}
+		capAll()
+		return damage, false
+	case 1:
+		damage = values
+	}
+	kind := int(def.Kind)
+	slot := &md.Attacks[0]
+	element := slot.Attrib
+	if def.AttrType != 0 {
+		element = def.AttrType
+	}
+	defElement := s.DefenseAttr
+	if def.TypeDetail == detailNoElement {
+		defElement = 0
+	}
+	attack := store(f32(int32(slot.Attack)) + f32(m.Attack[kind]) + f32(damage[0]))
+	crit := mobWeaponDamage(m, kind, attack, slot.Plus, element, defElement, s, &damage)
+	if def.DamageType == 2 {
+		for i, v := range values {
+			if v != 0 {
+				damage[i] = int32(uint32(damage[i]) * uint32(v))
+			}
+		}
+	}
+	capAll()
+	if damage[0] <= 10 {
+		damage[0] = rand.Int32N(10) + 1
+	}
+	return damage, crit
+}
+
+// mobSkillHits is CMob::AttackSuccess with a skill: SuccessType 1-3 roll
+// SuccessValue, otherwise the category's normal chance.
+func mobSkillHits(m *mobCombat, md *db.MobDef, def *db.SkillDef, s *CharacterStats) bool {
+	if def.SuccessType >= 1 && def.SuccessType <= 3 {
+		chance := int32(def.SuccessValue)
+		if def.SuccessType != 1 {
+			mine, theirs := int32(md.Wis), int32(s.Wis)
+			if def.SuccessType == 3 {
+				mine, theirs = int32(md.Luc), int32(s.Luc)
+			}
+			if mine+theirs != 0 {
+				chance += mine / (mine + theirs) * 100
+			}
+		}
+		return rand.Int32N(100) < chance
+	}
+	return mobHits(m, s, int(def.Kind))
 }

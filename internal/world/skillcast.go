@@ -9,19 +9,12 @@ import (
 
 const (
 	skillResultNormal      = 0
-	skillRangeGrace        = 2.0
 	skillTargetEscapeRange = 100.0
 
-	targetTypeAnyEnemy          = 1
-	targetTypeSelectedEnemy     = 3
 	targetTypeEnemiesNearCaster = 6
 	targetTypeEnemiesNearTarget = 7
 
-	typeDetailInstantHeal  = 41
-	typeDetailPeriodicHeal = 81
-	typeDetailBuff         = 82
-	periodicHealTick       = 3 * time.Second
-	typeAttackMagic        = 3
+	periodicHealTick = 3 * time.Second
 )
 
 // ActiveBuff is a self-buff on the session's character: stat bonuses
@@ -31,7 +24,9 @@ type ActiveBuff struct {
 	SkillID                uint16
 	SkillLevel             uint8
 	EndsAt                 time.Time
-	Bonus                  EquipmentStats
+	Effect, Detail         uint8
+	Attr                   uint8 // AttrType, for the element buffs 94/95
+	Abilities              [3]buffAbility
 	HealHP, HealSP, HealMP uint32
 	nextTickAt             time.Time // zero: no heal component
 }
@@ -44,45 +39,46 @@ type pendingCast struct {
 	targetPos   *[2]float32
 }
 
+type buffAbility struct {
+	Type  uint8
+	Value int32
+}
+
+// addBuffs applies each active buff's abilities, as CUser::AddApplySkillBuff
+// does: detail 82 adds all three, detail 91 negates the first, 94 and 95
+// set the attack and defence element.
 func addBuffs(e EquipmentStats, buffs []ActiveBuff) EquipmentStats {
 	for _, b := range buffs {
-		e.Str, e.Rec, e.Int = satAdd(e.Str, b.Bonus.Str), satAdd(e.Rec, b.Bonus.Rec), satAdd(e.Int, b.Bonus.Int)
-		e.Wis, e.Dex, e.Luc = satAdd(e.Wis, b.Bonus.Wis), satAdd(e.Dex, b.Bonus.Dex), satAdd(e.Luc, b.Bonus.Luc)
-		e.MaxHP, e.MaxMP, e.MaxSP = satAdd(e.MaxHP, b.Bonus.MaxHP), satAdd(e.MaxMP, b.Bonus.MaxMP), satAdd(e.MaxSP, b.Bonus.MaxSP)
+		switch b.Detail {
+		case 94: // attack element
+			e.AttackAttr = b.Attr
+		case 95: // defence element
+			e.DefenseAttr = b.Attr
+		}
+		for i, a := range b.Abilities {
+			v := a.Value
+			if b.Detail == 91 && i == 0 {
+				v = -v
+			}
+			applyAbility(&e, b.Effect, a.Type, v)
+		}
 	}
 	return e
 }
 
 func newBuff(id uint32, def *db.SkillDef, ends time.Time, log logPrinter) ActiveBuff {
-	b := ActiveBuff{ID: id, SkillID: def.SkillID, SkillLevel: def.SkillLevel, EndsAt: ends,
+	b := ActiveBuff{ID: id, SkillID: def.SkillID, SkillLevel: def.SkillLevel, EndsAt: ends, Effect: def.TypeEffect,
+		Detail: uint8(min(def.TypeDetail, 255)), Attr: def.AttrType,
 		HealHP: uint32(max(def.TimeHealHP, 0)), HealSP: uint32(max(def.TimeHealSP, 0)), HealMP: uint32(max(def.TimeHealMP, 0))}
 	if b.HealHP+b.HealSP+b.HealMP > 0 {
 		b.nextTickAt = time.Now().Add(periodicHealTick)
 	}
-	for i, t := range def.AbilityType {
-		v := uint32(max(def.AbilityValue[i], 0))
-		switch t {
-		case 0:
-		case 1:
-			b.Bonus.MaxHP += v
-		case 2:
-			b.Bonus.MaxMP += v
-		case 3:
-			b.Bonus.MaxSP += v
-		case 4:
-			b.Bonus.Str += v
-		case 5:
-			b.Bonus.Rec += v
-		case 6:
-			b.Bonus.Int += v
-		case 7:
-			b.Bonus.Wis += v
-		case 8:
-			b.Bonus.Dex += v
-		case 9:
-			b.Bonus.Luc += v
-		default:
-			log.Printf("Rapture World buff ability_type=%d not implemented (value=%d), ignored", t, def.AbilityValue[i])
+	if def.TypeDetail == 82 || def.TypeDetail == 91 {
+		for i, t := range def.AbilityType {
+			b.Abilities[i] = buffAbility{t, int32(def.AbilityValue[i])}
+			if !applyAbility(&EquipmentStats{}, def.TypeEffect, t, 0) {
+				log.Printf("Rapture World buff ability_type=%d not modeled (value=%d) skill_id=%d", t, def.AbilityValue[i], def.SkillID)
+			}
 		}
 	}
 	return b
@@ -163,12 +159,12 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 		return
 	}
 	stats := s.stats()
-	if stats.CurrentMP < uint32(def.MPCost) || stats.CurrentSP < uint32(def.SPCost) {
+	if sp, mp := s.skillCosts(def, &stats); stats.CurrentMP < mp || stats.CurrentSP < sp {
 		s.log.Printf("Rapture World rejected skill use: not enough MP/SP skill_id=%d", k.SkillID)
 		return
 	}
 	castTarget := target
-	if def.TypeDetail == typeDetailInstantHeal || def.TypeDetail == typeDetailPeriodicHeal || def.TypeDetail == typeDetailBuff {
+	if def.TypeEffect == typeEffectHeal || def.TypeEffect == typeEffectBuff {
 		castTarget = ch.ID
 	}
 	var pos *[2]float32
@@ -217,142 +213,35 @@ func (s *Session) resolveSkill(target uint32, number uint8, op packet.Opcode, ca
 		return
 	}
 	stats := s.stats()
-	if stats.CurrentMP < uint32(def.MPCost) || stats.CurrentSP < uint32(def.SPCost) {
+	if sp, mp := s.skillCosts(def, &stats); stats.CurrentMP < mp || stats.CurrentSP < sp {
 		s.log.Printf("Rapture World rejected skill use: not enough MP/SP skill_id=%d", k.SkillID)
 		return
 	}
-	switch def.TypeDetail {
-	case typeDetailBuff, typeDetailPeriodicHeal:
+	switch def.TypeEffect {
+	case typeEffectBuff:
 		s.startBuff(k, def, op)
-		return
-	case typeDetailInstantHeal:
+	case typeEffectHeal:
 		s.healSkill(k, def, op, stats)
-		return
-	}
-	var targets []uint32
-	if def.TargetType == targetTypeEnemiesNearCaster {
-		targets = mobsWithinRange(ch.MapID, ch.PosX, ch.PosZ, def.ApplyRange)
-	} else {
-		mob, ok := MobByID(ch.MapID, target)
-		if !ok || mob.CurrentHP == 0 {
-			return
-		}
-		if castPos != nil {
-			if DistanceXZ(castPos[0], castPos[1], mob.PosX, mob.PosZ) > skillTargetEscapeRange {
-				s.log.Printf("Rapture World rejected skill use: target escaped during cast skill_id=%d", k.SkillID)
-				return
-			}
-		} else if d := DistanceXZ(ch.PosX, ch.PosZ, mob.PosX, mob.PosZ); d > max(float32(def.AttackRange), 1)+skillRangeGrace {
-			s.log.Printf("Rapture World rejected skill use: out of range skill_id=%d distance=%.2f range=%d", k.SkillID, d, def.AttackRange)
-			return
-		}
-		switch def.TargetType {
-		case targetTypeAnyEnemy, targetTypeSelectedEnemy:
-			targets = []uint32{mob.ID}
-		case targetTypeEnemiesNearTarget:
-			targets = mobsWithinRange(ch.MapID, mob.PosX, mob.PosZ, def.ApplyRange)
-		default:
-			s.log.Printf("Rapture World rejected skill use: unsupported target_type=%d skill_id=%d", def.TargetType, k.SkillID)
-			return
-		}
-	}
-	// Skills.TypeAttack 3 is magic; otherwise the weapon decides melee or
-	// ranged. The skill's DamageHP adds to the attack before
-	// CUser::AttackDamage, as the original seeds damage[0].
-	kind := attackMelee
-	if def.TypeAttack == typeAttackMagic {
-		kind = attackMagic
-	} else if stats.RangedWeapon {
-		kind = attackRanged
-	}
-	extra := def.DamageHP
-	s.startCooldown(k, def)
-	s.spendDelta(uint32(def.MPCost), uint32(def.SPCost))
-	s.persist()
-	s.send(buildSkillUsedSpMp(uint32(def.SPCost), uint32(def.MPCost)), "0x050C skill used sp/mp")
-	s.log.Printf("Rapture World skill use skill_id=%d level=%d target_type=%d targets=%d kind=%d", k.SkillID, k.Level, def.TargetType, len(targets), kind)
-	if len(targets) == 0 {
-		s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill use (no targets hit)")
-	}
-	for _, t := range targets {
-		s.skillHit(t, &stats, kind, extra, def, k, op)
-	}
-}
-
-func mobsWithinRange(mapID uint16, x, z float32, r uint8) []uint32 {
-	limit := max(float32(r), 1) + skillRangeGrace
-	var out []uint32
-	for _, m := range EntitiesOnMap(mapID).Mobs {
-		if m.CurrentHP > 0 && DistanceXZ(x, z, m.PosX, m.PosZ) <= limit {
-			out = append(out, m.ID)
-		}
-	}
-	return out
-}
-
-func (s *Session) skillHit(target uint32, stats *CharacterStats, kind int, extra int32, def *db.SkillDef, k db.CharacterSkill, op packet.Opcode) {
-	ch := s.char
-	mob, ok := MobByID(ch.MapID, target)
-	md := db.MustDefs().Mobs[mob.MobID]
-	if !ok || md == nil {
-		return
-	}
-	mc := mobCombatFor(md)
-	SetMobAggro(ch.MapID, target, ch.ID)
-	s.lastCombatAt = time.Now()
-	if !playerHits(stats, &mc, kind) {
-		sendNear(ch.MapID, mob.PosX, mob.PosZ, CombatRadius,
-			buildSkillUseResult(op, attackResultMiss, ch.ID, mob.ID, k.SkillID, k.Level, 0, 0, 0), "skill use (miss)")
-		return
-	}
-	damage, crit := playerDamage(stats, &mc, kind, extra, stats.AttackAttr)
-	r, ok := DamageMob(ch.MapID, target, uint32(damage))
-	if !ok {
-		return
-	}
-	code := uint8(skillResultNormal)
-	if crit {
-		code = attackResultCritical
-	}
-	sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, CombatRadius,
-		buildSkillUseResult(op, code, ch.ID, r.Mob.ID, k.SkillID, k.Level, r.DamageHP, 0, 0), "skill use")
-	s.resolveMobDamage(&r)
-	if r.Killed {
-		return
-	}
-	if def.AddDamageHP > 0 {
-		if x, ok := DamageMob(ch.MapID, target, uint32(def.AddDamageHP)); ok {
-			w := packet.New(packet.SkillExtraDamage)
-			w.U32(ch.ID)
-			w.U32(x.Mob.ID)
-			w.U16(k.SkillID)
-			w.U8(k.Level)
-			w.U16(x.DamageHP)
-			w.U16(0)
-			w.U16(0)
-			sendNear(ch.MapID, x.Mob.PosX, x.Mob.PosZ, CombatRadius, w.MustFinish(), "0x051A skill extra damage")
-			s.resolveMobDamage(&x)
-		}
-	}
-	if def.TimeDamageHP > 0 || def.TimeDamageSP > 0 || def.TimeDamageMP > 0 {
-		ApplyDotToMob(ch.MapID, target, ch.ID, k.SkillID, k.Level, uint32(max(def.TimeDamageHP, 0)), time.Duration(def.KeepTime)*time.Second)
-		sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, CombatRadius,
-			buildMobDebuff(packet.MobDebuffAdd, MobDebuffTypeDOT, target, k.SkillID, k.Level), "0x030C mob debuff add")
-		s.log.Printf("Rapture World skill dot started skill_id=%d mob_global_id=%d keep_time=%d", k.SkillID, target, def.KeepTime)
+	case typeEffectAttack, typeEffectDebuff:
+		s.skillAttack(k, def, target, castPos, stats)
+	default:
+		s.log.Printf("Rapture World rejected skill use: effect %d not usable skill_id=%d", def.TypeEffect, k.SkillID)
 	}
 }
 
 func (s *Session) healSkill(k db.CharacterSkill, def *db.SkillDef, op packet.Opcode, stats CharacterStats) {
 	ch := s.char
 	s.startCooldown(k, def)
+	// CUser::HealUser: a non-zero HealHP adds twice the caster's WIS.
 	heal := uint32(max(def.HealHP, 0))
-	if def.TypeAttack == typeAttackMagic {
+	if heal != 0 {
 		heal = satAdd(heal, satMul(stats.Wis, 2))
 	}
 	hp, mp, sp := s.healDelta(heal, uint32(max(def.HealMP, 0)), uint32(max(def.HealSP, 0)))
-	s.spendDelta(uint32(def.MPCost), uint32(def.SPCost))
+	costSP, costMP := s.skillCosts(def, &stats)
+	s.spendDelta(costMP, costSP)
 	s.persist()
-	s.send(buildSkillUsedSpMp(uint32(def.SPCost), uint32(def.MPCost)), "0x050C skill used sp/mp")
+	s.send(buildSkillUsedSpMp(costSP, costMP), "0x050C skill used sp/mp")
 	s.log.Printf("Rapture World skill heal skill_id=%d hp=%d mp=%d sp=%d", k.SkillID, hp, sp, mp)
 	s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill heal")
 	st := s.stats()
@@ -361,10 +250,12 @@ func (s *Session) healSkill(k db.CharacterSkill, def *db.SkillDef, op packet.Opc
 
 func (s *Session) startBuff(k db.CharacterSkill, def *db.SkillDef, op packet.Opcode) {
 	ch := s.char
+	stats := s.stats()
 	s.startCooldown(k, def)
-	s.spendDelta(uint32(def.MPCost), uint32(def.SPCost))
+	sp, mp := s.skillCosts(def, &stats)
+	s.spendDelta(mp, sp)
 	s.persist()
-	s.send(buildSkillUsedSpMp(uint32(def.SPCost), uint32(def.MPCost)), "0x050C skill used sp/mp")
+	s.send(buildSkillUsedSpMp(sp, mp), "0x050C skill used sp/mp")
 	id := uint32(0)
 	kept := s.buffs[:0]
 	for _, b := range s.buffs {
@@ -381,14 +272,14 @@ func (s *Session) startBuff(k db.CharacterSkill, def *db.SkillDef, op packet.Opc
 		}
 		id++
 	}
-	s.buffs = append(s.buffs, newBuff(id, def, time.Now().Add(time.Duration(def.KeepTime)*time.Second), s.log))
-	s.log.Printf("Rapture World skill buff started skill_id=%d level=%d keep_time=%d", k.SkillID, k.Level, def.KeepTime)
+	s.buffs = append(s.buffs, newBuff(id, def, time.Now().Add(time.Duration(def.KeepSeconds)*time.Second), s.log))
+	s.log.Printf("Rapture World skill buff started skill_id=%d level=%d keep_time=%d", k.SkillID, k.Level, def.KeepSeconds)
 	s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill buff cast")
 	w := packet.New(packet.BuffAdd)
 	w.U32(id)
 	w.U16(k.SkillID)
 	w.U8(k.Level)
-	w.U32(uint32(def.KeepTime))
+	w.U32(uint32(def.KeepSeconds))
 	s.send(w.MustFinish(), "0x050D buff add")
 	s.sendBuffStats("after buff")
 }
@@ -488,7 +379,7 @@ func restoreBuffs(charID uint32, log logPrinter) []ActiveBuff {
 	var out []ActiveBuff
 	for _, r := range rows {
 		def := db.MustDefs().Skill(r.SkillID, r.Level)
-		if def == nil || (def.TypeDetail != typeDetailBuff && def.TypeDetail != typeDetailPeriodicHeal) {
+		if def == nil || def.TypeEffect != typeEffectBuff {
 			continue
 		}
 		out = append(out, newBuff(uint32(len(out)+1), def, time.Now().Add(time.Duration(r.LeftSeconds)*time.Second), log))
