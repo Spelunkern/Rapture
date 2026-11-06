@@ -37,8 +37,12 @@ func main() {
 		logger.Printf("Rapture World failed to load PS_GameDefs: %v", err)
 		os.Exit(1)
 	}
-	logger.Printf("Rapture World loaded definitions items=%d skills=%d mobs=%d products=%d",
-		len(defs.Items), len(defs.Skills), len(defs.Mobs), len(defs.Products))
+	logger.Printf("Rapture World loaded definitions items=%d skills=%d mobs=%d products=%d status=%d base_items=%d",
+		len(defs.Items), len(defs.Skills), len(defs.Mobs), len(defs.Products), len(defs.Status), len(defs.BaseItems))
+	if err := world.LoadGameConfig(logger); err != nil {
+		logger.Printf("Rapture World failed to load data/game (copy the EP4.5 PS_Game/Data files there): %v", err)
+		os.Exit(1)
+	}
 	if err := world.LoadSvmaps(logger); err != nil {
 		logger.Printf("Rapture World failed to load maps: %v", err)
 		os.Exit(1)

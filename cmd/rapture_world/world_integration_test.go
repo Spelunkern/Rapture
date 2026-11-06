@@ -93,6 +93,9 @@ func TestWorldSessionAgainstSQLServer(t *testing.T) {
 	if _, err := db.Definitions(); err != nil {
 		t.Fatal(err)
 	}
+	if err := world.LoadGameConfig(logger); err != nil {
+		t.Fatal(err)
+	}
 	if err := world.LoadSvmaps(logger); err != nil {
 		t.Fatal(err)
 	}
@@ -147,13 +150,14 @@ func TestWorldSessionAgainstSQLServer(t *testing.T) {
 	if r := c.until(packet.CreateCharacter, seen); r[2] != 0 {
 		t.Fatalf("create rejected (%d)", r[2])
 	}
-	var charID uint32
-	for charID == 0 {
-		p := c.until(packet.CharacterList, seen)
-		if p[2] == 4 {
-			charID, _ = packet.U32(p[3:])
-		}
+	c.until(packet.AccountFaction, seen) // end of the refreshed character list
+	charID, _, found, err := db.CharacterByName(name)
+	if err != nil || !found {
+		t.Fatalf("created character not found: %v", err)
 	}
+	items, _ := db.CharacterItems(charID)
+	detail, _ := db.CharacterDetail(testAccount, charID)
+	t.Logf("starter items=%d start map=%d pos=(%.1f, %.1f, %.1f)", len(items), detail.MapID, detail.PosX, detail.PosY, detail.PosZ)
 	t.Logf("created %s id=%d", name, charID)
 	defer func() {
 		if ok, err := db.DeleteCharacter(testAccount, charID); !ok || err != nil {

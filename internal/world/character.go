@@ -32,13 +32,11 @@ const (
 	InventoryLastBag   = 5
 	InventorySlotCount = 24
 
-	FactionLight           = 0
-	FactionDark            = 1
-	FactionNone            = 2
-	MaxModeUltimate        = 3
-	MaxCharacterSlots      = 5
-	StartMapID             = 1
-	SpawnX, SpawnY, SpawnZ = 500.0, 50.0, 500.0
+	FactionLight      = 0
+	FactionDark       = 1
+	FactionNone       = 2
+	MaxModeUltimate   = 3
+	MaxCharacterSlots = 5
 
 	MotionSitDown = 10
 	MotionStandUp = 11
@@ -58,8 +56,17 @@ func isConsumableType(t uint8) bool {
 	return false
 }
 
-// basePoolForLevel is the flat 100-per-level base max HP/MP/SP.
-func basePoolForLevel(level uint16) uint32 { return uint32(max(level, 1)) * basePoolPerLevel }
+// basePools are the base max HP/MP/SP for a level and job from
+// PS_GameDefs.dbo.StatusDefs, falling back to the highest defined level.
+func basePools(level uint16, job uint8) (hp, mp, sp uint32) {
+	status := db.MustDefs().Status
+	for l := max(level, 1); l >= 1; l-- {
+		if st, ok := status[db.StatusKey{Level: l, Job: job}]; ok {
+			return st.HP, st.MP, st.SP
+		}
+	}
+	return basePoolPerLevel, basePoolPerLevel, basePoolPerLevel
+}
 
 func satAdd(a, b uint32) uint32 {
 	if s := a + b; s >= a {
@@ -205,8 +212,7 @@ func StatsFor(ch *db.Character, e EquipmentStats) CharacterStats {
 	curHP, curMP, curSP := uint32(100), uint32(100), uint32(100)
 	if ch != nil {
 		bStr, bRec, bInt, bWis, bDex, bLuc = uint32(ch.Str), uint32(ch.Rec), uint32(ch.Int), uint32(ch.Wis), uint32(ch.Dex), uint32(ch.Luc)
-		pool := basePoolForLevel(ch.Level)
-		baseHP, baseMP, baseSP = pool, pool, pool
+		baseHP, baseMP, baseSP = basePools(ch.Level, ch.Class)
 		curHP, curMP, curSP = ch.CurrentHP, ch.CurrentMP, ch.CurrentSP
 	}
 	var s CharacterStats
@@ -254,7 +260,7 @@ func charName(ch *db.Character) string {
 
 func charPos(ch *db.Character) (float32, float32, float32) {
 	if ch == nil {
-		return SpawnX, SpawnY, SpawnZ
+		return 0, 0, 0
 	}
 	return ch.PosX, ch.PosY, ch.PosZ
 }
@@ -354,7 +360,7 @@ func buildCharacterEnteredMap(ch *db.Character, isAdmin, firstLoad bool) []byte 
 }
 
 func buildCharacterMapPosition(ch *db.Character) []byte {
-	mapID := uint16(StartMapID)
+	mapID := uint16(0)
 	if ch != nil {
 		mapID = ch.MapID
 	}

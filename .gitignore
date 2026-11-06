@@ -18,6 +18,8 @@ runtime/*.bin
 # Original Shaiya map data (proprietary game data, not project source --
 # see data/maps/README.txt for where to place your own copies)
 data/maps/*.svmap
+data/game/*
+!data/game/README.txt
 
 # Personal/session-continuity notes, not part of the public project
 NEXT_SESSION.txt

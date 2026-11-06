@@ -106,20 +106,24 @@ func (s *Session) resurrect() bool {
 	if ch == nil {
 		return false
 	}
-	x, y, z := ch.PosX, ch.PosY, ch.PosZ
-	if area, ok := FindNearestSpawnArea(ch.MapID, s.faction, ch.PosX, ch.PosZ); ok {
+	// Map.ini RebirthMapPos(1/2) when the map defines one (dungeons and
+	// some fields), otherwise the faction's nearest svmap spawn area.
+	mapID, x, y, z := ch.MapID, ch.PosX, ch.PosY, ch.PosZ
+	if p, ok := rebirthPosition(ch.MapID, s.faction); ok {
+		mapID, x, y, z = p.MapID, p.X, p.Y, p.Z
+	} else if area, ok := FindNearestSpawnArea(ch.MapID, s.faction, ch.PosX, ch.PosZ); ok {
 		x, y, z = area.Center()
 	}
 	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
 	stats := StatsFor(ch, s.equipment())
 	s.send(buildCharacterReviveInit(ch.ID), "0x0406 revive init")
-	s.applyTeleport(ch.MapID, x, y, z, "resurrect")
+	s.applyTeleport(mapID, x, y, z, "resurrect")
 	s.send(buildCharacterResurrect(ch.ID, x, y, z), "0x0551 resurrect reposition")
 	s.send(buildCharacterReviveHitpoints(ch.ID, stats.MaxHP, stats.MaxMP, stats.MaxSP), "0x0505 revive hitpoints")
 	if s.player != nil {
 		s.player.SetAlive(true)
 	}
-	s.log.Printf("Rapture World resurrected character_id=%d map=%d pos=(%.2f, %.2f, %.2f)", ch.ID, ch.MapID, x, y, z)
+	s.log.Printf("Rapture World resurrected character_id=%d map=%d pos=(%.2f, %.2f, %.2f)", ch.ID, mapID, x, y, z)
 	return true
 }
 

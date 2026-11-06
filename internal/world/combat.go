@@ -214,8 +214,8 @@ func scaledKillExp(charLevel, mobLevel uint16, mobExp uint32) uint32 {
 }
 
 // applyExpGain adds exp (Chars.Exp is progress within the level) and
-// advances levels per ExpDefs; a level-up refreshes the base pools and
-// heals fully. Base stats do not grow with level by design.
+// advances levels per ExpDefs; a level-up refreshes the base pools from
+// StatusDefs and heals fully.
 func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
 	if ch.Level >= LevelCap || gained == 0 {
 		return 0
@@ -232,9 +232,8 @@ func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
 		levels++
 	}
 	if levels > 0 {
-		base := basePoolForLevel(ch.Level)
-		ch.MaxHP, ch.MaxMP, ch.MaxSP = base, base, base
-		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = base, base, base
+		ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch.Level, ch.Class)
+		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
 	}
 	return levels
 }

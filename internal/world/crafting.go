@@ -22,9 +22,6 @@ const (
 	composeResultFailure   = 1
 )
 
-var enchantSuccessPercent = [enchantMaxLevel]uint32{100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
-	100, 100, 100, 100, 100, 100, 100, 100, 100, 100}
-
 func craftString(pairs [10]uint32) string {
 	var b strings.Builder
 	for _, v := range pairs {
@@ -106,7 +103,11 @@ func (s *Session) handleEnchantAdd(p []byte) {
 	uidL, uidM, uidI := lap.UID, mat.UID, item.UID
 	s.adjustCount(uidL, lapLeft)
 	s.adjustCount(uidM, matLeft)
-	if !chanceSucceeds(enchantSuccessPercent[craft.EnchantLevel]) {
+	rate := enchantConfig.DefenseRate[craft.EnchantLevel]
+	if weapon {
+		rate = enchantConfig.WeaponRate[craft.EnchantLevel]
+	}
+	if rand.Uint32N(1_000_000) >= rate { // ItemEnchant.ini, per million
 		s.persist()
 		s.send(buildEnchantResult(0, lBag, lSlot, lapLeft, mBag, mSlot, matLeft, iBag, iSlot, ch.Money, item.CraftName), "0x0805 enchant add result")
 		return

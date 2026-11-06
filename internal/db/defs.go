@@ -110,6 +110,25 @@ type ExpKey struct {
 	Grow  uint8 // ExpDefs.Grow, 1-4 (Chars.Grow + 1)
 }
 
+// StatusKey indexes StatusDefs by level and job (Chars.Job).
+type StatusKey struct {
+	Level uint16
+	Job   uint8
+}
+
+// Status is a StatusDefs row: base max HP/SP/MP for a level and job.
+type Status struct{ HP, SP, MP uint32 }
+
+// BaseItem is a BaseItemsDefs row: an item a new character of that
+// family and job starts with, in inventory bag 1 at Slot.
+type BaseItem struct {
+	Type, TypeID, Count, Slot uint8
+	Quality                   uint16
+}
+
+// BaseItemKey indexes BaseItemsDefs by family (race) and job.
+type BaseItemKey struct{ Family, Job uint8 }
+
 // Defs holds every PS_GameDefs table the world needs.
 type Defs struct {
 	Items        map[ItemKey]*ItemDef
@@ -119,6 +138,8 @@ type Defs struct {
 	MobDrops     map[uint16][]MobDrop
 	Exp          map[ExpKey]uint32
 	Products     map[string]*Product
+	Status       map[StatusKey]Status
+	BaseItems    map[BaseItemKey][]BaseItem
 }
 
 var (
@@ -167,7 +188,8 @@ func loadDefs() (*Defs, error) {
 	}
 	d := &Defs{Items: map[ItemKey]*ItemDef{}, ItemsByGrade: map[uint16][]*ItemDef{},
 		Skills: map[SkillKey]*SkillDef{}, Mobs: map[uint16]*MobDef{}, MobDrops: map[uint16][]MobDrop{},
-		Exp: map[ExpKey]uint32{}, Products: map[string]*Product{}}
+		Exp: map[ExpKey]uint32{}, Products: map[string]*Product{}, Status: map[StatusKey]Status{},
+		BaseItems: map[BaseItemKey][]BaseItem{}}
 	c, cancel := longCtx()
 	defer cancel()
 
@@ -293,6 +315,40 @@ func loadDefs() (*Defs, error) {
 			return nil, fmt.Errorf("scan ExpDefs: %w", err)
 		}
 		d.Exp[ExpKey{clampU16(level), grow}] = uint32(max(exp, 0))
+	}
+	rows.Close()
+
+	rows, err = pool.QueryContext(c, `SELECT Level, Job, HP, SP, MP FROM dbo.StatusDefs`)
+	if err != nil {
+		return nil, fmt.Errorf("load StatusDefs: %w", err)
+	}
+	for rows.Next() {
+		var level, hp, sp, mp int64
+		var job uint8
+		if err := rows.Scan(&level, &job, &hp, &sp, &mp); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan StatusDefs: %w", err)
+		}
+		d.Status[StatusKey{clampU16(level), job}] = Status{uint32(max(hp, 0)), uint32(max(sp, 0)), uint32(max(mp, 0))}
+	}
+	rows.Close()
+
+	rows, err = pool.QueryContext(c, `SELECT Family, Job, Type, TypeID, Count, Slot, ISNULL(Quality,0)
+		FROM dbo.BaseItemsDefs ORDER BY RowID`)
+	if err != nil {
+		return nil, fmt.Errorf("load BaseItemsDefs: %w", err)
+	}
+	for rows.Next() {
+		var family, job uint8
+		var b BaseItem
+		var quality int64
+		if err := rows.Scan(&family, &job, &b.Type, &b.TypeID, &b.Count, &b.Slot, &quality); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan BaseItemsDefs: %w", err)
+		}
+		b.Quality = clampU16(quality)
+		k := BaseItemKey{family, job}
+		d.BaseItems[k] = append(d.BaseItems[k], b)
 	}
 	rows.Close()
 

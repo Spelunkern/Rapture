@@ -181,12 +181,11 @@ func (s *Session) sendStatPackets() {
 	}
 }
 
-// normalize derives the base pools from the level (Chars only stores the
+// normalize derives the base pools from StatusDefs (Chars only stores the
 // current HP/MP/SP) and clamps the current values.
 func normalize(ch *db.Character) {
-	base := basePoolForLevel(ch.Level)
-	ch.MaxHP, ch.MaxMP, ch.MaxSP = base, base, base
-	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = min(ch.CurrentHP, base), min(ch.CurrentMP, base), min(ch.CurrentSP, base)
+	ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch.Level, ch.Class)
+	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = min(ch.CurrentHP, ch.MaxHP), min(ch.CurrentMP, ch.MaxMP), min(ch.CurrentSP, ch.MaxSP)
 }
 
 // tick runs the per-iteration work: mailboxes, buffs, regen, casts and
@@ -515,7 +514,7 @@ func (s *Session) handleCreateCharacter(p []byte) {
 		return
 	}
 	nc := db.NewCharacter{Slot: p[2], Race: p[3], Mode: p[4], Hair: p[5], Face: p[6], Height: p[7], Class: p[8],
-		Gender: p[9], Name: packet.FixedASCII(p[10:]), MapID: StartMapID, PosX: SpawnX, PosY: SpawnY, PosZ: SpawnZ}
+		Gender: p[9], Name: packet.FixedASCII(p[10:])}
 	reject := func(why string) {
 		s.log.Printf("Rapture World rejected create character name=%q slot=%d: %s", nc.Name, nc.Slot, why)
 		s.send(buildCreateCharacterResult(false), "0x0102 create character rejected")
@@ -536,14 +535,32 @@ func (s *Session) handleCreateCharacter(p []byte) {
 		reject("name in use")
 		return
 	}
-	pool := int16(basePoolForLevel(1))
-	id, err := db.CreateCharacter(s.account, nc, pool, pool, pool)
+	if nc.Race > 3 {
+		reject("invalid race")
+		return
+	}
+	// Map.ini start position per race; StatusDefs level-1 pools per job.
+	start := mapConfig.Start[nc.Race]
+	nc.MapID, nc.PosX, nc.PosY, nc.PosZ = start.MapID, start.X, start.Y, start.Z
+	hp, mp, sp := basePools(1, nc.Class)
+	id, err := db.CreateCharacter(s.account, nc, int16(hp), int16(mp), int16(sp))
 	if err != nil {
 		s.log.Printf("Rapture World create character failed: %v", err)
 		reject("database")
 		return
 	}
-	s.log.Printf("Rapture World created character id=%d name=%q", id, nc.Name)
+	// BaseItemsDefs: the family/job starter items, in bag 1 at their slots.
+	for _, b := range db.MustDefs().BaseItems[db.BaseItemKey{Family: nc.Race, Job: nc.Class}] {
+		quality := b.Quality
+		if def := db.MustDefs().Item(b.Type, b.TypeID); def != nil && quality == 0 {
+			quality = def.Quality
+		}
+		it := db.Item{Bag: 1, Slot: b.Slot, Type: b.Type, TypeID: b.TypeID, Quality: quality, Count: max(b.Count, 1)}
+		if err := db.AddCharacterItem(id, &it); err != nil {
+			s.log.Printf("Rapture World starter item %d/%d failed: %v", b.Type, b.TypeID, err)
+		}
+	}
+	s.log.Printf("Rapture World created character id=%d name=%q map=%d", id, nc.Name, nc.MapID)
 	s.send(buildCreateCharacterResult(true), "0x0102 create character ok")
 	s.sendCharacterSelect()
 }
