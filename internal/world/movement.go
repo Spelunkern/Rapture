@@ -64,7 +64,7 @@ func (s *Session) introduceToOthers(label string) {
 	if len(others) == 0 {
 		return
 	}
-	frames := [][]byte{s.player.EnteredMapPacket(), s.player.ShapePacket(), s.player.MovePacket(), s.player.OverlayPacket()}
+	frames := [][]byte{s.player.EnteredMapPacket(), s.player.ShapePacket(), s.player.MovePacket()}
 	if s.player.IsSitting() {
 		frames = append(frames, s.player.SitMotionPacket())
 	}

@@ -142,31 +142,13 @@ func (s *Session) adjustCount(uid int64, count uint8) {
 	}
 }
 
-// --- gems (0x0801 / 0x0802 / 0x0809 / 0x080A) ---
-
-func buildGemPossibility(op packet.Opcode) []byte {
-	w := packet.New(op)
-	w.U8(1)
-	w.Bytes(make([]byte, 5))
-	w.U8(0x80)
-	w.U8(100 << 1) // rate percent << 1
-	w.U8(0x40)
-	w.U32(0) // free
-	return w.MustFinish()
-}
-
-func (s *Session) handleGemPossibility(op packet.Opcode, p []byte) {
-	if len(p) >= 8 {
-		s.send(buildGemPossibility(op), "gem possibility")
-	}
-}
+// --- gems (0x0801 / 0x0802) ---
 
 func buildGemAddResult(result, gBag, gSlot, gCount, iBag, iSlot, pos, gemID uint8, money uint32) []byte {
 	w := packet.New(packet.GemAdd)
 	w.Bytes([]byte{result, gBag, gSlot, gCount, iBag, iSlot, pos, gemID})
-	w.U32(0)
+	w.U32(0) // four unused bytes (client reader 0x0801: 12 bytes + money)
 	w.U32(money)
-	w.U16(0)
 	return w.MustFinish()
 }
 
@@ -295,7 +277,6 @@ func (s *Session) handleGemRemove(p []byte) {
 	w.Bool(extracted)
 	w.U8(iBag)
 	w.U8(iSlot)
-	w.U8(0xFF)
 	w.Bytes(removed[:])
 	w.Bytes(ids[:])
 	w.Bytes(bags[:])

@@ -394,8 +394,6 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.handleChangeAppearance(p)
 	case packet.EnchantAdd:
 		s.handleEnchantAdd(p)
-	case packet.GemAddPossibility, packet.GemRemovePossibility:
-		s.handleGemPossibility(op, p)
 	case packet.GemAdd:
 		s.handleGemAdd(p)
 	case packet.GemRemove:
@@ -698,7 +696,6 @@ func (s *Session) handleMapLoaded() {
 		s.send(o.EnteredMapPacket(), "0x0201 other character entered map")
 		s.send(o.ShapePacket(), "0x0303 other character shape")
 		s.send(o.MovePacket(), "0x0501 other character move")
-		s.send(o.OverlayPacket(), "0x0240 other character name color")
 		if o.IsSitting() {
 			s.send(o.SitMotionPacket(), "0x0506 other character sitting")
 		}

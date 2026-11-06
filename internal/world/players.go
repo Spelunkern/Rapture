@@ -257,10 +257,6 @@ func (p *ConnectedPlayer) EnteredMapPacket() []byte {
 	return buildCharacterEnteredMap(&p.character, p.IsAdmin, false)
 }
 
-func (p *ConnectedPlayer) OverlayPacket() []byte {
-	return buildCharacterOverlay(p.CharacterID, nameColorFor(p.IsAdmin))
-}
-
 // ShapePacket never embeds sitting; sit is sent as a separate 0x0506.
 func (p *ConnectedPlayer) ShapePacket() []byte {
 	p.mu.Lock()

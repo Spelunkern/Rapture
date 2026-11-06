@@ -116,12 +116,7 @@ func buildMapAddItem(m *MapItem) []byte {
 	}
 	w.F32(m.PosX)
 	w.F32(m.PosY)
-	w.F32(m.PosZ)
-	if m.Money > 0 {
-		w.U32(0)
-	} else {
-		w.U32(m.OwnerID)
-	}
+	w.F32(m.PosZ) // the client reads no owner (0x0058f320)
 	return w.MustFinish()
 }
 

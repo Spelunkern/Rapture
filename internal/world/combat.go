@@ -213,9 +213,10 @@ func scaledKillExp(charLevel, mobLevel uint16, mobExp uint32) uint32 {
 	return uint32(min(max(v, 0), int64(^uint32(0))))
 }
 
-// applyExpGain adds exp (Chars.Exp is progress within the level) and
-// advances levels per ExpDefs; a level-up refreshes the base pools from
-// StatusDefs and heals fully.
+// applyExpGain adds exp. Chars.Exp is the cumulative total and ExpDefs
+// gives, per level and growth mode, the total needed to reach the next
+// level, as in the original server. A level-up refreshes the base pools
+// from StatusDefs and heals fully.
 func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
 	if ch.Level >= LevelCap || gained == 0 {
 		return 0
@@ -227,7 +228,6 @@ func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
 		if req == 0 || ch.Exp < req {
 			break
 		}
-		ch.Exp -= req
 		ch.Level++
 		levels++
 	}
@@ -236,6 +236,17 @@ func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
 		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
 	}
 	return levels
+}
+
+// expBounds are the cumulative exp at the start of the character's level
+// and the total needed for the next one (ExpDefs).
+func expBounds(ch *db.Character) (prev, next uint32) {
+	exp := db.MustDefs().Exp
+	grow := ch.Mode + 1
+	if ch.Level > 1 {
+		prev = exp[db.ExpKey{Level: ch.Level - 1, Grow: grow}]
+	}
+	return prev, exp[db.ExpKey{Level: ch.Level, Grow: grow}]
 }
 
 func (s *Session) grantKillExp(mobID, mobLevel uint16, mobExp uint32) {

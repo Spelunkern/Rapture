@@ -980,17 +980,23 @@ func buildMobLeave(id uint32) []byte {
 	return w.MustFinish()
 }
 
-func buildMobHP(op packet.Opcode, m *MapMob) []byte {
-	w := packet.New(op)
+// buildMobTargetHP (0x0305): mob id, HP (client reader 0x0058f2d0).
+func buildMobTargetHP(m *MapMob) []byte {
+	w := packet.New(packet.TargetMobHpUpdate)
 	w.U32(m.ID)
 	w.I32(int32(min(m.CurrentHP, math.MaxInt32)))
-	w.U8(5) // AttackSpeed.Normal
-	w.U8(2) // MoveSpeed.Normal
 	return w.MustFinish()
 }
 
-func buildMobTargetHP(m *MapMob) []byte { return buildMobHP(packet.TargetMobHpUpdate, m) }
-func buildMobState(m *MapMob) []byte    { return buildMobHP(packet.TargetMobGetState, m) }
+// buildMobState (0x0304): mob id, HP, attack speed, move speed.
+func buildMobState(m *MapMob) []byte {
+	w := packet.New(packet.TargetMobGetState)
+	w.U32(m.ID)
+	w.I32(int32(min(m.CurrentHP, math.MaxInt32)))
+	w.U8(5) // attack speed: normal
+	w.U8(2) // move speed: normal
+	return w.MustFinish()
+}
 
 func buildCharacterMobAttack(characterID, mobID uint32, result uint8, damage uint16) []byte {
 	w := packet.New(packet.CharacterMobAutoAttack)

@@ -34,7 +34,6 @@ const (
 	CharacterEnteredMap    Opcode = 0x0201
 	AutoAttackStop         Opcode = 0x0212
 	SetMoney               Opcode = 0x0213
-	CharacterOverlay       Opcode = 0x0240
 	TargetMobGetState      Opcode = 0x0304
 	TargetMobHpUpdate      Opcode = 0x0305
 	TargetClear            Opcode = 0x030A

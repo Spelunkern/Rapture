@@ -148,6 +148,12 @@ var (
 	defsErr  error
 )
 
+// SetDefsForTest installs definitions without a database (unit tests).
+func SetDefsForTest(d *Defs) {
+	defsOnce.Do(func() {})
+	defs, defsErr = d, nil
+}
+
 // Definitions returns the cached definitions, loading them on first use.
 func Definitions() (*Defs, error) {
 	defsOnce.Do(func() { defs, defsErr = loadDefs() })

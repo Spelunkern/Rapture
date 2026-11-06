@@ -40,9 +40,6 @@ const (
 
 	MotionSitDown = 10
 	MotionStandUp = 11
-
-	nameColorNormal = 0xFFFFFFFF
-	nameColorGM     = 0xFF3B9EFF
 )
 
 var consumableItemTypes = []uint8{25, 100, 101, 102}
@@ -265,8 +262,11 @@ func charPos(ch *db.Character) (float32, float32, float32) {
 	return ch.PosX, ch.PosY, ch.PosZ
 }
 
-// buildCharacterDetails (0x0105): stat_point, skill_point, hp, mp, sp, exp,
-// money, position, kills/deaths/victories/defeats, 11-byte tail.
+// buildCharacterDetails (0x0105), per the client's reader (0x0058dbd0):
+// stat point, skill point (u16), max HP, MP, SP (u32), direction (u16),
+// then eleven u32 and the 25-byte guild name. The three exp fields are
+// the cumulative exp at the level's start, the total for the next level
+// and the current total; their order is not yet confirmed in game.
 func buildCharacterDetails(ch *db.Character, s *CharacterStats) []byte {
 	w := packet.New(packet.CharacterDetails)
 	var statPoint, skillPoint uint16
@@ -276,11 +276,20 @@ func buildCharacterDetails(ch *db.Character, s *CharacterStats) []byte {
 		k1, k2, k3, k4 = ch.Kills, ch.Deaths, ch.Victories, ch.Defeats
 	}
 	x, y, z := charPos(ch)
+	var dir uint16
+	var prev, next uint32
+	if ch != nil {
+		dir = uint16(ch.Dir)
+		prev, next = expBounds(ch)
+	}
 	w.U16(statPoint)
 	w.U16(skillPoint)
-	w.U32(s.CurrentHP)
-	w.U32(s.CurrentMP)
-	w.U32(s.CurrentSP)
+	w.U32(s.MaxHP)
+	w.U32(s.MaxMP)
+	w.U32(s.MaxSP)
+	w.U16(dir)
+	w.U32(prev)
+	w.U32(next)
 	w.U32(exp)
 	w.U32(money)
 	w.F32(x)
@@ -290,7 +299,7 @@ func buildCharacterDetails(ch *db.Character, s *CharacterStats) []byte {
 	w.U32(k2)
 	w.U32(k3)
 	w.U32(k4)
-	w.FixedString("", 11)
+	w.FixedString("", 25) // guild name
 	return w.MustFinish()
 }
 
@@ -424,14 +433,15 @@ func buildCharacterEquipment(ch *db.Character, items []db.Item, slot uint8) []by
 		w.U8(it.Type)
 		w.U8(it.TypeID)
 		w.U8(enchantLevel(it))
+		// The client always reads 6 more bytes (0x0058f980): the cloak
+		// badge, zero for other slots.
 		if slot == 7 {
 			w.Bytes(it.Gems[:])
-		}
-	} else {
-		w.Bytes([]byte{0, 0, 0})
-		if slot == 7 {
+		} else {
 			w.Bytes(make([]byte, 6))
 		}
+	} else {
+		w.Bytes(make([]byte, 9))
 	}
 	return w.MustFinish()
 }
@@ -474,27 +484,6 @@ func buildCharacterShape(ch *db.Character, faction uint8, items []db.Item, motio
 		w.Bytes(make([]byte, 6))
 	}
 	w.FixedString("", 25) // guild name
-	return w.MustFinish()
-}
-
-func nameColorFor(isAdmin bool) uint32 {
-	if isAdmin {
-		return nameColorGM
-	}
-	return nameColorNormal
-}
-
-// buildCharacterOverlay (0x0240) sets the name color (flags 2 = NameColor).
-func buildCharacterOverlay(characterID, color uint32) []byte {
-	w := packet.New(packet.CharacterOverlay)
-	w.U32(characterID)
-	w.U8(1)
-	w.U32(2)
-	w.U32(color)
-	w.U32(0)
-	w.I32(0)
-	w.I32(0)
-	w.FixedString("", 32)
 	return w.MustFinish()
 }
 
