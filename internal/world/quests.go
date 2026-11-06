@@ -665,7 +665,7 @@ func (s *Session) awardQuest(q *activeQuest, variant uint8, ctx uint32) {
 	}
 	s.send(w.MustFinish(), "0x0903 quest completed")
 	if exp > 0 {
-		s.awardExp(exp)
+		s.awardExp(exp, false)
 		s.send(buildExpGain(exp), "0x0207 quest exp")
 	}
 	s.removeQuest(q, 1)

@@ -24,6 +24,7 @@ type MapItem struct {
 	Money            uint32
 	OwnerID          uint32
 	NoParty          bool // a player's drop: its party does not share it
+	FromMob          bool // mob loot (drop type 1): gold gets the charm bonus
 	DroppedAt        time.Time
 	PosX, PosY, PosZ float32
 }

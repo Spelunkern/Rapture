@@ -62,7 +62,7 @@ func applyAbility(e *EquipmentStats, effect, kind uint8, value int32) bool {
 		e.Mods[kind-29].Evasion += value
 	case 32, 33, 34:
 		e.Disabled[kind-32] += value
-	case 37, 38, 40, 41, 42:
+	case 35, 37, 38, 40, 41, 42, 44:
 		// Benefits read where they apply: 38 and the charms 40-42 set the
 		// death exp loss (Session.deathExpLoss).
 	case 0:

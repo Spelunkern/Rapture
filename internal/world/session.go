@@ -217,7 +217,7 @@ func (s *Session) tick(idle bool) {
 		}
 		exp, gold := p.TakeRewards()
 		for _, e := range exp {
-			s.awardExp(e)
+			s.awardExp(e, true)
 		}
 		if len(gold) > 0 {
 			for _, g := range gold {

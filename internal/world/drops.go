@@ -178,7 +178,7 @@ func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, party []*ConnectedP
 	var packets []MapItem
 	place := func(def *db.ItemDef, money uint32) {
 		x, z := dropPosition(mob.PosX, mob.PosZ)
-		mi := MapItem{ID: nextMapItemID(), OwnerID: ownerID, DroppedAt: time.Now(), PosX: x, PosZ: z}
+		mi := MapItem{ID: nextMapItemID(), OwnerID: ownerID, FromMob: true, DroppedAt: time.Now(), PosX: x, PosZ: z}
 		if def != nil {
 			mi.Item = db.Item{Type: def.Type, TypeID: def.TypeID, Quality: def.Quality, Count: 1}
 		} else {

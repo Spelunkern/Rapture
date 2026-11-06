@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/Spelunkern/Rapture/internal/db"
@@ -490,6 +491,32 @@ func (s *Session) equipmentChanged(slots []uint8) {
 	}
 }
 
+// mobGoldBonus is ItemGet's mob-gold rate: ability 44's percent, +20 with
+// the White Tiger charm, +50 with the Red Phoenix.
+func (s *Session) mobGoldBonus(amount uint32) uint32 {
+	rate, charm := int32(0), 0
+	for _, b := range s.buffs {
+		for _, a := range b.Abilities {
+			switch {
+			case a.Type == 44:
+				rate = max(a.Value, 0)
+			case a.Type >= 40 && a.Type <= 42 && a.Value > 0:
+				charm = max(charm, int(a.Type)-39)
+			}
+		}
+	}
+	switch charm {
+	case 2:
+		rate += 20
+	case 3:
+		rate += 50
+	}
+	if rate <= 0 {
+		return amount
+	}
+	return amount + uint32(math.Trunc(float64(float32(rate))/100*float64(float32(amount))))
+}
+
 // handlePickupItem (0x0205): map item id.
 func (s *Session) handlePickupItem(p []byte) {
 	if len(p) < 6 || s.char == nil {
@@ -520,7 +547,11 @@ func (s *Session) handlePickupItem(p []byte) {
 	}
 	if mi.Money > 0 {
 		removeMapItem(ch.MapID, mi.ID)
-		ch.Money = min(uint32(min(uint64(ch.Money)+uint64(mi.Money), db.MoneyCap)), db.MoneyCap)
+		amount := mi.Money
+		if mi.FromMob {
+			amount = s.mobGoldBonus(amount)
+		}
+		ch.Money = min(uint32(min(uint64(ch.Money)+uint64(amount), db.MoneyCap)), db.MoneyCap)
 		s.persist()
 		gold := db.Item{Bag: 1, Type: moneyItemType, Quality: uint16(min(mi.Money, 65535)), Count: 1}
 		s.log.Printf("Rapture World picked up money amount=%d new_money=%d", mi.Money, ch.Money)

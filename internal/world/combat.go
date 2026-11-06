@@ -1,6 +1,7 @@
 package world
 
 import (
+	"math"
 	"time"
 
 	"github.com/Spelunkern/Rapture/internal/db"
@@ -378,23 +379,37 @@ func (s *Session) persist() {
 // LevelCap is the last level in StatusDefs and ExpDefs.
 const LevelCap = 60
 
+// levelCap is award_experience's: easy mode stops at 30.
+func levelCap(ch *db.Character) uint16 {
+	if ch.Mode == 0 {
+		return 30
+	}
+	return LevelCap
+}
+
 // applyExpGain adds exp. Chars.Exp is the cumulative total and ExpDefs
 // gives, per level and growth mode, the total needed to reach the next
 // level, as in the original server. A level-up refreshes the base pools
 // from StatusDefs and heals fully.
 func applyExpGain(ch *db.Character, gained uint32) (levels uint16) {
-	if ch.Level >= LevelCap || gained == 0 {
+	limit := levelCap(ch)
+	if ch.Level >= limit || gained == 0 {
 		return 0
 	}
 	ch.Exp = satAdd(ch.Exp, gained)
 	exp := db.MustDefs().Exp
-	for ch.Level < LevelCap {
+	for ch.Level < limit {
 		req := exp[db.ExpKey{Level: ch.Level, Grow: ch.Mode + 1}]
 		if req == 0 || ch.Exp < req {
 			break
 		}
 		levelUp(ch)
 		levels++
+	}
+	if ch.Level >= limit {
+		// Reaching the cap leaves the exp at the level's start.
+		prev, _ := expBounds(ch)
+		ch.Exp = prev
 	}
 	if levels > 0 {
 		ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
@@ -455,11 +470,36 @@ func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMo
 	}
 }
 
+// expScale is award_experience's modifiers: x1.5 with exp doubling
+// (ability 35), +0.2 with any charm (abilities 40-42).
+func (s *Session) expScale(gained uint32) uint32 {
+	double, charm := false, false
+	for _, b := range s.buffs {
+		for _, a := range b.Abilities {
+			if a.Value > 0 {
+				double = double || a.Type == 35
+				charm = charm || (a.Type >= 40 && a.Type <= 42)
+			}
+		}
+	}
+	scale := 1.0
+	if double {
+		scale = 1.5
+	}
+	if charm {
+		scale += 0.2
+	}
+	return uint32(math.Trunc(float64(gained) * scale))
+}
+
 // awardExp applies an exp reward to the session's character.
-func (s *Session) awardExp(gained uint32) {
+func (s *Session) awardExp(gained uint32, modifiers bool) {
 	ch := s.char
 	if ch == nil {
 		return
+	}
+	if modifiers {
+		gained = s.expScale(gained) // quest rewards skip them
 	}
 	levels := applyExpGain(ch, gained)
 	s.persist()

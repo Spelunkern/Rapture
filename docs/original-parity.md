@@ -17,7 +17,7 @@ gaps; **invented** is still a Rapture rule to replace.
 | Base HP/MP/SP | `CUser::InitEquipment` 0x00454560, `StatusDefs` | done |
 | Attack, defense, accuracy, evasion, critical | `CUser::SetAttack` 0x00454280, `CUser::SetSkillAbility` 0x00485e00, `CUser::AddSkillPassive` 0x00489a80 | done: buff abilities 1-9, 13-18, 20-31; passives detail 1 (weapon mastery, with the original running-total quirk), 4, 8, 9 (cross road), 10 (shield); gem reach/speed; armour (slot 1) element. Abilities 10-12, 19, 32-46 and passive details 2, 5, 6 not modeled |
 | Level-up | stat/skill points by mode, +1 main stat | done |
-| Exp per kill | `CMob::GetExp` 0x00491690 | done (no event multiplier) |
+| Exp per kill | `CMob::GetExp` 0x00491690, `award_experience` | done: x1.5 with exp doubling (ability 35), +0.2 with a charm (40-42), quest rewards without modifiers; easy mode stops at level 30 and reaching the cap leaves the exp at the level start. No event multiplier |
 | Recovery | 5 s tick, 5% sitting, none in combat | partial: no equipment/skill recovery bonuses |
 | Lapisia enchant | `ItemEnchant.ini` | partial: gold cost to be configured |
 | Hit chance | `CUser::AttackSuccess` 0x0044d010 / `CMob::AttackSuccess` 0x004a23f0 | done: skills check the mob's ResistState/ResistSkill and SuccessType 1-3; the magic term reads WIS on both sides (CUser +0x122c, stMOBInfo +0x3a), SuccessType 3 reads LUC (Eternity labels these DEX). Defender blocks (buff 85 by count, 86 by chance, 92 all) and mirror reflection (buff 83, `CUser::ChkMirror` 0x0044e080: SuccessType 1 SuccessValue%, 2 LUC x 10 / value, 3 WIS x 10 / value; 0x051B back to the mob) |
@@ -35,6 +35,7 @@ gaps; **invented** is still a Rapture rule to replace.
 | NPC patrol | `CNpc::UpdateMove` 0x004bbeb0, `NpcQuest.SData` MoveDistance/MoveSpeed | done: steps of MoveDistance every MoveSpeed ms (16 units / 8 s in EP4.5 data), points walked forward then back, rest rand(10 s) + MoveSpeed + 10 s at each point |
 | Skill learning | `CUser::LearnSkill` 0x004842e0, `EnableLearnSkill` 0x00484080 | done: levels 1-3, new skills at level 1 and known ones to any higher level, errors 1 points / 2 level / 3 otherwise, Country by family, job, growth mode (easy only Grow 0, normal up to 1, hard all but 3), TypeShow 0 hidden; no prerequisite skill (Rapture's PrevSkillID check was invented) |
 | Mounts | `vertical_combat_vehicle_prefix`, `CUser::CancleActionVehicle`, `StatusCastingStop` | partial: slot-13 mount, shape from the item's Range (r*2 below 2, else r+7), refusal 0x0216 (0, 1), shown to users entering the view (0x051D), a hit dismounts. The summon delay (item byte +0x32) and the mounted speed are not modeled |
+| Mob gold pickup | `ItemGet` 0x0045d2e0 | done: mob gold gets ability 44 percent, +20 White Tiger, +50 Red Phoenix |
 | Equip requirements | `CUser::EnableEquipment` 0x0045b450 | done |
 | NPC shop buy | `CUser::PacketShop` 0x0046af10, `NpcQuest.SData` | done (no guild-house discounts) |
 | Gatekeepers | `CUser::PacketMaininterface` case 0x020C, `NpcQuest.SData` | done (no guild-house rates; teleport is immediate) |
