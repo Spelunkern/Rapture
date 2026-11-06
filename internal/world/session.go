@@ -445,6 +445,18 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.handlePartyExpel(p)
 	case packet.PartyLeader:
 		s.handlePartyLeader(p)
+	case packet.RaidConvert, packet.RaidDivision, packet.RaidAutoJoin, packet.RaidDisband:
+		s.handleRaidSettings(op, p)
+	case packet.RaidInvite, packet.RaidInviteName:
+		s.handleRaidInvite(op, p)
+	case packet.RaidAnswer:
+		s.handleRaidAnswer(p)
+	case packet.RaidAutoJoinName:
+		s.handleRaidAutoJoin(p)
+	case packet.RaidSwap, packet.RaidSubLeader, packet.RaidLeader:
+		s.handleRaidRoles(op, p)
+	case packet.RaidExpel:
+		s.handleRaidExpel(p)
 	case packet.ChatParty:
 		if s.char != nil {
 			if msg, err := readChatMessage(p); err == nil {

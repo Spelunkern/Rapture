@@ -30,7 +30,8 @@ gaps; **invented** is still a Rapture rule to replace.
 | Equip requirements | `CUser::EnableEquipment` 0x0045b450 | done |
 | NPC shop buy | `CUser::PacketShop` 0x0046af10, `NpcQuest.SData` | done (no guild-house discounts) |
 | Gatekeepers | `CUser::PacketMaininterface` case 0x020C, `NpcQuest.SData` | done (no guild-house rates; teleport is immediate) |
-| Party | `party_runtime*`, `mob_death` (solo exp ×1.2, party count factor, level share, 100-unit range) | done: invites, roster, leader, expel, chat (0x1105), pools/level updates, exp and gold split, shared loot; no raids or item-division modes |
+| Party | `party_runtime*`, `mob_death` (solo exp ×1.2, party count factor, level share, 100-unit range) | done: invites, roster, leader, expel, chat (0x1105), pools/level updates, exp and gold split, shared loot |
+| Raids | `party_runtime_raid*`, raid exp table | done: convert, 30 wire slots, leader/sub-leader, slot swaps, invites, auto-join, expel, disband, chunked roster; item-division modes are stored but loot still goes to the killer |
 | Quests, guilds | `0x09xx`, `0x0Dxx` | missing |
 
 ## Element table

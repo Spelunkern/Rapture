@@ -40,6 +40,13 @@ type party struct {
 	members  []*ConnectedPlayer
 	leader   int
 	maxLevel uint16
+
+	// Raid state (kind 1), see raid.go.
+	kind         uint8
+	subLeader    int
+	slots        []uint16 // wire slot per member
+	autoJoin     bool
+	itemDivision int32
 }
 
 var (
@@ -130,6 +137,9 @@ func partyBadge(p *ConnectedPlayer) {
 // enterParty is enter_normal_party (partyMu held): announce the newcomer,
 // send it the roster of the members already there.
 func enterParty(pt *party, p *ConnectedPlayer) bool {
+	if pt.isRaid() {
+		return enterRaid(pt, p)
+	}
 	if len(pt.members) >= partyMax {
 		return false
 	}
@@ -155,6 +165,10 @@ func enterParty(pt *party, p *ConnectedPlayer) bool {
 // leaveParty is leave_normal_party (partyMu held). expelled sends 0x0B06
 // instead of 0x0B05. A party left with one member dissolves.
 func leaveParty(pt *party, p *ConnectedPlayer, expelled bool) {
+	if pt.isRaid() {
+		removeRaid(pt, p, expelled)
+		return
+	}
 	index := -1
 	for i, m := range pt.members {
 		if m == p {
@@ -289,7 +303,7 @@ func (s *Session) handlePartyAnswer(p []byte) {
 	pt := partyOf(inviter)
 	if pt == nil {
 		nextPartyID++
-		pt = &party{id: nextPartyID}
+		pt = &party{id: nextPartyID, itemDivision: 1}
 		enterParty(pt, inviter)
 	} else if pt.leaderPlayer() != inviter {
 		partyError(inviter, partyErrBusy, me.CharacterID)
@@ -362,15 +376,19 @@ func (s *Session) partyPools() {
 	partyMu.Lock()
 	pt := partyOf(s.player)
 	var members []*ConnectedPlayer
+	op := packet.PartyPools
 	if pt != nil {
 		members = append(members, pt.members...)
+		if pt.isRaid() {
+			op = packet.RaidPools
+		}
 	}
 	partyMu.Unlock()
 	if len(members) == 0 {
 		return
 	}
 	st := s.stats()
-	w := packet.New(packet.PartyPools)
+	w := packet.New(op)
 	w.U32(s.char.ID)
 	w.U32(st.CurrentHP)
 	w.U32(st.CurrentSP)
@@ -382,7 +400,7 @@ func (s *Session) partyPools() {
 func (s *Session) partyLevel() {
 	partyMu.Lock()
 	defer partyMu.Unlock()
-	if pt := partyOf(s.player); pt != nil {
+	if pt := partyOf(s.player); pt != nil && !pt.isRaid() {
 		w := packet.New(packet.PartyLevel)
 		w.U32(s.char.ID)
 		w.U16(s.char.Level)
@@ -431,8 +449,9 @@ func killRewards(killer *ConnectedPlayer, mapID uint16, x, z float32, mobLevel, 
 	pt := partyOf(killer)
 	var members []*ConnectedPlayer
 	var maxLevel uint16
+	raid := false
 	if pt != nil {
-		members, maxLevel = append(members, pt.members...), pt.maxLevel
+		members, maxLevel, raid = append(members, pt.members...), pt.maxLevel, pt.isRaid()
 	}
 	partyMu.Unlock()
 	if len(members) == 0 {
@@ -441,6 +460,9 @@ func killRewards(killer *ConnectedPlayer, mapID uint16, x, z float32, mobLevel, 
 		return out
 	}
 	factor := partyExpFactor[min(len(members), len(partyExpFactor)-1)]
+	if raid {
+		factor = raidExpFactor[min(len(members), len(raidExpFactor)-1)]
+	}
 	for _, m := range members {
 		mx, mz := m.PositionXZ()
 		if m.MapID() != mapID || !m.IsAlive() || DistanceXZ(mx, mz, x, z) > partyRewardRange {

@@ -78,3 +78,42 @@ func TestPartyAgainstSQLServer(t *testing.T) {
 	}
 	t.Logf("opcodes seen: %v", seen)
 }
+
+func TestRaidAgainstSQLServer(t *testing.T) {
+	setupWorld(t)
+	// Let the server release accounts from a previous test's sessions.
+	time.Sleep(time.Second)
+	leader, leaderID := enterWorld(t, 1, "Interloper")
+	member, memberID := enterWorld(t, 3, "Arcanist")
+	seen := map[packet.Opcode]int{}
+	le := func(v uint32) []byte { return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)} }
+
+	leader.write(msg(packet.RaidInvite, le(memberID)...))
+	member.until(packet.RaidInvite, seen)
+	member.write(msg(packet.RaidAnswer, append([]byte{0}, le(leaderID)...)...))
+	member.until(packet.PartyRoster, seen)
+
+	// Convert to a raid: kind 1, auto-join on, item division 2.
+	leader.write(msg(packet.RaidConvert, append([]byte{1, 1}, le(2)...)...))
+	conv := member.until(packet.RaidConvert, seen)
+	if conv[2] != 1 || conv[3] != 1 {
+		t.Fatalf("convert reply kind %d autojoin %d", conv[2], conv[3])
+	}
+	if div, _ := packet.U32(conv[4:]); div != 2 {
+		t.Fatalf("division %d", div)
+	}
+	leader.write(msg(packet.RaidDivision, le(3)...))
+	if d := member.until(packet.RaidDivision, seen); d[2] != 3 {
+		t.Fatalf("division update %d", d[2])
+	}
+	leader.write(msg(packet.RaidSwap, append(le(0), le(5)...)...))
+	swap := member.until(packet.RaidSwap, seen)
+	if lead, _ := packet.U32(swap[10:]); lead != 5 {
+		t.Fatalf("leader wire slot after swap %d, want 5", lead)
+	}
+	member.write(msg(packet.PartyLeaveAlt))
+	if l := leader.until(packet.PartyLeaveAlt, seen); len(l) < 6 {
+		t.Fatal("short raid leave")
+	}
+	t.Logf("raid ok; opcodes seen: %v", seen)
+}
