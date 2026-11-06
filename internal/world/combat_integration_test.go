@@ -519,3 +519,58 @@ func TestGroupRespawn(t *testing.T) {
 		t.Fatalf("respawned %d before the timer ran out again", got)
 	}
 }
+
+// TestCraftRules checks the lapisia/gem rules against the EP4.5 data.
+func TestCraftRules(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	defs := db.MustDefs()
+	weaponLap, armorLap := defs.Item(95, 1), defs.Item(95, 6)
+	if weaponLap == nil || armorLap == nil {
+		t.Skip("no lapisia")
+	}
+	if !lapisiaFits(weaponLap, 1) || lapisiaFits(weaponLap, 16) {
+		t.Error("weapon lapisia targets")
+	}
+	if lapisiaFits(armorLap, 1) || !lapisiaFits(armorLap, 16) || !lapisiaFits(armorLap, 17) {
+		t.Error("armor lapisia targets")
+	}
+	if lapisiaMoney(weaponLap.ReqIg) != 2500000 || lapisiaMoney(armorLap.ReqIg) != 1040000 {
+		t.Errorf("lapisia costs %d %d", lapisiaMoney(weaponLap.ReqIg), lapisiaMoney(armorLap.ReqIg))
+	}
+	// A two-socket item takes two Slot-1 gems, not a third.
+	var target *db.ItemDef
+	for _, d := range defs.Items {
+		if d.Slot == 2 && realType(d.Type) >= 1 && realType(d.Type) <= 15 {
+			target = d
+			break
+		}
+	}
+	var gems []*db.ItemDef
+	for _, d := range defs.Items {
+		if d.Type == gemItemType && d.Slot == 1 && lapisiaFits(d, realType(target.Type)) {
+			gems = append(gems, d)
+		}
+	}
+	if target == nil || len(gems) < 3 {
+		t.Skip("no two-socket weapon or slot-1 gems")
+	}
+	it := db.Item{Type: target.Type, TypeID: target.TypeID, Count: 1}
+	for i := 0; i < 2; i++ {
+		if !gemFits(&it, target, gems[i]) {
+			t.Fatalf("gem %d refused", i)
+		}
+		it.Gems[i] = gems[i].TypeID
+	}
+	if gemFits(&it, target, gems[2]) || gemFits(&it, target, gems[0]) {
+		t.Fatal("capacity or duplicate check failed")
+	}
+}

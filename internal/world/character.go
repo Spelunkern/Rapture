@@ -230,17 +230,22 @@ func GetEquipmentStats(items []db.Item) EquipmentStats {
 		if it.Slot == 6 {
 			e.ShieldType = realType(it.Type)
 		}
-		if c, ok := ParseCraftName(it.CraftName); ok {
+		// CUser::ItemEquipmentAdd: Items.Exp absorbs damage; the Craftname
+		// counts only on items with Server set and ReqWis 1-99
+		// (CItem::CopyCraftExpassion). Its enchant pair is the weapon step
+		// (attack) up to 50, the armour step + 50 above (absorption).
+		if d != nil {
+			e.Absorption = satAdd(e.Absorption, uint32(d.ExpAbsorb))
+		}
+		if c, ok := ParseCraftName(it.CraftName); ok && d != nil && d.Server != 0 && d.ReqWis > 0 && d.ReqWis < 100 {
 			e.Str, e.Dex, e.Rec = satAdd(e.Str, c.Str), satAdd(e.Dex, c.Dex), satAdd(e.Rec, c.Rec)
 			e.Int, e.Wis, e.Luc = satAdd(e.Int, c.Int), satAdd(e.Wis, c.Wis), satAdd(e.Luc, c.Luc)
 			e.MaxHP, e.MaxMP, e.MaxSP = satAdd(e.MaxHP, c.MaxHP), satAdd(e.MaxMP, c.MaxMP), satAdd(e.MaxSP, c.MaxSP)
-			if c.EnchantLevel > 0 {
-				step := min(c.EnchantLevel, 20)
-				if IsWeaponItemType(it.Type) {
-					e.ItemAttack = satAdd(e.ItemAttack, weaponEnchantAttackBonus[step])
-				} else if IsArmorItemType(it.Type) {
-					e.Absorption = satAdd(e.Absorption, armorEnchantAbsorption[step])
-				}
+			switch step := c.EnchantLevel; {
+			case step > 50 && step-50 <= enchantMaxLevel:
+				e.Absorption = satAdd(e.Absorption, armorEnchantAbsorption[step-50])
+			case step > 0 && step <= enchantMaxLevel:
+				e.ItemAttack = satAdd(e.ItemAttack, weaponEnchantAttackBonus[step])
 			}
 		}
 	}

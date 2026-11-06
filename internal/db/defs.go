@@ -38,6 +38,8 @@ type ItemDef struct {
 	Drop                                   uint16 // drop-limit interval selector (0 = unlimited)
 	Server                                 uint8
 	Count                                  uint8
+	ReqVg                                  int16 // lapisia: breaks the item on a failed enchant
+	ExpAbsorb                              uint8 // Items.Exp: damage absorbed while equipped
 }
 
 // MaxStack is the stack size (Items.Count, at least 1).
@@ -307,7 +309,7 @@ func loadDefs() (*Defs, error) {
 		Attackfighter, Defensefighter, Patrolrogue, Shootrogue, Attackmage, Defensemage, Grow,
 		ReqStr, ReqDex, ReqRec, ReqInt, ReqWis, Reqluc, ReqIg, Range, AttackTime, Special, ISNULL(Attrib,0), Slot, Quality,
 		Effect1, Effect2, Effect3, Effect4, ConstHP, ConstSP, ConstMP, ConstStr, ConstDex, ConstRec,
-		ConstInt, ConstWis, ConstLuc, Buy, Sell, Grade, ISNULL([Drop],0), Server, Count FROM dbo.Items`)
+		ConstInt, ConstWis, ConstLuc, Buy, Sell, Grade, ISNULL([Drop],0), Server, Count, ReqVg, ISNULL(Exp,0) FROM dbo.Items`)
 	if err != nil {
 		return nil, fmt.Errorf("load Items: %w", err)
 	}
@@ -320,7 +322,7 @@ func loadDefs() (*Defs, error) {
 			&it.ReqStr, &it.ReqDex, &it.ReqRec, &it.ReqInt, &it.ReqWis, &it.ReqLuc, &it.ReqIg, &it.Range,
 			&it.AttackTime, &it.Special, &it.Attrib, &it.Slot, &quality, &it.Effect1, &it.Effect2, &it.Effect3, &it.Effect4,
 			&it.ConstHP, &it.ConstSP, &it.ConstMP, &it.ConstStr, &it.ConstDex, &it.ConstRec, &it.ConstInt,
-			&it.ConstWis, &it.ConstLuc, &it.Buy, &it.Sell, &grade, &drop, &it.Server, &it.Count); err != nil {
+			&it.ConstWis, &it.ConstLuc, &it.Buy, &it.Sell, &grade, &drop, &it.Server, &it.Count, &it.ReqVg, &it.ExpAbsorb); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Items: %w", err)
 		}
