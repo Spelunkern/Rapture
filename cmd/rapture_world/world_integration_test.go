@@ -134,6 +134,8 @@ func setupWorld(t *testing.T) string {
 // connect performs the handshake for an account.
 func connect(t *testing.T, account uint32) *client {
 	t.Helper()
+	// A previous test's session for the account may still be closing.
+	time.Sleep(time.Second)
 	var material [32]byte
 	rand.Read(material[:])
 	identity := session.NewIdentity()

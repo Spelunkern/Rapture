@@ -120,6 +120,13 @@ const (
 	TeleportSavePositionList  Opcode = 0x0225
 	BlessInit                 Opcode = 0x0211
 	QuestList                 Opcode = 0x0901
+	QuestStart                Opcode = 0x0902
+	QuestEnd                  Opcode = 0x0903
+	QuestStartAlt             Opcode = 0x0904
+	QuestCounter              Opcode = 0x0905
+	QuestChoose               Opcode = 0x0907
+	QuestAbandon              Opcode = 0x0908
+	NpcTalk                   Opcode = 0x0E04
 	QuestFinishedList         Opcode = 0x0906
 	ChatNormal                Opcode = 0x1101
 	ChatWorld                 Opcode = 0x1103

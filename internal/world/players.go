@@ -76,6 +76,42 @@ type ConnectedPlayer struct {
 	rewardMu   sync.Mutex
 	expRewards []uint32
 	goldShares []uint32
+	questKills []uint16
+
+	questMu  sync.Mutex
+	questIDs map[uint16]bool // active quests, for loot eligibility
+}
+
+// QueueQuestKill credits a kill to the player's quests (party members get
+// it too, as mob_death does).
+func (p *ConnectedPlayer) QueueQuestKill(mobID uint16) {
+	p.rewardMu.Lock()
+	p.questKills = append(p.questKills, mobID)
+	p.rewardMu.Unlock()
+}
+
+func (p *ConnectedPlayer) TakeQuestKills() []uint16 {
+	p.rewardMu.Lock()
+	defer p.rewardMu.Unlock()
+	k := p.questKills
+	p.questKills = nil
+	return k
+}
+
+func (p *ConnectedPlayer) setQuests(ids []uint16) {
+	m := make(map[uint16]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	p.questMu.Lock()
+	p.questIDs = m
+	p.questMu.Unlock()
+}
+
+func (p *ConnectedPlayer) hasQuest(id uint16) bool {
+	p.questMu.Lock()
+	defer p.questMu.Unlock()
+	return p.questIDs[id]
 }
 
 // QueueExp / QueueGold carry a party member's share of a kill to its own

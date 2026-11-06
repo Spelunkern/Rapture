@@ -65,6 +65,9 @@ type Session struct {
 	positionDirty    bool
 	lastPositionSave time.Time
 	lastRegenAt      time.Time
+	lastQuestCheck   time.Time
+	quests           []*activeQuest
+	finishedQuests   []db.FinishedQuest
 	regenSitting     bool
 	lastCombatAt     time.Time
 	lastChatAt       time.Time
@@ -145,6 +148,7 @@ func (s *Session) leaveWorld() {
 	s.savePosition()
 	s.persistBuffs()
 	s.persistSkillDelays()
+	s.saveQuests()
 	if s.player != nil {
 		s.player.Unregister()
 		s.player = nil
@@ -202,6 +206,9 @@ func (s *Session) tick(idle bool) {
 		if r := p.TakeTradeRefresh(); r != nil {
 			s.applyTradeRefresh(r)
 		}
+		for _, mob := range p.TakeQuestKills() {
+			s.questKill(mob)
+		}
 		exp, gold := p.TakeRewards()
 		for _, e := range exp {
 			s.awardExp(e)
@@ -225,6 +232,11 @@ func (s *Session) tick(idle bool) {
 	}
 	s.processBuffs()
 	s.recoveryTick()
+	if time.Since(s.lastQuestCheck) >= 5*time.Second {
+		s.lastQuestCheck = time.Now()
+		s.questTimers()
+		s.syncQuestIDs()
+	}
 	s.processPendingCast()
 	if idle && s.autoAttack && !s.autoAttackSwing(s.autoAttackTarget) {
 		s.autoAttack = false
@@ -435,6 +447,16 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.handleShopSell(p)
 	case packet.ShopBuy:
 		s.handleShopBuy(p)
+	case packet.QuestStart, packet.QuestStartAlt:
+		s.handleQuestStart(p)
+	case packet.QuestEnd:
+		s.handleQuestEnd(p)
+	case packet.QuestChoose:
+		s.handleQuestChoose(p)
+	case packet.QuestAbandon:
+		s.handleQuestAbandon(p)
+	case packet.NpcTalk:
+		// The original only records which NPC the player is using.
 	case packet.PartyInvite, packet.PartyInviteName:
 		s.handlePartyInvite(op, p)
 	case packet.PartyAnswer:
@@ -668,6 +690,7 @@ func (s *Session) selectCharacter(id uint32) {
 	s.logErr("load warehouse", err)
 	s.points, err = db.Points(s.accountID)
 	s.logErr("load points", err)
+	s.loadQuests()
 	s.mounted, s.dead, s.cast, s.autoAttack = false, false, nil, false
 	s.lastRegenAt = time.Now()
 	st := s.stats()
@@ -703,8 +726,13 @@ func (s *Session) sendInitialState(st *CharacterStats) {
 	}
 	for _, p := range []labeled{
 		{buildCharacterSkills(s.skills), "0x0108 skills"},
-		{buildZeroCount(packet.QuestList), "0x0901 open quests"},
-		{buildZeroCount(packet.QuestFinishedList), "0x0906 finished quests"},
+	} {
+		s.send(p.Packet, p.Label)
+	}
+	for _, p := range s.questListPackets() {
+		s.send(p, "0x0901/0x0906 quests")
+	}
+	for _, p := range []labeled{
 		{buildCharacterActiveBuffs(s.buffs), "0x010A active buffs"},
 		{buildBlessInit(s.faction), "0x0211 bless"},
 		{buildZeroCount(packet.BankItemList), "0xB101 bank"},

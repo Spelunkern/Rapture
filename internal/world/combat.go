@@ -268,8 +268,22 @@ func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMo
 	if killer != nil {
 		party = partyMembersNear(killer, mapID, m.PosX, m.PosZ)
 	}
+	recipients := party
+	if len(recipients) == 0 && killer != nil {
+		recipients = []*ConnectedPlayer{killer}
+	}
 	for _, p := range rollMobDrops(mapID, m, killerID, y, party, log) {
 		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 mob drop")
+	}
+	if def := questItemDrop(m, recipients); def != nil {
+		x, z := dropPosition(m.PosX, m.PosZ)
+		mi := MapItem{ID: nextMapItemID(), OwnerID: killerID, DroppedAt: time.Now(), PosX: x, PosY: y, PosZ: z,
+			Item: db.Item{Type: def.Type, TypeID: def.TypeID, Quality: def.Quality, Count: 1}}
+		addMapItem(mapID, mi)
+		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, buildMapAddItem(&mi), "0x0401 quest item drop")
+	}
+	for _, p := range recipients {
+		p.QueueQuestKill(m.MobID)
 	}
 	if m.Exp == 0 {
 		return

@@ -524,6 +524,7 @@ func (s *Session) handlePickupItem(p []byte) {
 		broadcast(others, add, "0x0401 pickup map add remaining item (broadcast)", s.logger)
 	}
 	s.log.Printf("Rapture World picked up map_item_id=%d type=%d/%d remaining=%d", mi.ID, mi.Item.Type, mi.Item.TypeID, left)
+	s.questPickup(mi.Item.Type, mi.Item.TypeID)
 }
 
 // moveItem performs an inventory move/swap/merge and returns the 0x0204.

@@ -32,7 +32,9 @@ gaps; **invented** is still a Rapture rule to replace.
 | Gatekeepers | `CUser::PacketMaininterface` case 0x020C, `NpcQuest.SData` | done (no guild-house rates; teleport is immediate) |
 | Party | `party_runtime*`, `mob_death` (solo exp ×1.2, party count factor, level share, 100-unit range) | done: invites, roster, leader, expel, chat (0x1105), pools/level updates, exp and gold split, shared loot |
 | Raids | `party_runtime_raid*`, raid exp table | done: convert, 30 wire slots, leader/sub-leader, slot swaps, invites, auto-join, expel, disband, chunked roster; item-division modes are stored but loot still goes to the killer |
-| Quests, guilds | `0x09xx`, `0x0Dxx` | missing |
+| Quests | `NpcQuest.SData` (1720 quests, item links), `CUser::QuestEnableStart` 0x0047f080, `QuestStartRequest` 0x0047f220, `QuestFindItem` 0x0047f8e0, end/reward/progress routines, `CharQuests` procedures | done: start by NPC or item, level/race/job/mode/prerequisite checks, start items, item/mob/player-kill objectives, timed and minimum-time quests, reward variants and player choice, repeatable quests, abandon, party kill credit, quest item drops (`Mobs.QuestItemID`); no player-kill source yet (no PvP), item-use starts (type 4) not wired |
+| NPC talk | `0x0E04` | done (the original only records the NPC in use) |
+| Guilds | `0x0Dxx` | missing |
 
 ## Element table
 

@@ -98,7 +98,7 @@ BSD 3-Clause. See [LICENSE](LICENSE).
   `.svmap` (NPCs, mob spawns, portals, spawn areas), movement and
   visibility, mob AI (roam, aggro, chase, respawn), auto-attack and skills
   (damage, heals, buffs, DoTs, cast times), death and revive, experience,
-  inventory, drops, NPC shop selling, warehouse, enchanting, gems,
+  inventory, drops, NPC shops and gatekeepers, quests, parties and raids, warehouse, enchanting, gems,
   recreation runes, mounts, player trade and the item mall (buy, gifts,
   gift box). Character, item, skill, quick-slot and buff state goes through
   the original `PS_GameData` procedures; definitions come from

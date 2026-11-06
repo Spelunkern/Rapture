@@ -141,8 +141,40 @@ func loadNpcQuest(log *logx.Logger) (err error) {
 		}
 		npcDefs[group] = list
 	}
-	log.Printf("Rapture World loaded NpcQuest.SData shops=%d gatekeepers=%d", shops, gates)
+	// 256x256 item links: the quests each item starts and ends.
+	for t := 0; t < 256; t++ {
+		for id := 0; id < 256; id++ {
+			starts, ends := r.wordList(), r.wordList()
+			if len(starts) > 0 || len(ends) > 0 {
+				questItemLinks[[2]uint8{uint8(t), uint8(id)}] = questItemLink{Start: starts, End: ends}
+			}
+		}
+	}
+	count := r.u32()
+	if count > 65535 {
+		return errors.New("quest count exceeds WORD identifiers in NpcQuest.SData")
+	}
+	quests := make([]questDef, count)
+	for i := range quests {
+		readQuest(r, &quests[i])
+	}
+	questDefs = quests
+	buildMobQuestLinks()
+	log.Printf("Rapture World loaded NpcQuest.SData shops=%d gatekeepers=%d item_links=%d quests=%d trailing=%d",
+		shops, gates, len(questItemLinks), len(quests), len(raw)-r.pos)
 	return nil
+}
+
+func (r *sdataReader) wordList() []uint16 {
+	n := r.u32()
+	if n > 65536 {
+		panic(errShortSData)
+	}
+	out := make([]uint16, n)
+	for i := range out {
+		out[i] = r.u16()
+	}
+	return out
 }
 
 // findNpcDef is GetNpc (0x0041d640): by type and row.
