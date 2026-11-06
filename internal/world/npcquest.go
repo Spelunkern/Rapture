@@ -39,7 +39,9 @@ type npcDef struct {
 	Name      string
 	ShopType  uint8
 	ShopItems [][2]uint8
-	Gates     [3]npcGate
+	// stNpcInfo +0x08 / +0x0C: patrol step and step interval (ms).
+	MoveDistance, MoveSpeed int32
+	Gates                   [3]npcGate
 }
 
 var npcDefs [npcTypeCount][]npcDef
@@ -106,7 +108,8 @@ func loadNpcQuest(log *logx.Logger) (err error) {
 			if group == 0 {
 				n.ShopType = r.u8()
 			}
-			r.take(12) // model, move distance, move speed
+			r.take(4) // model
+			n.MoveDistance, n.MoveSpeed = int32(r.u32()), int32(r.u32())
 			switch r.u32() {
 			case 1:
 				n.Country = 0

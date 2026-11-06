@@ -55,37 +55,15 @@ func (s *Session) syncPlayer() {
 	}
 }
 
-// introduceToOthers (re)announces this character to nearby viewers.
-func (s *Session) introduceToOthers(label string) {
-	if s.player == nil {
-		return
-	}
-	ch := s.char
-	others := PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius)
-	if len(others) == 0 {
-		return
-	}
-	frames := [][]byte{s.player.EnteredMapPacket(), s.player.ShapePacket(), s.player.MovePacket()}
-	if s.player.IsSitting() {
-		frames = append(frames, s.player.SitMotionPacket())
-	}
-	for _, o := range others {
-		if !canSeeCharacter(o.IsAdmin, s.isAdmin, s.player.GMVisible()) {
-			continue
-		}
-		for _, f := range frames {
-			o.Send(f, label+" introduce")
-		}
-	}
-}
-
 // applyTeleport is the single path for every teleport (portals, town,
 // resurrection): moves the character, persists it, acks the client,
 // introduces it to viewers at the destination and refreshes visibility.
 func (s *Session) applyTeleport(mapID uint16, x, y, z float32, label string) {
 	ch := s.char
+	// LeaveUser / EnterUser: the old view goes (on the same map the client
+	// keeps its entities, so they get leave packets), then the new one.
+	s.clearView(mapID == ch.MapID)
 	ch.MapID, ch.PosX, ch.PosY, ch.PosZ = mapID, x, y, z
-	s.visibility = EntityVisibility{}
 	if s.player != nil {
 		s.player.SetMap(mapID)
 		s.player.UpdateCharacter(*ch)
@@ -94,10 +72,7 @@ func (s *Session) applyTeleport(mapID uint16, x, y, z float32, label string) {
 	s.savePosition()
 	s.send(buildCharacterMapPosition(ch), "0x020B "+label)
 	s.send(buildCharacterMove(ch, 0, 0), "0x0501 "+label+" move")
-	s.introduceToOthers(label)
-	for _, p := range VisibilityDelta(ch.MapID, ch.PosX, ch.PosZ, &s.visibility) {
-		s.send(p.Packet, p.Label)
-	}
+	s.placeView()
 }
 
 // resurrect is CUser::KillSoul: the death's exp loss (ExpDrop), then
@@ -156,18 +131,12 @@ func (s *Session) handleCharacterMove(p []byte) {
 		s.applyTeleport(portal.TargetMapID, portal.TargetX, portal.TargetY, portal.TargetZ, "portal teleport")
 		return
 	}
-	if others := PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius); len(others) > 0 {
-		frame := buildCharacterMove(ch, motion, direction)
-		visible := s.player != nil && s.player.GMVisible()
-		for _, o := range others {
-			if canSeeCharacter(o.IsAdmin, s.isAdmin, visible) {
-				o.Send(frame, "0x0501 character move (broadcast)")
-			}
-		}
+	// CZone::MoveUser: a cell change updates the view first, then the move
+	// goes to the users that show this one.
+	if s.player != nil && s.player.moveViewCell(x, z) {
+		s.refreshView()
 	}
-	for _, d := range VisibilityDelta(ch.MapID, ch.PosX, ch.PosZ, &s.visibility) {
-		s.send(d.Packet, d.Label)
-	}
+	s.sendToViewers(buildCharacterMove(ch, motion, direction), "0x0501 character move (broadcast)")
 	if time.Since(s.lastPositionSave) >= positionSaveInterval {
 		s.savePosition()
 	}
@@ -197,9 +166,7 @@ func (s *Session) executeTown() {
 		s.send(buildChatNormal(ch.ID, "No town spawn area was found for this map/faction."), "0x1101 town command result")
 		return
 	}
-	for _, p := range VisibilityClear(&s.visibility) {
-		s.send(p.Packet, p.Label)
-	}
+	s.clearView(true)
 	ch.PosX, ch.PosY, ch.PosZ = area.Center()
 	if s.player != nil {
 		s.player.UpdateCharacter(*ch)
@@ -208,9 +175,7 @@ func (s *Session) executeTown() {
 	s.savePosition()
 	s.send(buildCharacterMapPosition(ch), "0x020B town teleport")
 	s.send(buildCharacterMove(ch, 0, 0), "0x0501 town teleport move")
-	for _, p := range VisibilityDelta(ch.MapID, ch.PosX, ch.PosZ, &s.visibility) {
-		s.send(p.Packet, p.Label)
-	}
+	s.placeView()
 	s.send(buildChatNormal(ch.ID, fmt.Sprintf("Returned to nearest town spawn (%.2f, %.2f, %.2f).", ch.PosX, ch.PosY, ch.PosZ)),
 		"0x1101 town command result")
 }

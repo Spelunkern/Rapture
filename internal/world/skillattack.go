@@ -235,7 +235,7 @@ func (s *Session) skillHit(target uint32, def *db.SkillDef, k db.CharacterSkill,
 	// TypeEffect 3 leaves the skill on the mob (CMob::AddApplySkill).
 	if alive && def.TypeEffect == typeEffectDebuff {
 		if speed, ok := ApplyMobEffect(ch.MapID, target, ch.ID, def); ok && speed != nil {
-			sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, ViewportRadius, speed, "0x0609 mob speed")
+			sendNear(ch.MapID, r.Mob.PosX, r.Mob.PosZ, BroadcastRadius, speed, "0x0609 mob speed")
 		}
 	}
 	return alive

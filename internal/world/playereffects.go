@@ -119,7 +119,7 @@ func (s *Session) broadcastSpeed(sp playerSpeeds) {
 	w.U8(sp.attack)
 	w.U8(sp.move)
 	frame := w.MustFinish()
-	for _, p := range PlayersNear(ch.MapID, ch.PosX, ch.PosZ, ViewportRadius) {
+	for _, p := range PlayersNear(ch.MapID, ch.PosX, ch.PosZ, BroadcastRadius) {
 		p.Send(frame, "0x051C character speed")
 	}
 }

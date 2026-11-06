@@ -4,8 +4,8 @@ package world
 
 import (
 	"os"
-	"time"
 	"testing"
+	"time"
 
 	"github.com/Spelunkern/Rapture/internal/config"
 	"github.com/Spelunkern/Rapture/internal/db"

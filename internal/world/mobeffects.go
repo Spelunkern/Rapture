@@ -325,7 +325,7 @@ func TickMobEffects() []MobEffectOutcome {
 					o.RespawnSeconds = uint64(m.respawnDelay / time.Second)
 				}
 				if killed {
-					m.Effects = nil
+					m.Effects, m.diedAt, m.corpseGone = nil, now, false
 				} else if applied > 0 {
 					o.Speed = m.removeSleep()
 				}

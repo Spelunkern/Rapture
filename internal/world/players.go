@@ -82,6 +82,8 @@ type ConnectedPlayer struct {
 
 	questMu  sync.Mutex
 	questIDs map[uint16]bool // active quests, for loot eligibility
+
+	view playerView // cell and the entities this client knows
 }
 
 // QueueQuestKill credits a kill to the player's quests (party members get
@@ -165,6 +167,7 @@ func RegisterPlayer(ch db.Character, items []db.Item, isAdmin bool, faction uint
 
 // Unregister removes the player and cancels any trade it was part of.
 func (p *ConnectedPlayer) Unregister() {
+	p.dropFromOthers()
 	registryMu.Lock()
 	delete(bucket(p.MapID()), p.CharacterID)
 	registryMu.Unlock()

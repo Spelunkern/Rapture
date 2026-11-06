@@ -169,13 +169,13 @@ func dropPosition(x, z float32) (float32, float32) {
 }
 
 // rollMobDrops rolls one kill's loot, registers it on the map and returns
-// the 0x0401 packets.
+// the new map items.
 //
 // With two or more party members in range, the gold is split evenly among
 // them instead of dropped (at least 1 each).
-func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, party []*ConnectedPlayer, log logPrinter) [][]byte {
+func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, party []*ConnectedPlayer, log logPrinter) []MapItem {
 	defs := db.MustDefs()
-	var packets [][]byte
+	var packets []MapItem
 	place := func(def *db.ItemDef, money uint32) {
 		x, z := dropPosition(mob.PosX, mob.PosZ)
 		mi := MapItem{ID: nextMapItemID(), OwnerID: ownerID, DroppedAt: time.Now(), PosX: x, PosZ: z}
@@ -185,7 +185,7 @@ func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, party []*ConnectedP
 			mi.Item, mi.Money = db.Item{Type: moneyItemType, Count: 1}, money
 		}
 		addMapItem(mapID, mi)
-		packets = append(packets, buildMapAddItem(&mi))
+		packets = append(packets, mi)
 	}
 	for _, d := range defs.MobDrops[mob.MobID] {
 		if d.ItemOrder < 1 || d.ItemOrder > 9 {

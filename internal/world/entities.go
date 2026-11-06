@@ -15,7 +15,7 @@ import (
 const (
 	VisibilityCellSize = 40
 	ViewportRadius     = 120.0
-	CombatRadius       = 80.0
+	CombatRadius       = BroadcastRadius // CZone::PSendView
 	MobAttackRange     = 3.0
 	MobAttackInterval  = 2500 * time.Millisecond
 
@@ -41,6 +41,10 @@ type MapNpc struct {
 	Angle            uint16
 	patrol           []NpcPatrolPoint
 	patrolIndex      int
+	cell             cell
+	hasCell          bool
+	backward         bool      // walking the patrol points back
+	nextMoveAt       time.Time // CNpc +0x4c
 }
 
 type MobArea struct{ LowerX, LowerZ, UpperX, UpperZ float32 }
@@ -79,6 +83,10 @@ type MapMob struct {
 	nextMoveAt         time.Time   // idle wander
 	nextChaseAt        time.Time   // chase / return step
 	Effects            []MobEffect // applied skills (TypeEffect 3)
+	cell               cell        // view cell, with the move hysteresis
+	hasCell            bool
+	diedAt             time.Time
+	corpseGone         bool // the corpse left the view (5 s after death)
 }
 
 type MapPortal struct {
@@ -255,22 +263,33 @@ func isNeighborCell(a, b cell) bool {
 
 // EntitiesNear returns the entities in the 5x5 cell window around (x, z).
 func EntitiesNear(mapID uint16, x, z float32) MapEntities {
-	if !hasGrid(mapID) {
-		return EntitiesOnMap(mapID)
-	}
-	viewer := cellFor(x, z)
+	return EntitiesInView(mapID, cellFor(x, z))
+}
+
+// EntitiesInView returns the NPCs and the visible mobs whose cell is in the
+// 5x5 window around the viewer's cell.
+func EntitiesInView(mapID uint16, viewer cell) MapEntities {
 	s := shard(mapID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out MapEntities
-	for _, n := range s.entities.NPCs {
-		if isNeighborCell(viewer, cellFor(n.PosX, n.PosZ)) {
-			out.NPCs = append(out.NPCs, n)
+	for i := range s.entities.NPCs {
+		n := &s.entities.NPCs[i]
+		c := n.cell
+		if !n.hasCell {
+			c = cellFor(n.PosX, n.PosZ)
+		}
+		if isNeighborCell(viewer, c) {
+			out.NPCs = append(out.NPCs, *n)
 		}
 	}
 	for i := range s.entities.Mobs {
 		m := &s.entities.Mobs[i]
-		if m.CurrentHP > 0 && isNeighborCell(viewer, cellFor(m.PosX, m.PosZ)) {
+		c := m.cell
+		if !m.hasCell {
+			c = cellFor(m.PosX, m.PosZ)
+		}
+		if m.visible() && isNeighborCell(viewer, c) {
 			out.Mobs = append(out.Mobs, cloneMob(m))
 		}
 	}
@@ -304,66 +323,6 @@ func walkableInMask(size uint32, mask []byte, x, z float32) bool {
 		return false
 	}
 	return (mask[bit/8]>>(bit%8))&1 == 0
-}
-
-// EntityVisibility tracks which NPCs and mobs a client currently knows.
-type EntityVisibility struct {
-	npcs map[uint32]bool
-	mobs map[uint32]bool
-}
-
-func VisibilityFrom(e MapEntities) EntityVisibility {
-	v := EntityVisibility{npcs: map[uint32]bool{}, mobs: map[uint32]bool{}}
-	for _, n := range e.NPCs {
-		v.npcs[n.ID] = true
-	}
-	for _, m := range e.Mobs {
-		v.mobs[m.ID] = true
-	}
-	return v
-}
-
-// VisibilityDelta returns leave/enter packets for what moved in or out of
-// view and updates v.
-func VisibilityDelta(mapID uint16, x, z float32, v *EntityVisibility) []labeled {
-	e := EntitiesNear(mapID, x, z)
-	next := VisibilityFrom(e)
-	var out []labeled
-	for id := range v.npcs {
-		if !next.npcs[id] {
-			out = append(out, labeled{buildNpcLeave(id), "0x0E02 npc leave"})
-		}
-	}
-	for id := range v.mobs {
-		if !next.mobs[id] {
-			out = append(out, labeled{buildMobLeave(id), "0x0602 mob leave"})
-		}
-	}
-	for i := range e.NPCs {
-		if !v.npcs[e.NPCs[i].ID] {
-			out = append(out, labeled{buildNpcEnter(&e.NPCs[i]), "0x0E01 npc enter delta"})
-		}
-	}
-	for i := range e.Mobs {
-		if !v.mobs[e.Mobs[i].ID] {
-			out = append(out, labeled{buildMobEnter(&e.Mobs[i], false), "0x0601 mob enter delta"})
-		}
-	}
-	*v = next
-	return out
-}
-
-// VisibilityClear returns leave packets for everything visible.
-func VisibilityClear(v *EntityVisibility) []labeled {
-	var out []labeled
-	for id := range v.npcs {
-		out = append(out, labeled{buildNpcLeave(id), "0x0E02 npc leave"})
-	}
-	for id := range v.mobs {
-		out = append(out, labeled{buildMobLeave(id), "0x0602 mob leave"})
-	}
-	*v = EntityVisibility{npcs: map[uint32]bool{}, mobs: map[uint32]bool{}}
-	return out
 }
 
 func MobByID(mapID uint16, id uint32) (MapMob, bool) {
@@ -404,7 +363,7 @@ func DamageMob(mapID uint16, id uint32, damage uint32) (MobDamageResult, bool) {
 		m.CurrentHP -= applied
 		r := MobDamageResult{DamageHP: uint16(min(damage, 65535)), AppliedHP: applied, Killed: m.CurrentHP == 0}
 		if r.Killed {
-			m.Effects = nil
+			m.Effects, m.diedAt, m.corpseGone = nil, time.Now(), false
 		} else {
 			r.Speed = m.removeSleep()
 		}
@@ -443,7 +402,7 @@ type mapPacket struct {
 
 type MobCombatTick struct {
 	Attacks  []MobAttackAction
-	Moves    []mapPacket
+	Moves    []entityMove
 	Restores []mapPacket
 }
 
@@ -476,8 +435,8 @@ func (b viewerBuckets) nearAny(x, z float32, radius float32) bool {
 }
 
 // TickMobRoam moves idle mobs near viewers within their area.
-func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacket {
-	var out []mapPacket
+func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []entityMove {
+	var out []entityMove
 	for mapID, viewers := range viewersByMap {
 		s := shard(mapID)
 		s.mu.Lock()
@@ -494,7 +453,7 @@ func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacke
 			}
 			if m.advanceRoam(mapID) {
 				moved++
-				out = append(out, mapPacket{mapID, m.PosX, m.PosZ, buildMobMove(m, 0)})
+				out = append(out, m.relocate(mapID, 0))
 			}
 		}
 		s.mu.Unlock()
@@ -503,8 +462,8 @@ func TickMobRoam(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacke
 }
 
 // TickMobRespawns revives due mobs at a fresh position in their area.
-func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacket {
-	var out []mapPacket
+func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []entityMove {
+	var out []entityMove
 	now := time.Now()
 	for mapID, viewers := range viewersByMap {
 		s := shard(mapID)
@@ -525,41 +484,40 @@ func TickMobRespawns(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapP
 			m.respawnAt = time.Time{}
 			m.AggroTarget, m.lastAttackAt, m.nextAttackAt, m.returningHome = 0, time.Time{}, time.Time{}, false
 			respawned++
-			if buckets.nearAny(m.PosX, m.PosZ, ViewportRadius) {
-				out = append(out, mapPacket{mapID, m.PosX, m.PosZ, buildMobEnter(m, true)})
-			}
+			m.hasCell, m.diedAt, m.corpseGone = false, time.Time{}, false
+			e := m.relocate(mapID, 0)
+			e.Move, e.Enter = nil, buildMobEnter(m, true)
+			out = append(out, e)
+			_ = buckets
 		}
 		s.mu.Unlock()
 	}
 	return out
 }
 
-var npcPatrolCursor atomic.Uint32
-
-// TickNpcPatrol advances patrolling NPCs near viewers.
-func TickNpcPatrol(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPacket {
-	var out []mapPacket
-	cursor := npcPatrolCursor.Add(1) - 1
+// TickNpcPatrol is CNpc::UpdateMove for patrolling NPCs near viewers:
+// every MoveSpeed ms an NPC steps MoveDistance toward its next patrol
+// point; on reaching it, it walks the points forward then back and rests
+// rand(10 s) + MoveSpeed + 10 s. NPCs in use by a player stand still.
+func TickNpcPatrol(viewersByMap map[uint16][][2]float32, maxPerMap int) []entityMove {
+	var out []entityMove
+	now := time.Now()
 	for mapID, viewers := range viewersByMap {
 		s := shard(mapID)
 		s.mu.Lock()
 		buckets := bucketViewers(viewers)
-		moved, visited := 0, 0
+		moved := 0
 		for i := range s.entities.NPCs {
 			if moved >= maxPerMap {
 				break
 			}
 			n := &s.entities.NPCs[i]
-			if len(n.patrol) <= 1 || !buckets.nearAny(n.PosX, n.PosZ, ViewportRadius) || npcInUse(n.ID) {
+			if len(n.patrol) <= 1 || now.Before(n.nextMoveAt) || !buckets.nearAny(n.PosX, n.PosZ, ViewportRadius) || npcInUse(n.ID) {
 				continue
 			}
-			visited++
-			if (uint32(visited)+cursor)%2 != 0 {
-				continue
-			}
-			if n.advancePatrol() {
+			if n.stepPatrol(now) {
 				moved++
-				out = append(out, mapPacket{mapID, n.PosX, n.PosZ, buildNpcMove(n, 0)})
+				out = append(out, n.relocate(mapID))
 			}
 		}
 		s.mu.Unlock()
@@ -567,17 +525,79 @@ func TickNpcPatrol(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPac
 	return out
 }
 
-func (n *MapNpc) advancePatrol() bool {
-	if len(n.patrol) <= 1 {
+func (n *MapNpc) stepPatrol(now time.Time) bool {
+	def := findNpcDef(n.Type, n.TypeID)
+	if def == nil || def.MoveDistance <= 0 {
+		n.nextMoveAt = now.Add(time.Minute)
 		return false
 	}
-	n.patrolIndex = (n.patrolIndex + 1) % len(n.patrol)
+	interval := time.Duration(max(def.MoveSpeed, 0)) * time.Millisecond
 	p := n.patrol[n.patrolIndex]
-	if abs32(n.PosX-p.X) < 0.1 && abs32(n.PosY-p.Y) < 0.1 && abs32(n.PosZ-p.Z) < 0.1 {
-		return false
+	dx, dz := p.X-float32(math.Round(float64(n.PosX))), p.Z-float32(math.Round(float64(n.PosZ)))
+	dist := float32(math.Hypot(float64(dx), float64(dz)))
+	step := float32(def.MoveDistance)
+	if dist <= step {
+		n.PosX, n.PosY, n.PosZ, n.Angle = p.X, p.Y, p.Z, p.Angle
+		if n.backward {
+			n.patrolIndex--
+			if n.patrolIndex < 0 {
+				n.patrolIndex, n.backward = 1, false
+			}
+		} else {
+			n.patrolIndex++
+			if n.patrolIndex >= len(n.patrol) {
+				n.patrolIndex, n.backward = len(n.patrol)-2, true
+			}
+		}
+		n.nextMoveAt = now.Add(time.Duration(rand.IntN(10000))*time.Millisecond + interval + 10*time.Second)
+		return true
 	}
-	n.PosX, n.PosY, n.PosZ, n.Angle = p.X, p.Y, p.Z, p.Angle
+	n.PosX += dx / dist * step
+	n.PosZ += dz / dist * step
+	n.nextMoveAt = now.Add(interval)
 	return true
+}
+
+// relocate updates the mob's cell after a position change and returns the
+// update for the users around it.
+func (m *MapMob) relocate(mapID uint16, motion uint8) entityMove {
+	from, fresh := m.cell, !m.hasCell
+	m.cell, m.hasCell = cellAfterMove(m.cell, m.hasCell, m.PosX, m.PosZ), true
+	return entityMove{MapID: mapID, Kind: viewMob, ID: m.ID, From: from, To: m.cell, Fresh: fresh,
+		Changed: fresh || from != m.cell, Move: buildMobMove(m, motion), Enter: buildMobEnter(m, false)}
+}
+
+func (n *MapNpc) relocate(mapID uint16) entityMove {
+	from, fresh := n.cell, !n.hasCell
+	n.cell, n.hasCell = cellAfterMove(n.cell, n.hasCell, n.PosX, n.PosZ), true
+	return entityMove{MapID: mapID, Kind: viewNpc, ID: n.ID, From: from, To: n.cell, Fresh: fresh,
+		Changed: fresh || from != n.cell, Move: buildNpcMove(n, 0), Enter: buildNpcEnter(n)}
+}
+
+// mobCorpseDelay is CMob::Damage's death tick: the corpse stays 5 s.
+const mobCorpseDelay = 5 * time.Second
+
+// visibleMob: alive, or dead with its corpse still shown.
+func (m *MapMob) visible() bool { return m.CurrentHP > 0 || (!m.diedAt.IsZero() && !m.corpseGone) }
+
+// TickMobCorpses is CZone::UpdateMobDeath: corpses older than 5 s leave
+// the view (0x0602).
+func TickMobCorpses() []entityMove {
+	now := time.Now()
+	var out []entityMove
+	for _, mapID := range shardIDs() {
+		s := shard(mapID)
+		s.mu.Lock()
+		for i := range s.entities.Mobs {
+			m := &s.entities.Mobs[i]
+			if m.CurrentHP == 0 && !m.diedAt.IsZero() && !m.corpseGone && now.Sub(m.diedAt) >= mobCorpseDelay {
+				m.corpseGone = true
+				out = append(out, entityMove{MapID: mapID, Kind: viewMob, ID: m.ID})
+			}
+		}
+		s.mu.Unlock()
+	}
+	return out
 }
 
 // SetMobAggro makes a live mob fight characterID (last-hit aggro).
@@ -682,7 +702,7 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 						}
 					}
 					actions++
-					tick.Moves = append(tick.Moves, mapPacket{mapID, m.PosX, m.PosZ, buildMobMove(m, mobMotionWalk)})
+					tick.Moves = append(tick.Moves, m.relocate(mapID, mobMotionWalk))
 					if arrived {
 						m.returningHome, m.lastAttackAt = false, time.Time{}
 						m.CurrentHP, m.Effects = max(m.MaxHP, 1), nil
@@ -739,7 +759,7 @@ func TickMobCombat(players []PlayerCombatSnapshot, maxPerMap int) MobCombatTick 
 				if IsMapWalkable(mapID, nx, nz) {
 					m.PosX, m.PosZ = nx, nz
 					actions++
-					tick.Moves = append(tick.Moves, mapPacket{mapID, m.PosX, m.PosZ, buildMobMove(m, mobMotionRun)})
+					tick.Moves = append(tick.Moves, m.relocate(mapID, mobMotionRun))
 				}
 			}
 		}
@@ -802,7 +822,8 @@ func NewPatrolNpc(npcType uint8, typeID uint16, points []NpcPatrolPoint) (MapNpc
 	}
 	p := points[0]
 	return MapNpc{ID: nextNpcID.Add(1) - 1, Type: npcType, TypeID: typeID, PosX: p.X, PosY: p.Y, PosZ: p.Z,
-		Angle: p.Angle, patrol: points}, true
+		Angle: p.Angle, patrol: points, cell: cellFor(p.X, p.Z), hasCell: true, patrolIndex: min(1, len(points)-1),
+		nextMoveAt: time.Now().Add(time.Duration(10000+rand.IntN(10000)) * time.Millisecond)}, true
 }
 
 // NewStaticMob builds a mob from its definition; respawn 0 never respawns.
@@ -817,6 +838,7 @@ func NewStaticMob(def *db.MobDef, mobID uint16, x, z float32, area *MobArea, res
 	// CMob::Init: the first wander comes within a minute.
 	m.nextMoveAt = time.Now().Add(time.Duration(rand.IntN(60000)) * time.Millisecond)
 	m.CurrentHP = m.MaxHP
+	m.cell, m.hasCell = cellFor(x, z), true
 	if area != nil {
 		a := area.normalized()
 		m.Area = &a

@@ -131,7 +131,7 @@ func partyBadge(p *ConnectedPlayer) {
 	w.U8(kind)
 	frame := w.MustFinish()
 	x, z := p.PositionXZ()
-	sendNear(p.MapID(), x, z, ViewportRadius, frame, "0x0520 party badge")
+	sendNear(p.MapID(), x, z, BroadcastRadius, frame, "0x0520 party badge")
 }
 
 // enterParty is enter_normal_party (partyMu held): announce the newcomer,

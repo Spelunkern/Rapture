@@ -13,16 +13,17 @@ func StartSweeps(log *logx.Logger) {
 	every(2*time.Second, func() {
 		for _, e := range sweepExpiredMapItems() {
 			log.Printf("Rapture World despawned map_item_id=%d on map=%d", e.Item.ID, e.MapID)
-			sendNear(e.MapID, e.Item.PosX, e.Item.PosZ, ViewportRadius, buildMapRemoveItem(e.Item.ID), "0x0402 map item despawn")
+			dispatchEntityLeave(e.MapID, viewItem, e.Item.ID, "0x0402 map item despawn")
 		}
 	})
-	every(time.Second, func() { broadcastMapPackets(TickMobRoam(viewersByMap(), 48), ViewportRadius, "0x0603 mob roam move") })
+	every(time.Second, func() { dispatchMoves(TickMobRoam(viewersByMap(), 48)) })
 	every(time.Second, func() {
-		broadcastMapPackets(TickMobRespawns(viewersByMap(), 128), ViewportRadius, "0x0601 mob respawn")
+		dispatchMoves(TickMobRespawns(viewersByMap(), 128))
+		for _, c := range TickMobCorpses() {
+			dispatchEntityLeave(c.MapID, viewMob, c.ID, "0x0602 mob corpse removed")
+		}
 	})
-	every(4*time.Second, func() {
-		broadcastMapPackets(TickNpcPatrol(viewersByMap(), 16), ViewportRadius, "0x0E03 npc patrol move")
-	})
+	every(250*time.Millisecond, func() { dispatchMoves(TickNpcPatrol(viewersByMap(), 64)) })
 	every(time.Second, func() { runDotSweep(log) })
 	every(500*time.Millisecond, func() {
 		players := AllPlayers()
@@ -38,8 +39,10 @@ func StartSweeps(log *logx.Logger) {
 		for _, a := range tick.Attacks {
 			queueMobAttack(a)
 		}
-		broadcastMapPackets(tick.Moves, ViewportRadius, "0x0603 mob chase move")
-		broadcastMapPackets(tick.Restores, CombatRadius, "0x0610 mob hp restore on reset")
+		dispatchMoves(tick.Moves)
+		for _, r := range tick.Restores {
+			sendView(r.MapID, r.X, r.Z, r.Packet, "0x0610 mob hp restore")
+		}
 	})
 }
 
@@ -92,9 +95,9 @@ func viewersByMap() map[uint16][][2]float32 {
 	return out
 }
 
-func broadcastMapPackets(list []mapPacket, radius float32, label string) {
-	for _, m := range list {
-		sendNear(m.MapID, m.X, m.Z, radius, m.Packet, label)
+func dispatchMoves(list []entityMove) {
+	for _, e := range list {
+		dispatchEntityMove(e)
 	}
 }
 
@@ -102,7 +105,7 @@ func runDotSweep(log *logx.Logger) {
 	for _, o := range TickMobEffects() {
 		m := &o.Mob
 		if o.Speed != nil {
-			sendNear(o.MapID, m.PosX, m.PosZ, ViewportRadius, o.Speed, "0x0609 mob speed")
+			sendNear(o.MapID, m.PosX, m.PosZ, BroadcastRadius, o.Speed, "0x0609 mob speed")
 		}
 		if !o.Damaged {
 			continue

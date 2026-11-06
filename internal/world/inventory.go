@@ -416,11 +416,8 @@ func (s *Session) handleChangeAppearance(p []byte) {
 // character; includeSelf also echoes it to this session.
 func (s *Session) broadcastNear(frame []byte, label string, includeSelf bool) {
 	ch := s.char
-	for _, o := range PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius) {
-		if canSeeCharacter(o.IsAdmin, s.isAdmin, false) {
-			o.Send(frame, label)
-		}
-	}
+	_ = ch
+	s.sendToViewers(frame, label)
 	if includeSelf {
 		s.send(frame, label)
 	}
@@ -467,12 +464,8 @@ func (s *Session) handleDropItem(p []byte) {
 	}
 	addMapItem(ch.MapID, mi)
 	s.log.Printf("Rapture World dropped item uid=%d map_item_id=%d type=%d/%d count=%d remaining=%d", it.UID, mi.ID, it.Type, it.TypeID, n, res.Count)
-	add := buildMapAddItem(&mi)
 	s.send(buildRemoveItem(&res, res.Count == 0), "0x0206 drop remove item")
-	s.send(add, "0x0401 drop map add item")
-	for _, o := range PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius) {
-		o.Send(add, "0x0401 drop map add item (broadcast)")
-	}
+	dispatchItemEnter(ch.MapID, &mi, "0x0401 drop map add item")
 	if bag == 0 {
 		if slot < 8 {
 			s.equipmentChanged([]uint8{slot})
@@ -490,11 +483,7 @@ func (s *Session) equipmentChanged(slots []uint8) {
 	for _, slot := range slots {
 		frame := buildCharacterEquipment(ch, s.items, slot)
 		s.send(frame, fmt.Sprintf("0x0507 character equipment slot %d", slot))
-		for _, o := range PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius) {
-			if canSeeCharacter(o.IsAdmin, s.isAdmin, false) {
-				o.Send(frame, "0x0507 character equipment (broadcast)")
-			}
-		}
+		s.sendToViewers(frame, "0x0507 character equipment (broadcast)")
 	}
 }
 
@@ -514,8 +503,6 @@ func (s *Session) handlePickupItem(p []byte) {
 		s.send(buildAddItemError(2), "0x0205 pickup reserved")
 		return
 	}
-	others := PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius)
-	remove := buildMapRemoveItem(mi.ID)
 	if mi.Money > 0 {
 		removeMapItem(ch.MapID, mi.ID)
 		ch.Money = min(uint32(min(uint64(ch.Money)+uint64(mi.Money), db.MoneyCap)), db.MoneyCap)
@@ -524,8 +511,7 @@ func (s *Session) handlePickupItem(p []byte) {
 		s.log.Printf("Rapture World picked up money amount=%d new_money=%d", mi.Money, ch.Money)
 		s.send(buildAddItem(&gold), "0x0205 pickup money")
 		s.send(buildSetMoney(ch.Money), "0x0213 pickup money update")
-		s.send(remove, "0x0402 pickup map remove item")
-		broadcast(others, remove, "0x0402 pickup map remove item (broadcast)", s.logger)
+		dispatchEntityLeave(ch.MapID, viewItem, mi.ID, "0x0402 pickup map remove item")
 		return
 	}
 	adds, left, err := s.giveItem(&mi.Item, mi.Item.Count, maxStackOf(mi.Item.Type, mi.Item.TypeID))
@@ -539,14 +525,11 @@ func (s *Session) handlePickupItem(p []byte) {
 	for _, a := range adds {
 		s.send(a, "0x0205 pickup add item")
 	}
-	s.send(remove, "0x0402 pickup map remove item")
-	broadcast(others, remove, "0x0402 pickup map remove item (broadcast)", s.logger)
+	dispatchEntityLeave(ch.MapID, viewItem, mi.ID, "0x0402 pickup map remove item")
 	if left == 0 {
 		removeMapItem(ch.MapID, mi.ID)
 	} else if upd, ok := setMapItemCount(ch.MapID, mi.ID, left); ok {
-		add := buildMapAddItem(&upd)
-		s.send(add, "0x0401 pickup map add remaining item")
-		broadcast(others, add, "0x0401 pickup map add remaining item (broadcast)", s.logger)
+		dispatchItemEnter(ch.MapID, &upd, "0x0401 pickup map add remaining item")
 	}
 	s.log.Printf("Rapture World picked up map_item_id=%d type=%d/%d remaining=%d", mi.ID, mi.Item.Type, mi.Item.TypeID, left)
 	s.questPickup(mi.Item.Type, mi.Item.TypeID)

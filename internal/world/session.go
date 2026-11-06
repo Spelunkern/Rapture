@@ -49,7 +49,6 @@ type Session struct {
 	quickSlots []db.QuickSlot
 	points     uint32
 	player     *ConnectedPlayer
-	visibility EntityVisibility
 
 	itemCooldowns  map[uint8]time.Time
 	skillCooldowns map[uint16]time.Time
@@ -296,7 +295,7 @@ func (s *Session) recoveryTick() {
 	}
 	s.persist()
 	after := s.stats()
-	sendNear(s.char.MapID, s.char.PosX, s.char.PosZ, ViewportRadius,
+	sendNear(s.char.MapID, s.char.PosX, s.char.PosZ, BroadcastRadius,
 		buildCharacterReviveHitpoints(s.char.ID, hp, mp, sp), "0x0505 recover")
 	s.send(buildCurrentHitpoints(&after), "0x0521 recover set")
 }
@@ -683,7 +682,6 @@ func (s *Session) selectCharacter(id uint32) {
 	normalize(&ch)
 	s.char = &ch
 	s.log.SetTag(strings.SplitN(s.log.Tag(), "/", 3)[0] + "/" + s.account.UserID + "/" + ch.Name)
-	s.visibility = EntityVisibility{}
 	s.items, err = db.CharacterItems(id)
 	s.logErr("load items", err)
 	s.skills, err = db.CharacterSkills(id)
@@ -768,34 +766,18 @@ func (s *Session) handleMapLoaded() {
 	s.send(buildCharacterEnteredMap(ch, s.isAdmin, true), "0x0201 entered map")
 	s.send(buildCharacterShape(ch, s.faction, s.items, 0), "0x0303 character shape")
 	s.send(buildCharacterMove(ch, 0, 0), "0x0501 character move")
-	for _, it := range itemsOnMap(ch.MapID) {
-		s.send(buildMapAddItem(&it), "0x0401 map add item")
-	}
-	near := EntitiesNear(ch.MapID, ch.PosX, ch.PosZ)
-	for i := range near.NPCs {
-		s.send(buildNpcEnter(&near.NPCs[i]), "0x0E01 npc enter")
-	}
-	for i := range near.Mobs {
-		s.send(buildMobEnter(&near.Mobs[i], false), "0x0601 mob enter")
-	}
-	s.visibility = VisibilityFrom(near)
 	if s.player == nil {
 		s.player = RegisterPlayer(*ch, s.items, s.isAdmin, s.faction, s.out, s.logger)
 	} else {
+		s.clearView(false)
 		s.player.SetMap(ch.MapID)
 		s.player.UpdateCharacter(*ch)
 		s.player.UpdateItems(s.items)
 	}
-	others := PlayersNearExcluding(ch.MapID, ch.ID, ch.PosX, ch.PosZ, ViewportRadius)
-	for _, o := range others {
-		s.send(o.EnteredMapPacket(), "0x0201 other character entered map")
-		s.send(o.ShapePacket(), "0x0303 other character shape")
-		s.send(o.MovePacket(), "0x0501 other character move")
-		if o.IsSitting() {
-			s.send(o.SitMotionPacket(), "0x0506 other character sitting")
-		}
-	}
-	s.introduceToOthers("map loaded")
+	// CZone::EnterUser + SendCellInfoView: the 5x5 cells around the user.
+	s.placeView()
+	near := EntitiesInView(ch.MapID, cellFor(ch.PosX, ch.PosZ))
+	others := s.player.knownIDs(viewUser)
 	s.log.Printf("Rapture World map loaded map=%d npcs=%d mobs=%d players=%d", ch.MapID, len(near.NPCs), len(near.Mobs), len(others))
 }
 
@@ -842,7 +824,6 @@ func (s *Session) handleLogout() {
 	s.leaveWorld()
 	s.buffs, s.cast, s.mounted, s.dead, s.autoAttack = nil, nil, false, false, false
 	s.items, s.skills, s.quickSlots, s.stored, s.points = nil, nil, nil, nil, 0
-	s.visibility = EntityVisibility{}
 	s.send(buildLeaveWorldAck(id), "0x0107 leave world ack")
 	s.expanded = false
 	s.sendCharacterSelect()

@@ -250,6 +250,8 @@ func (s *Session) handleUseVehicle() {
 	w := packet.New(packet.CharacterMountShape)
 	w.U32(ch.ID)
 	w.U8(shape)
-	sendNear(ch.MapID, ch.PosX, ch.PosZ, ViewportRadius, w.MustFinish(), "0x051D character mount shape")
+	frame := w.MustFinish()
+	s.send(frame, "0x051D character mount shape")
+	s.sendToViewers(frame, "0x051D character mount shape")
 	s.log.Printf("Rapture World character_id=%d mounted=%t", ch.ID, next)
 }

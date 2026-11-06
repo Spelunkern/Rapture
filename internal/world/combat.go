@@ -152,7 +152,7 @@ func (s *Session) resolveMobDamage(r *MobDamageResult) bool {
 	ch := s.char
 	m := &r.Mob
 	if r.Speed != nil {
-		sendNear(ch.MapID, m.PosX, m.PosZ, ViewportRadius, r.Speed, "0x0609 mob speed (woke)")
+		sendNear(ch.MapID, m.PosX, m.PosZ, BroadcastRadius, r.Speed, "0x0609 mob speed (woke)")
 	}
 	if !r.Killed {
 		sendNear(ch.MapID, m.PosX, m.PosZ, CombatRadius, buildMobCurrentHP(m.ID, m.CurrentHP), "0x0610 mob current hp after attack")
@@ -425,15 +425,15 @@ func rewardKill(killer *ConnectedPlayer, killerID uint32, mapID uint16, m *MapMo
 	if len(recipients) == 0 && killer != nil {
 		recipients = []*ConnectedPlayer{killer}
 	}
-	for _, p := range rollMobDrops(mapID, m, killerID, party, log) {
-		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, p, "0x0401 mob drop")
+	for _, it := range rollMobDrops(mapID, m, killerID, party, log) {
+		dispatchItemEnter(mapID, &it, "0x0401 mob drop")
 	}
 	if def := questItemDrop(m, recipients); def != nil {
 		x, z := dropPosition(m.PosX, m.PosZ)
 		mi := MapItem{ID: nextMapItemID(), OwnerID: killerID, DroppedAt: time.Now(), PosX: x, PosZ: z,
 			Item: db.Item{Type: def.Type, TypeID: def.TypeID, Quality: def.Quality, Count: 1}}
 		addMapItem(mapID, mi)
-		sendNear(mapID, m.PosX, m.PosZ, CombatRadius, buildMapAddItem(&mi), "0x0401 quest item drop")
+		dispatchItemEnter(mapID, &mi, "0x0401 quest item drop")
 	}
 	for _, p := range recipients {
 		p.QueueQuestKill(m.MobID)
