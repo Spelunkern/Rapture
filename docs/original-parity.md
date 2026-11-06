@@ -38,6 +38,9 @@ gaps; **invented** is still a Rapture rule to replace.
 | Skill learning | `CUser::LearnSkill` 0x004842e0, `EnableLearnSkill` 0x00484080 | done: levels 1-3, new skills at level 1 and known ones to any higher level, errors 1 points / 2 level / 3 otherwise, Country by family, job, growth mode (easy only Grow 0, normal up to 1, hard all but 3), TypeShow 0 hidden; no prerequisite skill (Rapture's PrevSkillID check was invented) |
 | Mounts | `vertical_combat_vehicle_prefix`, `CUser::CancleActionVehicle`, `StatusCastingStop` | partial: slot-13 mount, shape from the item's Range (r*2 below 2, else r+7), refusal 0x0216 (0, 1), shown to users entering the view (0x051D), a hit dismounts. The summon delay (item byte +0x32) and the mounted speed are not modeled |
 | Mob gold pickup | `ItemGet` 0x0045d2e0 | done: mob gold gets ability 44 percent, +20 White Tiger, +50 Red Phoenix |
+| Trade | `CUser::PacketExchange` 0x0046ec90, `ExchangeItemAddEnable`, `ExchangeMoneyAddEnable` | done: same zone and country, not already trading; offers from the bags only, count 1..stack, no quest items (real type 27), no item twice; room and gold checks on completion |
+| NPC shop sale | `CUser::PacketShop` 0x0703 | done: bags only, count 1..stack else ignored, quest items pay nothing (a partial sale keeps the stack), no sale while attacking or on gold overflow |
+| Warehouse | `CUser::ItemBankToBag` 0x0045bf30, `ItemBagToBank` 0x0045c4e0, `IsBank` | done: 240 slots, withdrawing costs 5% of Sell x count (type 94 free), quest items cannot be stored |
 | Equip requirements | `CUser::EnableEquipment` 0x0045b450 | done |
 | NPC shop buy | `CUser::PacketShop` 0x0046af10, `NpcQuest.SData` | done (no guild-house discounts) |
 | Gatekeepers | `CUser::PacketMaininterface` case 0x020C, `NpcQuest.SData` | done (no guild-house rates; teleport is immediate) |

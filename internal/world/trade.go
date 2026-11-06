@@ -159,8 +159,10 @@ func (s *Session) handleTradeRequest(target uint32) {
 	if me == nil || target == me.CharacterID || tradeFor(me.CharacterID) != nil {
 		return
 	}
+	// CUser::PacketExchange 0x0A01: a user of the same zone and country
+	// that is not trading.
 	other := FindPlayerByID(target)
-	if other == nil || other.MapID() != me.MapID() {
+	if other == nil || other.MapID() != me.MapID() || other.Faction() != me.Faction() || tradeFor(target) != nil {
 		return
 	}
 	tradeMu.Lock()
@@ -263,8 +265,22 @@ func (s *Session) handleTradeAdd(bag, slot, count, dest uint8) {
 	if i < 0 {
 		return
 	}
+	// 0x0A06: count 1..stack, not a quest item (real type 27), not offered
+	// twice.
 	it := s.items[i]
-	n := min(max(count, 1), it.Count)
+	if count == 0 || count > it.Count || realType(it.Type) == 27 {
+		return
+	}
+	if t := tradeFor(s.char.ID); t != nil {
+		if off := t.offer(s.char.ID); off != nil {
+			for _, x := range off.items {
+				if x != nil && x.Item.UID == it.UID {
+					return
+				}
+			}
+		}
+	}
+	n := count
 	o := &offeredItem{Item: it, Count: n}
 	_, partner, ok := s.mutateOffer(func(off *tradeOffer) { off.items[dest] = o })
 	if !ok {

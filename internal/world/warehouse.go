@@ -2,6 +2,7 @@ package world
 
 import (
 	"encoding/binary"
+	"math"
 
 	"github.com/Spelunkern/Rapture/internal/db"
 	"github.com/Spelunkern/Rapture/internal/packet"
@@ -11,7 +12,7 @@ import (
 // the client's move packets.
 const (
 	WarehouseBag   = 100
-	WarehouseSlots = 120
+	WarehouseSlots = 240 // CUser::IsBank: slots below 0xF0
 )
 
 func findStored(items []db.Item, slot uint8) int {
@@ -132,6 +133,14 @@ func (s *Session) warehouseDeposit(srcBag, srcSlot, dest uint8) []byte {
 		return buildBagToBag(srcBag, srcSlot, nil, WarehouseBag, dest, d)
 	}
 	src := s.items[si]
+	if realType(src.Type) == 27 {
+		// CUser::ItemBagToBank: quest items stay in the bags.
+		var d *db.Item
+		if di >= 0 {
+			d = &s.stored[di]
+		}
+		return buildBagToBag(srcBag, srcSlot, &src, WarehouseBag, dest, d)
+	}
 	if di >= 0 {
 		b := &s.stored[di]
 		if ms := maxStackOf(src.Type, src.TypeID); itemsMatch(&src, b) && ms > 1 && b.Count < ms {
@@ -176,10 +185,30 @@ func (s *Session) warehouseWithdraw(src, destBag, destSlot uint8) []byte {
 		return buildBagToBag(WarehouseBag, src, nil, destBag, destSlot, d)
 	}
 	a := s.stored[si]
+	// CUser::ItemBankToBag: taking an item out costs 5% of its Sell price
+	// times the count (item mall type 94 is free).
+	fee := uint32(0)
+	if d := db.MustDefs().Item(a.Type, a.TypeID); d != nil && a.Type != 94 {
+		fee = uint32(math.RoundToEven(float64(float32(uint32(a.Count)*uint32(max(d.Sell, 0)))) * float64(float32(0.05))))
+	}
+	if ch.Money < fee {
+		var d *db.Item
+		if di >= 0 {
+			d = &s.items[di]
+		}
+		return buildBagToBag(WarehouseBag, src, &a, destBag, destSlot, d)
+	}
+	pay := func() {
+		if fee > 0 {
+			ch.Money -= fee
+			s.persist()
+		}
+	}
 	if di >= 0 {
 		b := &s.items[di]
 		if ms := maxStackOf(a.Type, a.TypeID); itemsCanStack(&a, b) && ms > 1 && b.Count < ms {
 			moved := min(a.Count, ms-b.Count)
+			pay()
 			b.Count += moved
 			db.SaveCharacterItem(ch.ID, b)
 			bCopy := *b
@@ -207,6 +236,7 @@ func (s *Session) warehouseWithdraw(src, destBag, destSlot uint8) []byte {
 	}
 	s.stored = append(s.stored[:si], s.stored[si+1:]...)
 	s.items = append(s.items, it)
+	pay()
 	s.log.Printf("Rapture World withdrew item %d/%d from warehouse slot=%d to (%d,%d)", a.Type, a.TypeID, src, destBag, destSlot)
 	return buildBagToBag(WarehouseBag, src, nil, destBag, destSlot, &it)
 }
@@ -222,36 +252,54 @@ func buildShopSellResult(result, bag, slot, itemType, typeID, remaining uint8, m
 
 // handleShopSell (0x0703): bag, slot, count. Items.Sell is per unit.
 func (s *Session) handleShopSell(p []byte) {
-	if len(p) < 5 || s.char == nil {
+	if len(p) < 5 || s.char == nil || s.autoAttack {
 		return
 	}
+	// npc_shop sell (CUser::PacketShop 0x0703): not from the equipment (bag
+	// 0), count 1..stack, else ignored; real type 27 pays nothing and a
+	// partial sale of it keeps the stack; overflowing gold is ignored.
 	ch := s.char
-	bag, slot, req := p[2], p[3], max(p[4], 1)
+	bag, slot, count := p[2], p[3], p[4]
+	if bag == 0 || !isValidItemPosition(bag, slot) {
+		return
+	}
 	i := findItem(s.items, bag, slot)
-	if i < 0 {
-		s.send(buildShopSellResult(1, bag, slot, 0, 0, 0, ch.Money), "0x0703 shop sell rejected")
+	if i < 0 || count == 0 || count > s.items[i].Count {
 		return
 	}
 	it := s.items[i]
 	def := db.MustDefs().Item(it.Type, it.TypeID)
 	if def == nil {
-		s.send(buildShopSellResult(1, bag, slot, 0, 0, 0, ch.Money), "0x0703 shop sell rejected")
 		return
 	}
-	sold := min(req, it.Count)
-	proceeds := satMul(uint32(max(def.Sell, 0)), uint32(sold))
-	s.items[i].Count -= sold
-	if err := db.SaveCharacterItem(ch.ID, &s.items[i]); err != nil {
-		s.log.Printf("Rapture World shop sell failed: %v", err)
-		s.items[i].Count = it.Count
+	whole := it.Count == count
+	quest := realType(it.Type) == 27
+	proceeds := uint64(max(def.Sell, 0)) * uint64(count)
+	if !quest && uint64(ch.Money)+proceeds > uint64(^uint32(0)) {
 		return
 	}
-	remaining := s.items[i].Count
-	if remaining == 0 {
+	remaining := uint8(0)
+	if whole {
+		if err := db.DeleteCharacterItems(ch.ID, it.UID); err != nil {
+			s.log.Printf("Rapture World shop sell failed: %v", err)
+			return
+		}
 		s.items = append(s.items[:i], s.items[i+1:]...)
+	} else if !quest {
+		s.items[i].Count -= count
+		if err := db.SaveCharacterItem(ch.ID, &s.items[i]); err != nil {
+			s.log.Printf("Rapture World shop sell failed: %v", err)
+			s.items[i].Count = it.Count
+			return
+		}
+		remaining = s.items[i].Count
+	} else {
+		remaining = it.Count
 	}
-	ch.Money = uint32(min(uint64(ch.Money)+uint64(proceeds), db.MoneyCap))
+	if !quest {
+		ch.Money = uint32(min(uint64(ch.Money)+proceeds, db.MoneyCap))
+	}
 	s.persist()
-	s.log.Printf("Rapture World sold item %d/%d count=%d proceeds=%d", it.Type, it.TypeID, sold, proceeds)
+	s.log.Printf("Rapture World sold item %d/%d count=%d proceeds=%d", it.Type, it.TypeID, count, proceeds)
 	s.send(buildShopSellResult(0, bag, slot, it.Type, it.TypeID, remaining, ch.Money), "0x0703 shop sell")
 }
