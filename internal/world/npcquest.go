@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/Spelunkern/Rapture/internal/db"
 	"github.com/Spelunkern/Rapture/internal/logx"
@@ -315,4 +316,39 @@ func (s *Session) handleGatekeeper(p []byte) {
 	s.send(buildGatekeeperResult(true, ch.Money), "0x020C gatekeeper")
 	s.log.Printf("Rapture World gatekeeper to %q map %d for %d", g.Name, g.MapID, g.Money)
 	s.applyTeleport(g.MapID, g.X, g.Y, g.Z, "gatekeeper")
+}
+
+// NPC usage (CUser::PacketNpc 0x00467510): 0x0E04 records the NPC a
+// player is talking to; an NPC in use stops patrolling.
+var (
+	npcUseMu sync.Mutex
+	npcUsers = map[uint32]int{}
+)
+
+func (s *Session) useNpc(id uint32) {
+	if s.char != nil && id != 0 {
+		if _, ok := npcOnMap(s.char.MapID, id); !ok {
+			return
+		}
+	}
+	if id == s.usingNpc {
+		return
+	}
+	npcUseMu.Lock()
+	if s.usingNpc != 0 {
+		if npcUsers[s.usingNpc]--; npcUsers[s.usingNpc] <= 0 {
+			delete(npcUsers, s.usingNpc)
+		}
+	}
+	if id != 0 {
+		npcUsers[id]++
+	}
+	npcUseMu.Unlock()
+	s.usingNpc = id
+}
+
+func npcInUse(id uint32) bool {
+	npcUseMu.Lock()
+	defer npcUseMu.Unlock()
+	return npcUsers[id] > 0
 }

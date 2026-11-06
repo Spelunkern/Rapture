@@ -639,7 +639,7 @@ func TickNpcPatrol(viewersByMap map[uint16][][2]float32, maxPerMap int) []mapPac
 				break
 			}
 			n := &s.entities.NPCs[i]
-			if len(n.patrol) <= 1 || !buckets.nearAny(n.PosX, n.PosZ, ViewportRadius) {
+			if len(n.patrol) <= 1 || !buckets.nearAny(n.PosX, n.PosZ, ViewportRadius) || npcInUse(n.ID) {
 				continue
 			}
 			visited++

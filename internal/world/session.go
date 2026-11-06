@@ -66,6 +66,7 @@ type Session struct {
 	lastPositionSave time.Time
 	lastRegenAt      time.Time
 	lastQuestCheck   time.Time
+	usingNpc         uint32
 	quests           []*activeQuest
 	finishedQuests   []db.FinishedQuest
 	regenSitting     bool
@@ -149,6 +150,7 @@ func (s *Session) leaveWorld() {
 	s.persistBuffs()
 	s.persistSkillDelays()
 	s.saveQuests()
+	s.useNpc(0)
 	if s.player != nil {
 		s.player.Unregister()
 		s.player = nil
@@ -456,7 +458,10 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 	case packet.QuestAbandon:
 		s.handleQuestAbandon(p)
 	case packet.NpcTalk:
-		// The original only records which NPC the player is using.
+		if len(p) >= 6 {
+			id, _ := packet.U32(p[2:])
+			s.useNpc(id)
+		}
 	case packet.PartyInvite, packet.PartyInviteName:
 		s.handlePartyInvite(op, p)
 	case packet.PartyAnswer:

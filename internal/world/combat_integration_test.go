@@ -13,7 +13,9 @@ import (
 // TestCombatNumbers simulates the migrated test characters against real
 // mobs with the original formulas and logs hit rates and damage.
 func TestCombatNumbers(t *testing.T) {
-	os.Chdir("../..")
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
 	config.LoadRuntimeEnv()
 	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
 		t.Fatal(err)
@@ -54,7 +56,9 @@ func TestCombatNumbers(t *testing.T) {
 }
 
 func TestNewCharacterCombat(t *testing.T) {
-	os.Chdir("../..")
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
 	config.LoadRuntimeEnv()
 	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
 		t.Fatal(err)
@@ -92,7 +96,9 @@ func TestNewCharacterCombat(t *testing.T) {
 }
 
 func TestEquipRules(t *testing.T) {
-	os.Chdir("../..")
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
 	config.LoadRuntimeEnv()
 	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
 		t.Fatal(err)

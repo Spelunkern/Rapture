@@ -15,7 +15,9 @@ import (
 // TestQuestKillProgress counts mob kills on quest 1 (5x mob 2008, handed in
 // at an NPC) without a client: counters advance and stop at the hand-in.
 func TestQuestKillProgress(t *testing.T) {
-	os.Chdir("../..")
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
 	config.LoadRuntimeEnv()
 	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
 		t.Fatal(err)
