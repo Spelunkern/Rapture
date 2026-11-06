@@ -230,8 +230,9 @@ func (s *Session) handleGemAdd(p []byte) {
 	}
 }
 
+// handleGemRemove: item bag, slot (the client sends 4- and 8-byte forms).
 func (s *Session) handleGemRemove(p []byte) {
-	if len(p) < 8 || s.char == nil {
+	if len(p) < 4 || s.char == nil {
 		return
 	}
 	ch := s.char

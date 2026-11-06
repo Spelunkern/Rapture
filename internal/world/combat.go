@@ -18,19 +18,17 @@ type weaponCombat struct {
 	ItemType, TypeID uint8
 	AttackTime       uint8
 	Range            float32
-	OriginalDelay    time.Duration
 	Delay            time.Duration
 }
 
-// weaponAttackDelay maps Items.AttackTime (1-10) to the native delay and
-// Rapture's accelerated test delay.
-func weaponAttackDelay(attackTime uint8) (time.Duration, time.Duration, bool) {
-	table := [11][2]int{{}, {4000, 1500}, {3000, 1500}, {2750, 1375}, {2500, 1250}, {2250, 1125},
-		{2000, 1000}, {1750, 875}, {1500, 750}, {1250, 625}, {1000, 500}}
+// weaponAttackDelay maps Items.AttackTime (1-10) to the original swing
+// delay.
+func weaponAttackDelay(attackTime uint8) (time.Duration, bool) {
+	table := [11]int{0, 4000, 3000, 2750, 2500, 2250, 2000, 1750, 1500, 1250, 1000}
 	if attackTime < 1 || attackTime > 10 {
-		return 0, 0, false
+		return 0, false
 	}
-	return time.Duration(table[attackTime][0]) * time.Millisecond, time.Duration(table[attackTime][1]) * time.Millisecond, true
+	return time.Duration(table[attackTime]) * time.Millisecond, true
 }
 
 func equippedWeaponCombat(items []db.Item) (weaponCombat, bool) {
@@ -43,7 +41,7 @@ func equippedWeaponCombat(items []db.Item) (weaponCombat, bool) {
 		return weaponCombat{}, false
 	}
 	at := min(d.AttackTime, 10)
-	orig, delay, ok := weaponAttackDelay(at)
+	delay, ok := weaponAttackDelay(at)
 	if !ok {
 		return weaponCombat{}, false
 	}
@@ -51,7 +49,7 @@ func equippedWeaponCombat(items []db.Item) (weaponCombat, bool) {
 	if r <= 0 {
 		r = 2
 	}
-	return weaponCombat{d.Type, d.TypeID, at, r, orig, delay}, true
+	return weaponCombat{d.Type, d.TypeID, at, r, delay}, true
 }
 
 func basicAutoAttackDamage(s CharacterStats) uint32 {
