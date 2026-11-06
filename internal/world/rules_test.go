@@ -49,3 +49,39 @@ func TestLevelUpAndReset(t *testing.T) {
 		t.Errorf("reset: int %d wis %d stat %d", ch.Int, ch.Wis, ch.StatPoint)
 	}
 }
+
+// TestBindPosition follows CMap::GetBindPos: the nearest group by its first
+// box's lower corner among the faction's (type 1 light, 2 fury, 0/3 both),
+// a random whole-unit point inside the box 0.9 above its floor, and group 0
+// when no group admits the faction.
+func TestBindPosition(t *testing.T) {
+	const id = 60001
+	RegisterMapGrid(id, 2048, nil)
+	AddEntities(id, MapEntities{SpawnAreas: []MapSpawnArea{
+		{Faction: 2, Boxes: []SpawnBox{{100, 10, 100, 110, 12, 104}}},
+		{Faction: 1, Boxes: []SpawnBox{{500, 20, 500, 520, 22, 530}}},
+		{Faction: 1, Boxes: []SpawnBox{{900, 30, 900, 905, 32, 905}}},
+		{Faction: 3, Boxes: []SpawnBox{{1500, 40, 1500, 1501, 42, 1501}}},
+	}})
+	for range 50 {
+		m, x, y, z := bindPosition(id, FactionLight, 880, 0, 880)
+		if m != id || x < 900 || x >= 905 || z < 900 || z >= 905 || y != 30.9 || x != float32(int(x)) {
+			t.Fatalf("light near 900: map %d (%v, %v, %v)", m, x, y, z)
+		}
+	}
+	if _, x, _, _ := bindPosition(id, FactionLight, 600, 0, 600); x < 500 || x >= 520 {
+		t.Fatalf("light near 600 picked x %v", x)
+	}
+	if _, x, _, _ := bindPosition(id, FactionDark, 1400, 0, 1400); x != 1500 {
+		t.Fatalf("fury near 1400 should take the shared group, x %v", x)
+	}
+	const furyOnly = 60002
+	RegisterMapGrid(furyOnly, 2048, nil)
+	AddEntities(furyOnly, MapEntities{SpawnAreas: []MapSpawnArea{
+		{Faction: 2, Boxes: []SpawnBox{{100, 10, 100, 110, 12, 104}}},
+		{Faction: 2, Boxes: []SpawnBox{{900, 10, 900, 910, 12, 904}}},
+	}})
+	if _, x, _, _ := bindPosition(furyOnly, FactionLight, 900, 0, 900); x < 100 || x >= 110 {
+		t.Fatalf("no admitted group should fall back to group 0, x %v", x)
+	}
+}

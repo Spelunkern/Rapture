@@ -203,20 +203,41 @@ func LoadGameConfig(log *logx.Logger) error {
 }
 
 // rebirthPosition is where a character of faction revives on mapID, per
-// Map.ini; ok is false where the map defines none (fields use the
-// faction's nearest svmap spawn area).
+// CMap::LoadConfig: RebirthMapPos for every faction when the zone sets it,
+// otherwise RebirthMapPos1 (light) / RebirthMapPos2 (fury); ok is false
+// where the map defines none (map -1).
 func rebirthPosition(mapID uint16, faction uint8) (MapPos, bool) {
 	z, found := mapConfig.Zones[mapID]
 	if !found {
 		return MapPos{}, false
 	}
 	switch {
+	case z.Rebirth != nil:
+		return *z.Rebirth, true
 	case faction == FactionLight && z.RebirthLight != nil:
 		return *z.RebirthLight, true
 	case faction == FactionDark && z.RebirthFury != nil:
 		return *z.RebirthFury, true
-	case z.Rebirth != nil:
-		return *z.Rebirth, true
 	}
 	return MapPos{}, false
+}
+
+// bindPosition is CMap::GetBindPos 0x004295a0: the Map.ini rebirth point
+// when its map exists and the point lies inside it (0.9 above), else a
+// random point of the nearest svmap rebirth group of this map, else the
+// current position (zeroed if outside the map).
+func bindPosition(mapID uint16, faction uint8, x, y, z float32) (uint16, float32, float32, float32) {
+	if p, ok := rebirthPosition(mapID, faction); ok {
+		if size, ok := mapSize(p.MapID); ok && p.X >= 0 && p.X < size && p.Z >= 0 && p.Z < size {
+			return p.MapID, p.X, p.Y + 0.9, p.Z
+		}
+	}
+	if area, ok := FindNearestSpawnArea(mapID, faction, x, z); ok {
+		x, y, z := area.RandomPoint()
+		return mapID, x, y, z
+	}
+	if size, ok := mapSize(mapID); ok && (x < 0 || x >= size || z < 0 || z >= size) {
+		x, z = 0, 0
+	}
+	return mapID, x, y, z
 }

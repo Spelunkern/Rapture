@@ -363,6 +363,8 @@ func readPortals(r *svmapReader) ([]MapPortal, error) {
 	return portals, nil
 }
 
+// readSpawnAreas reads the rebirth groups as CMap::LoadMap does: per group
+// count, type, an unused word, then count boxes (lower, upper).
 func readSpawnAreas(r *svmapReader) ([]MapSpawnArea, error) {
 	n, err := r.count("spawn area")
 	if err != nil {
@@ -370,7 +372,8 @@ func readSpawnAreas(r *svmapReader) ([]MapSpawnArea, error) {
 	}
 	var areas []MapSpawnArea
 	for range n {
-		if _, err := r.i32(); err != nil {
+		boxes, err := r.i32()
+		if err != nil {
 			return nil, err
 		}
 		faction, err := r.i32()
@@ -380,15 +383,22 @@ func readSpawnAreas(r *svmapReader) ([]MapSpawnArea, error) {
 		if _, err := r.i32(); err != nil {
 			return nil, err
 		}
-		lower, err := r.vec3()
-		if err != nil {
-			return nil, err
+		if boxes < 0 || int(boxes) > len(r.data)/24 {
+			return nil, fmt.Errorf("invalid spawn area box count %d", boxes)
 		}
-		upper, err := r.vec3()
-		if err != nil {
-			return nil, err
+		a := MapSpawnArea{Faction: faction}
+		for range boxes {
+			lower, err := r.vec3()
+			if err != nil {
+				return nil, err
+			}
+			upper, err := r.vec3()
+			if err != nil {
+				return nil, err
+			}
+			a.Boxes = append(a.Boxes, SpawnBox{lower.x, lower.y, lower.z, upper.x, upper.y, upper.z})
 		}
-		areas = append(areas, MapSpawnArea{faction, lower.x, lower.y, lower.z, upper.x, upper.y, upper.z})
+		areas = append(areas, a)
 	}
 	return areas, nil
 }

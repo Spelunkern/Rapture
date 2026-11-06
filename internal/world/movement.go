@@ -83,14 +83,7 @@ func (s *Session) resurrect() bool {
 	if ch == nil {
 		return false
 	}
-	// Map.ini RebirthMapPos(1/2) when the map defines one (dungeons and
-	// some fields), otherwise the faction's nearest svmap spawn area.
-	mapID, x, y, z := ch.MapID, ch.PosX, ch.PosY, ch.PosZ
-	if p, ok := rebirthPosition(ch.MapID, s.faction); ok {
-		mapID, x, y, z = p.MapID, p.X, p.Y, p.Z
-	} else if area, ok := FindNearestSpawnArea(ch.MapID, s.faction, ch.PosX, ch.PosZ); ok {
-		x, y, z = area.Center()
-	}
+	mapID, x, y, z := bindPosition(ch.MapID, s.faction, ch.PosX, ch.PosY, ch.PosZ)
 	lost := expDrop(ch, s.deathLoss)
 	ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
 	full := StatsFor(ch, s.equipment())
@@ -167,7 +160,7 @@ func (s *Session) executeTown() {
 		return
 	}
 	s.clearView(true)
-	ch.PosX, ch.PosY, ch.PosZ = area.Center()
+	ch.PosX, ch.PosY, ch.PosZ = area.RandomPoint()
 	if s.player != nil {
 		s.player.UpdateCharacter(*ch)
 		s.player.UpdateMotion(0, 0)

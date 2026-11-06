@@ -113,22 +113,27 @@ func (p *MapPortal) AllowsFaction(f uint8) bool {
 }
 func (p *MapPortal) AllowsLevel(level uint16) bool { return level >= p.MinLevel && level <= p.MaxLevel }
 
+// MapSpawnArea is one stMapBind of the svmap: a rebirth group of boxes.
+// Faction is its type: 1 light, 2 fury, 0 and 3 both.
 type MapSpawnArea struct {
-	Faction                int32
+	Faction int32
+	Boxes   []SpawnBox
+}
+
+type SpawnBox struct {
 	LowerX, LowerY, LowerZ float32
 	UpperX, UpperY, UpperZ float32
 }
 
-func (a *MapSpawnArea) Center() (float32, float32, float32) {
-	return (a.LowerX + a.UpperX) * 0.5, (a.LowerY + a.UpperY) * 0.5, (a.LowerZ + a.UpperZ) * 0.5
-}
+// distanceSq is measured, as CMap::GetBindPos does, to the lower corner of
+// the group's first box.
 func (a *MapSpawnArea) distanceSq(x, z float32) float32 {
-	cx, _, cz := a.Center()
-	return (cx-x)*(cx-x) + (cz-z)*(cz-z)
+	b := a.Boxes[0]
+	return (b.LowerX-x)*(b.LowerX-x) + (b.LowerZ-z)*(b.LowerZ-z)
 }
 func (a *MapSpawnArea) allowsFaction(f uint8) bool {
 	switch a.Faction {
-	case 0:
+	case 0, 3:
 		return true
 	case 1:
 		return f == 0
@@ -136,6 +141,19 @@ func (a *MapSpawnArea) allowsFaction(f uint8) bool {
 		return f == 1
 	}
 	return false
+}
+
+// RandomPoint is GetBindPos's pick: a random box of the group and a random
+// whole-unit offset inside it, 0.9 above its floor.
+func (a *MapSpawnArea) RandomPoint() (x, y, z float32) {
+	b := a.Boxes[rand.IntN(len(a.Boxes))]
+	offset := func(lo, hi float32) float32 {
+		if span := int(math.Round(float64(hi - lo))); span > 0 {
+			return float32(rand.IntN(span)) + lo
+		}
+		return lo
+	}
+	return offset(b.LowerX, b.UpperX), b.LowerY + 0.9, offset(b.LowerZ, b.UpperZ)
 }
 
 // MapEntities is one map's NPCs, mobs, portals and spawn areas.
@@ -219,6 +237,14 @@ func RegisterMapGrid(mapID uint16, size uint32, mask []byte) {
 	gridsMu.Lock()
 	grids[mapID] = mapGrid{size, mask}
 	gridsMu.Unlock()
+}
+
+// mapSize is the svmap's side length.
+func mapSize(mapID uint16) (float32, bool) {
+	gridsMu.RLock()
+	defer gridsMu.RUnlock()
+	g, ok := grids[mapID]
+	return float32(g.size), ok
 }
 
 func hasGrid(mapID uint16) bool {
@@ -975,24 +1001,24 @@ func AddEntities(mapID uint16, e MapEntities) {
 	s.entities.SpawnAreas = append(s.entities.SpawnAreas, e.SpawnAreas...)
 }
 
+// FindNearestSpawnArea is CMap::GetBindPos's group choice: the nearest
+// non-empty group open to the faction; when none is, the first group (the
+// original's index stays 0), and ok is false only if that group is empty.
 func FindNearestSpawnArea(mapID uint16, faction uint8, x, z float32) (MapSpawnArea, bool) {
-	var best MapSpawnArea
-	found := false
-	for _, a := range EntitiesOnMap(mapID).SpawnAreas {
-		if a.allowsFaction(faction) && (!found || a.distanceSq(x, z) < best.distanceSq(x, z)) {
-			best, found = a, true
+	areas := EntitiesOnMap(mapID).SpawnAreas
+	best, bestDist := 0, float32(9999)
+	for i, a := range areas {
+		if len(a.Boxes) == 0 || !a.allowsFaction(faction) {
+			continue
+		}
+		if d := float32(math.Sqrt(float64(a.distanceSq(x, z)))); d < bestDist {
+			best, bestDist = i, d
 		}
 	}
-	return best, found
-}
-
-func FindAnySpawnArea(mapID uint16, faction uint8) (MapSpawnArea, bool) {
-	for _, a := range EntitiesOnMap(mapID).SpawnAreas {
-		if a.allowsFaction(faction) {
-			return a, true
-		}
+	if len(areas) == 0 || len(areas[best].Boxes) == 0 {
+		return MapSpawnArea{}, false
 	}
-	return MapSpawnArea{}, false
+	return areas[best], true
 }
 
 func FindPortalByIndex(mapID uint16, index uint8) (MapPortal, bool) {
