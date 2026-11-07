@@ -76,6 +76,7 @@ type Session struct {
 	shoutReadyAt     time.Time      // 0x1107 cooldown (CUser +0x5848)
 	wornItems        map[int64]bool // item UIDs whose quality changed
 	armourWearNext   int            // QualityByDefense rotation (CUser +0x144c)
+	returnAt         time.Time      // 0x0556 pending move (CUser +0x581c, type 0)
 }
 
 var (
@@ -244,6 +245,7 @@ func (s *Session) tick(idle bool) {
 	}
 	s.processBuffs()
 	s.tickSkillOnce()
+	s.tickReturnToTown()
 	s.takeGuildFee()
 	s.tickRebirth(time.Now())
 	if s.char == nil {
@@ -576,9 +578,12 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.handleResurrect(p)
 	case packet.ItemRepair:
 		s.handleItemRepair(p)
+	case packet.ReturnToTown:
+		s.handleReturnToTown()
 	case packet.UseVehicle:
 		s.handleUseVehicle()
 	case packet.CharacterMobAutoAttack:
+		s.cancelMove()
 		if len(p) >= 6 && s.char != nil {
 			id, _ := packet.U32(p[2:])
 			s.autoAttack, s.autoAttackTarget = true, id

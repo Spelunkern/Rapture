@@ -2,6 +2,7 @@ package world
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Spelunkern/Rapture/internal/db"
 )
@@ -83,5 +84,29 @@ func TestBindPosition(t *testing.T) {
 	}})
 	if _, x, _, _ := bindPosition(furyOnly, FactionLight, 900, 0, 900); x < 100 || x >= 110 {
 		t.Fatalf("no admitted group should fall back to group 0, x %v", x)
+	}
+}
+
+// TestReturnToTown follows 0x0556: the bind-point move fires 10 s later
+// and a move in between cancels it.
+func TestReturnToTown(t *testing.T) {
+	s := &Session{char: &db.Character{ID: 1, MapID: 1}}
+	s.handleReturnToTown()
+	if s.returnAt.IsZero() || time.Until(s.returnAt) < 9*time.Second {
+		t.Fatalf("return not scheduled 10 s ahead: %v", s.returnAt)
+	}
+	first := s.returnAt
+	s.handleReturnToTown() // a second request does not restart it
+	if s.returnAt != first {
+		t.Fatal("pending return restarted")
+	}
+	s.cancelMove()
+	if !s.returnAt.IsZero() {
+		t.Fatal("cancel kept the return")
+	}
+	s.dead = true
+	s.handleReturnToTown()
+	if !s.returnAt.IsZero() {
+		t.Fatal("scheduled while dead")
 	}
 }

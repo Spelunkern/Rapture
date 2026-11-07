@@ -87,6 +87,9 @@ func (s *Session) handleCharacterMove(p []byte) {
 	y, _ := packet.F32(p[9:])
 	z, _ := packet.F32(p[13:])
 	ch := s.char
+	if x != ch.PosX || z != ch.PosZ {
+		s.cancelMove()
+	}
 	ch.PosX, ch.PosY, ch.PosZ = x, y, z
 	s.positionDirty = true
 	if s.player != nil {
@@ -164,4 +167,34 @@ func expDrop(ch *db.Character, percent int) uint32 {
 	loss = min(loss, room)
 	ch.Exp -= uint32(loss)
 	return uint32(loss)
+}
+
+// returnToTownDelay is 0x0556's tick + 10000 (CUser::PacketPC).
+const returnToTownDelay = 10 * time.Second
+
+// handleReturnToTown (0x0556): alive and with no move pending, the user
+// is moved to its bind point 10 s later (UpdateResetPosition, type 0).
+func (s *Session) handleReturnToTown() {
+	if s.char == nil || s.dead || !s.returnAt.IsZero() {
+		return
+	}
+	s.returnAt = time.Now().Add(returnToTownDelay)
+}
+
+// cancelMove is CUser::CancleMove for the type-0 move: moving, attacking,
+// casting or being hit drops it without a reply.
+func (s *Session) cancelMove() { s.returnAt = time.Time{} }
+
+func (s *Session) tickReturnToTown() {
+	if s.returnAt.IsZero() || time.Now().Before(s.returnAt) || s.char == nil {
+		return
+	}
+	s.returnAt = time.Time{}
+	if s.dead {
+		return
+	}
+	ch := s.char
+	if m, x, y, z, ok := bindPositionFound(ch.MapID, s.faction, ch.PosX, ch.PosY, ch.PosZ); ok {
+		s.applyTeleport(m, x, y, z, "return to town")
+	}
 }

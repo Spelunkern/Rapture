@@ -330,6 +330,7 @@ func (s *Session) takeMobDamage(d pendingDamage, damage uint32, stats *Character
 		return false
 	}
 	s.wearArmour()
+	s.cancelMove() // CMob::Attack -> StatusCastingStop -> CancleMove
 	newEffective := satSub(cur.CurrentHP, damage)
 	ch.CurrentHP = satSub(ch.CurrentHP, cur.CurrentHP-newEffective)
 	killed := newEffective == 0

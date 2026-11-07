@@ -135,6 +135,7 @@ const (
 	SkillUseNoTarget          Opcode = 0x0511
 	ResurrectRequest          Opcode = 0x0553 // 1-byte body
 	ItemRepair                Opcode = 0x0554 // bag, slot -> bag, slot, money
+	ReturnToTown              Opcode = 0x0556 // no body; bind point after 10 s
 
 	// Guilds (CUser::PacketGuild and the CGuild senders).
 	GuildCreateFailed     Opcode = 0x0D01

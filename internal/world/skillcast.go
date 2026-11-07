@@ -148,6 +148,7 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 	if len(p) < 7 || s.char == nil {
 		return
 	}
+	s.cancelMove()
 	ch := s.char
 	number := p[2]
 	target, _ := packet.U32(p[3:])
