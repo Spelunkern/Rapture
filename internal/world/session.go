@@ -710,6 +710,11 @@ func (s *Session) selectCharacter(id uint32) {
 		return
 	}
 	normalize(&ch)
+	// Instanced maps are not kept across sessions: a character saved in
+	// one starts at that map's bind point.
+	if mapCreateType(ch.MapID) != "" {
+		ch.MapID, ch.PosX, ch.PosY, ch.PosZ = bindPosition(ch.MapID, s.faction, ch.PosX, ch.PosY, ch.PosZ)
+	}
 	s.char = &ch
 	s.log.SetTag(strings.SplitN(s.log.Tag(), "/", 3)[0] + "/" + s.account.UserID + "/" + ch.Name)
 	s.items, err = db.CharacterItems(id)

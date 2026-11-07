@@ -312,6 +312,10 @@ func RenameCharacter(userUID, charID uint32, oldName, newName string) (bool, err
 	return err == nil, err
 }
 
+// MapForSave maps a world zone to the map stored in Chars.Map (the world
+// replaces it so instanced zones save their real map).
+var MapForSave = func(zone uint16) uint16 { return zone }
+
 // SaveCharacter persists level, points, stats, HP/MP/SP, position, exp,
 // money and kill counters with usp_Save_Char_Info_E.
 func SaveCharacter(ch *Character) error {
@@ -322,7 +326,7 @@ func SaveCharacter(ch *Character) error {
 		sql.Named("Str", int16(ch.Str)), sql.Named("Dex", int16(ch.Dex)), sql.Named("Rec", int16(ch.Rec)),
 		sql.Named("Int", int16(ch.Int)), sql.Named("Wis", int16(ch.Wis)), sql.Named("Luc", int16(ch.Luc)),
 		sql.Named("Hp", clamp16(ch.CurrentHP)), sql.Named("Mp", clamp16(ch.CurrentMP)), sql.Named("Sp", clamp16(ch.CurrentSP)),
-		sql.Named("Map", int16(ch.MapID)), sql.Named("Dir", ch.Dir), sql.Named("Exp", int32(ch.Exp)),
+		sql.Named("Map", int16(MapForSave(ch.MapID))), sql.Named("Dir", ch.Dir), sql.Named("Exp", int32(ch.Exp)),
 		sql.Named("Money", int32(ch.Money)), sql.Named("Posx", ch.PosX), sql.Named("Posy", ch.PosY),
 		sql.Named("Posz", ch.PosZ), sql.Named("Hg", int32(ch.Hg)), sql.Named("Vg", int32(ch.Vg)),
 		sql.Named("Cg", int32(ch.Cg)), sql.Named("Og", int32(ch.Og)), sql.Named("Ig", int32(ch.Ig)),

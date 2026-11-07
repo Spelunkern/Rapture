@@ -211,6 +211,9 @@ func rollMobDrops(mapID uint16, mob *MapMob, ownerID uint32, party []*ConnectedP
 			log.Printf("Rapture World sequence drop mob_id=%d item=%d/%d", mob.MobID, def.Type, def.TypeID)
 		}
 	}
+	if grbKill(mapID, mob, ownerID) {
+		return packets
+	}
 	if rand.IntN(100) < 30 {
 		amount := mob.MoneyMin
 		if mob.MoneyMax > 0 {

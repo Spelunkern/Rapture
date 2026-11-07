@@ -61,6 +61,16 @@ func (s *Session) syncPlayer() {
 // introduces it to viewers at the destination and refreshes visibility.
 func (s *Session) applyTeleport(mapID uint16, x, y, z float32, label string) {
 	ch := s.char
+	// CWorld::GetZoneByMapID: a guild ranking map resolves to the guild's
+	// instance while the battle is open; without one the move fails.
+	if !isInstanceZone(mapID) && mapCreateType(mapID) == grbCreateType {
+		zone, ok := s.enterGuildRanking(mapID)
+		if !ok {
+			s.log.Printf("Rapture World guild ranking map %d refused (closed or no guild)", mapID)
+			return
+		}
+		mapID = zone
+	}
 	// LeaveUser / EnterUser: the old view goes (on the same map the client
 	// keeps its entities, so they get leave packets), then the new one.
 	s.clearView(mapID == ch.MapID)

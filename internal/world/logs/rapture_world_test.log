@@ -10,3 +10,5 @@
 [unit] Rapture World failed to save character_id=0: RAPTURE_DB_USER/RAPTURE_DB_PASSWORD not set; run tools/sqlserver.py setup
 [unit] Rapture World failed to save repaired item: RAPTURE_DB_USER/RAPTURE_DB_PASSWORD not set; run tools/sqlserver.py setup
 [unit] Rapture World failed to save character_id=0: RAPTURE_DB_USER/RAPTURE_DB_PASSWORD not set; run tools/sqlserver.py setup
+[unit] Rapture World failed to save repaired item: RAPTURE_DB_USER/RAPTURE_DB_PASSWORD not set; run tools/sqlserver.py setup
+[unit] Rapture World failed to save character_id=0: RAPTURE_DB_USER/RAPTURE_DB_PASSWORD not set; run tools/sqlserver.py setup

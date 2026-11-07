@@ -94,6 +94,8 @@ type ZoneConfig struct {
 	Rebirth, RebirthLight, RebirthFury *MapPos
 	WarType                            string
 	CreateType                         string // instanced maps (R, H, P)
+	// CreateTime (day of week, start hour, hours) entries; CMap reads two.
+	Schedule []grbSlot
 }
 
 // MapConfig is the parsed Map.ini.
@@ -141,6 +143,11 @@ func loadMapIni(log *logx.Logger) error {
 		}
 		z := ZoneConfig{Dungeon: strings.EqualFold(get(sec, "MAPTYPE"), "D"), WarType: get(sec, "WARTYPE"),
 			CreateType: get(sec, "CREATETYPE")}
+		if n := numbers(get(sec, "CREATETIME")); len(n) >= 3 {
+			for i := 0; i+2 < len(n) && len(z.Schedule) < 2; i += 3 {
+				z.Schedule = append(z.Schedule, grbSlot{Day: int(n[i]), Hour: int(n[i+1]), Hours: int(n[i+2])})
+			}
+		}
 		for key, dst := range map[string]**MapPos{"REBIRTHMAPPOS": &z.Rebirth, "REBIRTHMAPPOS1": &z.RebirthLight, "REBIRTHMAPPOS2": &z.RebirthFury} {
 			if p, ok := parseMapPos(get(sec, key)); ok {
 				*dst = &p
@@ -207,7 +214,7 @@ func LoadGameConfig(log *logx.Logger) error {
 // otherwise RebirthMapPos1 (light) / RebirthMapPos2 (fury); ok is false
 // where the map defines none (map -1).
 func rebirthPosition(mapID uint16, faction uint8) (MapPos, bool) {
-	z, found := mapConfig.Zones[mapID]
+	z, found := mapConfig.Zones[realMap(mapID)]
 	if !found {
 		return MapPos{}, false
 	}

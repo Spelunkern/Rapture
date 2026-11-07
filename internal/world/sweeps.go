@@ -25,6 +25,7 @@ func StartSweeps(log *logx.Logger) {
 	})
 	every(250*time.Millisecond, func() { dispatchMoves(TickNpcPatrol(viewersByMap(), 64)) })
 	every(time.Second, func() { runDotSweep(log) })
+	every(5*time.Second, func() { TickGuildRanking(time.Now(), log) })
 	every(500*time.Millisecond, func() {
 		players := AllPlayers()
 		if len(players) == 0 {

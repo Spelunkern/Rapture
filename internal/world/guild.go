@@ -59,9 +59,16 @@ type guild struct {
 	Points     uint32
 	Rank       uint8
 	Etin       uint32
-	members    map[uint32]*guildMember
-	applicants map[uint32]*guildMember
-	bank       [guildBankSlots]*db.Item
+	BuyHouse   uint8
+	UseHouse   uint8
+	EtinReturn uint32
+	KeepEtin   uint32
+	// Guild ranking battle, reset by each ranking (CGuild +0x98, +0x9c,
+	// +0xa0).
+	grbPoints, duelBonus, grbEntries uint32
+	members                          map[uint32]*guildMember
+	applicants                       map[uint32]*guildMember
+	bank                             [guildBankSlots]*db.Item
 }
 
 // guildCreate is CGuildCreate: a creation (disband false) or disband vote.
@@ -112,7 +119,8 @@ func LoadGuilds(log *logx.Logger) error {
 	guildsByID, guildOfChar = map[uint32]*guild{}, map[uint32]*guild{}
 	for _, r := range rows {
 		guildsByID[r.ID] = &guild{ID: r.ID, Name: r.Name, Master: r.MasterName, Remark: r.Remark, Country: r.Country,
-			Points: r.Points, Rank: r.Rank, Etin: r.Etin, members: map[uint32]*guildMember{}, applicants: map[uint32]*guildMember{}}
+			Points: r.Points, Rank: r.Rank, Etin: r.Etin, BuyHouse: r.BuyHouse, UseHouse: r.UseHouse,
+			EtinReturn: r.EtinReturn, KeepEtin: r.KeepEtin, members: map[uint32]*guildMember{}, applicants: map[uint32]*guildMember{}}
 		next = max(next, r.ID+1)
 	}
 	for _, m := range members {

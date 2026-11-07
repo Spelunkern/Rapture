@@ -468,7 +468,7 @@ func buildCharacterMapPosition(ch *db.Character) []byte {
 	x, y, z := charPos(ch)
 	w := packet.New(packet.CharacterMapTeleport)
 	w.U32(charID(ch))
-	w.U16(mapID)
+	w.U16(realMap(mapID))
 	w.F32(x)
 	w.F32(y)
 	w.F32(z)

@@ -110,3 +110,37 @@ func TestReturnToTown(t *testing.T) {
 		t.Fatal("scheduled while dead")
 	}
 }
+
+// TestGuildRankingSchedule follows IsGuildRankMapOpenTime and
+// GetGuildRankNotices for map 50's CreateTime (0, 21, 1): Sunday 21-22.
+func TestGuildRankingSchedule(t *testing.T) {
+	slots := []grbSlot{{Day: 0, Hour: 21, Hours: 1}}
+	at := func(day, hour, minute int) time.Time {
+		// 2026-11-08 is a Sunday.
+		return time.Date(2026, 11, 8+day, hour, minute, 0, 0, time.Local)
+	}
+	for _, c := range []struct {
+		day, hour, minute int
+		open              bool
+	}{{0, 21, 0, true}, {0, 21, 59, true}, {0, 22, 0, false}, {0, 20, 59, false}, {6, 21, 30, false}} {
+		if got := grbOpen(slots, at(c.day, c.hour, c.minute)); got != c.open {
+			t.Errorf("day %d %02d:%02d open %v, want %v", c.day, c.hour, c.minute, got, c.open)
+		}
+	}
+	for _, c := range []struct {
+		hour, minute int
+		want         uint8
+		ok           bool
+	}{{20, 30, 21, true}, {20, 50, 21, true}, {21, 0, grbNoticeOpen, true}, {21, 50, grbNoticeEnd10, true},
+		{21, 59, grbNoticeEnd1, true}, {21, 30, 0, false}, {20, 40, 0, false}} {
+		got, ok := grbNotice(slots, at(0, c.hour, c.minute))
+		if ok != c.ok || got != c.want {
+			t.Errorf("%02d:%02d notice %d/%v, want %d/%v", c.hour, c.minute, got, ok, c.want, c.ok)
+		}
+	}
+	// A slot past midnight wraps into the next day.
+	late := []grbSlot{{Day: 6, Hour: 23, Hours: 2}}
+	if !grbOpen(late, at(0, 0, 30)) || grbOpen(late, at(0, 1, 0)) {
+		t.Error("wrapped slot open window wrong")
+	}
+}

@@ -158,6 +158,9 @@ const (
 	GuildApplicant        Opcode = 0x0D17
 	GuildApplicantRemoved Opcode = 0x0D18
 	GuildRemark           Opcode = 0x0D20
+	GuildRankingNotice    Opcode = 0x0D26 // map u16, type u8
+	GuildRankingPoints    Opcode = 0x0D27 // points, country max, its guild id
+	GuildRankingList      Opcode = 0x0D37 // count, (guild id, points, rank)
 	GuildBankResult       Opcode = 0x0D28
 	GuildBankList         Opcode = 0x0D29
 	GuildBankPlaced       Opcode = 0x0D31

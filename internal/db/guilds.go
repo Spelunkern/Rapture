@@ -63,6 +63,10 @@ type GuildRow struct {
 	Rank       uint8
 	Etin       uint32
 	Remark     string
+	BuyHouse   uint8
+	UseHouse   uint8
+	EtinReturn uint32
+	KeepEtin   uint32
 }
 
 // GuildCharRow is one usp_Read_GuildChar_R row.
@@ -84,7 +88,8 @@ func LoadGuilds() ([]GuildRow, []GuildCharRow, error) {
 	c, cancel := ctx()
 	defer cancel()
 	rows, err := pool.QueryContext(c, `SELECT G.GuildID, G.GuildName, G.MasterName, G.Country, G.GuildPoint,
-		ISNULL(H.Rank,31), ISNULL(H.Etin,0), ISNULL(H.Remark,'')
+		ISNULL(H.Rank,31), ISNULL(H.Etin,0), ISNULL(H.Remark,''), ISNULL(H.BuyHouse,0), ISNULL(H.UseHouse,0),
+		ISNULL(H.EtinReturnCnt,0), ISNULL(H.KeepEtin,0)
 		FROM dbo.Guilds G LEFT OUTER JOIN dbo.GuildDetails H ON G.GuildID = H.GuildID WHERE G.Del = 0`)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read guilds: %w", err)
@@ -92,12 +97,14 @@ func LoadGuilds() ([]GuildRow, []GuildCharRow, error) {
 	var guilds []GuildRow
 	for rows.Next() {
 		var g GuildRow
-		var id, points, etin int64
-		if err := rows.Scan(&id, &g.Name, &g.MasterName, &g.Country, &points, &g.Rank, &etin, &g.Remark); err != nil {
+		var id, points, etin, ret, keep int64
+		if err := rows.Scan(&id, &g.Name, &g.MasterName, &g.Country, &points, &g.Rank, &etin, &g.Remark, &g.BuyHouse,
+			&g.UseHouse, &ret, &keep); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}
 		g.ID, g.Points, g.Etin = uint32(id), uint32(max(points, 0)), uint32(max(etin, 0))
+		g.EtinReturn, g.KeepEtin = uint32(max(ret, 0)), uint32(max(keep, 0))
 		g.Name, g.MasterName, g.Remark = strings.TrimSpace(g.Name), strings.TrimSpace(g.MasterName), strings.TrimSpace(g.Remark)
 		guilds = append(guilds, g)
 	}
@@ -220,4 +227,16 @@ func SaveGuildRemark(guildID uint32, remark string) error {
 // 72 hours after the character's last guild join.
 func GuildJoinRemainHours(charID uint32) (int, error) {
 	return execStatus("dbo.usp_Read_Char_GuildJoinDate_R", sql.Named("CharID", int32(charID)))
+}
+
+// SaveGuildRanking is usp_Save_GuildInfo_E2 (the DB agent's 0x0B16 batch):
+// guild points, rank and the house fields, then the CreatedGuilds copy.
+func SaveGuildRanking(g GuildRow) error {
+	if _, err := execStatus("dbo.usp_Save_GuildInfo_E2", sql.Named("GuildID", int32(g.ID)), sql.Named("GuildPoint", int32(g.Points)),
+		sql.Named("Etin", int32(g.Etin)), sql.Named("Remark", g.Remark), sql.Named("BuyHouse", g.BuyHouse),
+		sql.Named("EtinReturnCnt", int32(g.EtinReturn)), sql.Named("KeepEtin", int32(g.KeepEtin)),
+		sql.Named("Rank", g.Rank), sql.Named("UseHouse", g.UseHouse)); err != nil {
+		return err
+	}
+	return mirrorGuild(g.ID)
 }

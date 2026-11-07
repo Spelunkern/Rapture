@@ -127,3 +127,10 @@ func buildMapRemoveItem(id uint32) []byte {
 	w.U32(id)
 	return w.MustFinish()
 }
+
+// clearMapItems drops every item of a zone (instance teardown).
+func clearMapItems(zone uint16) {
+	mapItemsMu.Lock()
+	delete(mapItems, zone)
+	mapItemsMu.Unlock()
+}
