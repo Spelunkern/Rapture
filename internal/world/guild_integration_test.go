@@ -116,7 +116,7 @@ func TestGuildLifecycle(t *testing.T) {
 	// the master deposits, moves and withdraws (5% of Sell x count).
 	var item *db.ItemDef
 	for _, d := range db.MustDefs().Items {
-		if d.Sell >= 100 && realType(d.Type) != 27 && d.ReqOg == 0 && d.Count == 1 {
+		if d.Sell >= 100 && d.Sell <= 20000 && realType(d.Type) != 27 && d.ReqOg == 0 && d.Count == 1 {
 			item = d
 			break
 		}

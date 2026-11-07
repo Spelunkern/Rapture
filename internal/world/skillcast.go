@@ -151,6 +151,11 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 	s.cancelMove()
 	ch := s.char
 	number := p[2]
+	if op == packet.SkillUseNoTarget && number == 0xff {
+		id, _ := packet.U32(p[3:])
+		s.cancelBuff(id)
+		return
+	}
 	target, _ := packet.U32(p[3:])
 	if s.mounted || s.cast != nil || s.actionBlocked() {
 		s.log.Printf("Rapture World rejected skill use (mounted, casting, stunned or asleep) character_id=%d", ch.ID)
@@ -176,7 +181,16 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 	}
 	castTarget := target
 	if def.TypeEffect == typeEffectHeal || def.TypeEffect == typeEffectBuff {
+		targets, _, ok := s.friendlyTargets(def, target)
+		if !ok {
+			s.send(buildSkillUseResult(packet.SkillUseNoTarget, skillResultNotTarget, ch.ID, 0, k.SkillID, k.Level, 0, 0, 0),
+				"0x0511 skill target refused")
+			return
+		}
 		castTarget = ch.ID
+		if def.TargetType == targetTypeOther || def.TargetType == targetTypeOtherAlt {
+			castTarget = targets[0].CharacterID
+		}
 	}
 	var pos *[2]float32
 	if def.TypeEffect == typeEffectOnce {
@@ -239,49 +253,14 @@ func (s *Session) resolveSkill(target uint32, number uint8, op packet.Opcode, ca
 		return
 	}
 	switch def.TypeEffect {
-	case typeEffectBuff:
-		s.startBuff(k, def, op)
-	case typeEffectHeal:
-		s.healSkill(k, def, op, stats)
+	case typeEffectBuff, typeEffectHeal:
+		s.friendlySkill(k, def, target, stats)
 	case typeEffectAttack, typeEffectDebuff:
 		s.skillAttack(k, def, target, castPos, stats)
 	case typeEffectOnce:
 		s.skillOnce(k, def, target, stats)
 	default:
 		s.log.Printf("Rapture World rejected skill use: effect %d not usable skill_id=%d", def.TypeEffect, k.SkillID)
-	}
-}
-
-func (s *Session) healSkill(k db.CharacterSkill, def *db.SkillDef, op packet.Opcode, stats CharacterStats) {
-	ch := s.char
-	s.startCooldown(k, def)
-	// CUser::HealUser: a non-zero HealHP adds twice the caster's WIS.
-	heal := uint32(max(def.HealHP, 0))
-	if heal != 0 {
-		heal = satAdd(heal, satMul(stats.Wis, 2))
-	}
-	hp, mp, sp := s.healDelta(heal, uint32(max(def.HealMP, 0)), uint32(max(def.HealSP, 0)))
-	costSP, costMP := s.skillCosts(def, &stats)
-	s.spendDelta(costMP, costSP)
-	s.persist()
-	s.send(buildSkillUsedSpMp(costSP, costMP), "0x050C skill used sp/mp")
-	s.log.Printf("Rapture World skill heal skill_id=%d hp=%d mp=%d sp=%d", k.SkillID, hp, sp, mp)
-	s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill heal")
-	st := s.stats()
-	s.send(buildCurrentHitpoints(&st), "0x0521 current hp/mp/sp after heal")
-}
-
-func (s *Session) startBuff(k db.CharacterSkill, def *db.SkillDef, op packet.Opcode) {
-	ch := s.char
-	stats := s.stats()
-	s.startCooldown(k, def)
-	sp, mp := s.skillCosts(def, &stats)
-	s.spendDelta(mp, sp)
-	s.persist()
-	s.send(buildSkillUsedSpMp(sp, mp), "0x050C skill used sp/mp")
-	s.send(buildSkillUseResult(op, skillResultNormal, ch.ID, ch.ID, k.SkillID, k.Level, 0, 0, 0), "skill buff cast")
-	if _, ok := s.addEffect(def, 0); ok {
-		s.log.Printf("Rapture World skill buff started skill_id=%d level=%d keep_time=%d", k.SkillID, k.Level, def.KeepSeconds)
 	}
 }
 

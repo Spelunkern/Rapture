@@ -66,6 +66,7 @@ type ConnectedPlayer struct {
 	tradeRefresh *tradeRefresh
 	damage       []pendingDamage
 	lifeSkill    *pendingLifeSkill
+	friendly     []pendingFriendly
 
 	guild    playerGuildState // guarded by guildMu
 	soulKill bool

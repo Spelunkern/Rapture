@@ -132,7 +132,8 @@ const (
 	ChatMap                   Opcode = 0x1111
 	WarehouseItemList         Opcode = 0x0711
 	ShopSell                  Opcode = 0x0703
-	SkillUseNoTarget          Opcode = 0x0511
+	SkillUseNoTarget          Opcode = 0x0511 // a skill on a user (CUser::ChkTargetUser)
+	SkillPartyMember          Opcode = 0x0513 // a party heal/buff reaching one member
 	ResurrectRequest          Opcode = 0x0553 // 1-byte body
 	ItemRepair                Opcode = 0x0554 // bag, slot -> bag, slot, money
 	ReturnToTown              Opcode = 0x0556 // no body; bind point after 10 s

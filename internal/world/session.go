@@ -245,6 +245,7 @@ func (s *Session) tick(idle bool) {
 	}
 	s.processBuffs()
 	s.tickSkillOnce()
+	s.tickFriendly()
 	s.tickReturnToTown()
 	s.takeGuildFee()
 	s.tickRebirth(time.Now())

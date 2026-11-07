@@ -737,3 +737,100 @@ func TestSkillOnce(t *testing.T) {
 		t.Fatalf("return skill teleport %+v", tp)
 	}
 }
+
+// TestFriendlySkills follows ChkTargetUser / HealUser / SkillBuffParty: a
+// TargetType 3 heal reaches a friendly user (not one of the other
+// country), a TargetType 4 buff the party members within ApplyRange, and
+// 0x0511 0xFF cancels an own buff.
+func TestFriendlySkills(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ReloadDefsForTest(); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := logx.New("rapture_world_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mapID = 60050
+	session := func(id uint32, faction uint8, x float32) *Session {
+		a, b := net.Pipe()
+		go io.Copy(io.Discard, b)
+		ch := &db.Character{ID: id, Level: 40, Mode: growNormal, Str: 50, Dex: 50, Rec: 50, Int: 50, Wis: 80, Luc: 50,
+			MapID: mapID, PosX: x, PosY: 11, PosZ: 500}
+		ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
+		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
+		s := &Session{char: ch, log: logger.Tagged("unit"), logger: logger, faction: faction,
+			skillCooldowns: map[uint16]time.Time{}, out: &connWriter{conn: a}}
+		s.player = RegisterPlayer(*ch, nil, false, faction, s.out, logger)
+		t.Cleanup(s.player.Unregister)
+		return s
+	}
+	caster := session(900101, FactionLight, 500)
+	ally := session(900102, FactionLight, 510)
+	enemy := session(900103, FactionDark, 505)
+	skill := func(id uint16) (db.CharacterSkill, *db.SkillDef) {
+		def := db.MustDefs().Skill(id, 1)
+		if def == nil {
+			t.Skipf("skill %d missing", id)
+		}
+		return db.CharacterSkill{SkillID: id, Level: 1, Number: 1}, def
+	}
+
+	heal, healDef := skill(102)
+	ally.char.CurrentHP = 10
+	ally.player.UpdateCharacter(*ally.char)
+	caster.friendlySkill(heal, healDef, ally.char.ID, caster.stats())
+	ally.tickFriendly()
+	want := min(10+uint32(healDef.HealHP)+2*caster.stats().Wis, ally.stats().MaxHP)
+	if got := ally.stats().CurrentHP; got != want {
+		t.Fatalf("ally hp %d after heal, want %d", got, want)
+	}
+	caster.skillCooldowns = map[uint16]time.Time{}
+	caster.friendlySkill(heal, healDef, enemy.char.ID, caster.stats())
+	if len(enemy.player.TakeFriendly()) != 0 {
+		t.Fatal("healed a user of the other country")
+	}
+
+	buff, buffDef := skill(111)
+	pt := &party{id: 990900, itemDivision: 1, members: []*ConnectedPlayer{caster.player, ally.player}}
+	partyMu.Lock()
+	caster.player.party, ally.player.party = pt, pt
+	partyMu.Unlock()
+	defer func() {
+		partyMu.Lock()
+		caster.player.party, ally.player.party = nil, nil
+		partyMu.Unlock()
+	}()
+	caster.friendlySkill(buff, buffDef, 0, caster.stats())
+	ally.tickFriendly()
+	has := func(s *Session, id uint16) bool {
+		for _, b := range s.buffs {
+			if b.SkillID == id {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(caster, 111) || !has(ally, 111) {
+		t.Fatalf("party buff caster %v ally %v", has(caster, 111), has(ally, 111))
+	}
+	ally.buffs = nil
+	ally.char.PosX = 500 + float32(buffDef.ApplyRange) + 20
+	ally.player.UpdateCharacter(*ally.char)
+	caster.skillCooldowns = map[uint16]time.Time{}
+	caster.friendlySkill(buff, buffDef, 0, caster.stats())
+	ally.tickFriendly()
+	if has(ally, 111) {
+		t.Fatal("party buff reached a member beyond ApplyRange")
+	}
+	caster.cancelBuff(111)
+	if has(caster, 111) {
+		t.Fatal("buff not cancelled")
+	}
+}

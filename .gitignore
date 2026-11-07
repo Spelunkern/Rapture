@@ -34,3 +34,4 @@ tools/refs/
 # Claude Code local session/agent state -- machine-specific, not project
 # source.
 .claude/
+internal/world/logs/
