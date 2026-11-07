@@ -130,6 +130,7 @@ func (s *Session) autoAttackSwing(target uint32) bool {
 			buildCharacterMobAttack(ch.ID, mob.ID, attackResultMiss, 0), "0x0503 character mob auto attack (miss)")
 		return true
 	}
+	s.wearWeapon()
 	closeRanged := DistanceXZ(ch.PosX, ch.PosZ, mob.PosX, mob.PosZ) <= closeRangeDistance
 	damage, crit := playerDamage(&stats, &mc, kind, stats.AttackAttr, closeRanged)
 	result, ok := DamageMob(ch.MapID, target, uint32(damage))
@@ -328,6 +329,7 @@ func (s *Session) takeMobDamage(d pendingDamage, damage uint32, stats *Character
 	if cur.CurrentHP == 0 || damage == 0 {
 		return false
 	}
+	s.wearArmour()
 	newEffective := satSub(cur.CurrentHP, damage)
 	ch.CurrentHP = satSub(ch.CurrentHP, cur.CurrentHP-newEffective)
 	killed := newEffective == 0

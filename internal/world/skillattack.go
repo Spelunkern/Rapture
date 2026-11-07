@@ -191,6 +191,7 @@ func (s *Session) skillHit(target uint32, def *db.SkillDef, k db.CharacterSkill,
 		sendNear(ch.MapID, mob.PosX, mob.PosZ, CombatRadius, frame, "skill use (miss)")
 		return true
 	}
+	s.wearWeapon()
 	t := skillTarget{MaxHP: mob.MaxHP, HP: mob.CurrentHP, MaxMP: md.MaxMP, MaxSP: md.MaxSP, MP: md.MaxMP, SP: md.MaxSP}
 	caster := [3]uint32{stats.CurrentHP, stats.CurrentSP, stats.CurrentMP}
 	close := DistanceXZ(ch.PosX, ch.PosZ, mob.PosX, mob.PosZ) <= closeRangeDistance

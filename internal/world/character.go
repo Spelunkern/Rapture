@@ -165,13 +165,18 @@ func pos16(v int16) uint32 { return uint32(max(v, 0)) }
 
 func isAccessoryType(t uint8) bool { return t == 22 || t == 23 || t == 40 }
 
-func (e *EquipmentStats) addItemDef(itemType uint8, d *db.ItemDef) {
+// addItemDef adds an item's effects at its quality level
+// (ItemEquipmentAttackAddQ: accessories and gems always use level 0).
+func (e *EquipmentStats) addItemDef(itemType uint8, d *db.ItemDef, level uint8) {
 	weapon := IsWeaponItemType(itemType)
+	if isAccessoryType(itemType) || itemType == gemItemType {
+		level = 0
+	}
 	if weapon || isAccessoryType(itemType) || itemType == gemItemType {
-		e.ItemAttack, e.Variance = satAdd(e.ItemAttack, pos16(d.Effect1)), satAdd(e.Variance, pos16(d.Effect2))
+		e.ItemAttack, e.Variance = satAdd(e.ItemAttack, effectAtLevel(d.Effect1, level)), satAdd(e.Variance, effectAtLevel(d.Effect2, level))
 	}
 	if !weapon {
-		e.Defense, e.Resistance = satAdd(e.Defense, pos16(d.Effect3)), satAdd(e.Resistance, pos16(d.Effect4))
+		e.Defense, e.Resistance = satAdd(e.Defense, effectAtLevel(d.Effect3, level)), satAdd(e.Resistance, effectAtLevel(d.Effect4, level))
 	}
 	e.MaxHP, e.MaxSP, e.MaxMP = satAdd(e.MaxHP, pos16(d.ConstHP)), satAdd(e.MaxSP, pos16(d.ConstSP)), satAdd(e.MaxMP, pos16(d.ConstMP))
 	e.Str, e.Dex, e.Rec = satAdd(e.Str, pos16(d.ConstStr)), satAdd(e.Dex, pos16(d.ConstDex)), satAdd(e.Rec, pos16(d.ConstRec))
@@ -205,14 +210,14 @@ func GetEquipmentStats(items []db.Item) EquipmentStats {
 		}
 		d := defs.Item(it.Type, it.TypeID)
 		if d != nil {
-			e.addItemDef(it.Type, d)
+			e.addItemDef(it.Type, d, itemQualityLevel(it, d))
 		}
 		for _, gem := range it.Gems {
 			if gem == 0 {
 				continue
 			}
 			if g := defs.Item(gemItemType, gem); g != nil {
-				e.addItemDef(gemItemType, g)
+				e.addItemDef(gemItemType, g, 0)
 				// CUser::GemEquipmentAdd: gems also add reach and speed.
 				e.Range += int32(g.Range)
 				e.AttackSpeed += int32(g.AttackTime)

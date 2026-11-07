@@ -134,6 +134,7 @@ const (
 	ShopSell                  Opcode = 0x0703
 	SkillUseNoTarget          Opcode = 0x0511
 	ResurrectRequest          Opcode = 0x0553 // 1-byte body
+	ItemRepair                Opcode = 0x0554 // bag, slot -> bag, slot, money
 
 	// Guilds (CUser::PacketGuild and the CGuild senders).
 	GuildCreateFailed     Opcode = 0x0D01

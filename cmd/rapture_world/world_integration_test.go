@@ -243,3 +243,29 @@ func TestWorldSessionAgainstSQLServer(t *testing.T) {
 	}
 	t.Logf("saved position map=%d (%.1f, %.1f, %.1f); opcodes seen: %v", ch.MapID, ch.PosX, ch.PosY, ch.PosZ, seen)
 }
+
+// keepItemQuality restores the character's equipped item qualities when
+// the test ends: combat wears them (CUser::QualityDec) and saves the change.
+func keepItemQuality(t *testing.T, charID uint32) {
+	pool, err := db.Pool(db.GameData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(`SELECT ItemUID, Quality FROM dbo.CharItems WHERE CharID = @p1 AND Bag = 0`, int32(charID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := map[int64]int64{}
+	for rows.Next() {
+		var uid, q int64
+		if rows.Scan(&uid, &q) == nil {
+			saved[uid] = q
+		}
+	}
+	rows.Close()
+	t.Cleanup(func() {
+		for uid, q := range saved {
+			pool.Exec(`UPDATE dbo.CharItems SET Quality = @p2 WHERE ItemUID = @p1`, uid, q)
+		}
+	})
+}

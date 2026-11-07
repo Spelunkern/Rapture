@@ -23,6 +23,7 @@ func TestCombatAgainstSQLServer(t *testing.T) {
 	if err != nil || !found {
 		t.Skip("Valiant not found")
 	}
+	keepItemQuality(t, charID)
 	saved, err := db.CharacterDetail(uid, charID)
 	if err != nil {
 		t.Fatal(err)

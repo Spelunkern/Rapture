@@ -73,7 +73,9 @@ type Session struct {
 	finishedQuests   []db.FinishedQuest
 	regenSitting     bool
 	lastCombatAt     time.Time
-	shoutReadyAt     time.Time // 0x1107 cooldown (CUser +0x5848)
+	shoutReadyAt     time.Time      // 0x1107 cooldown (CUser +0x5848)
+	wornItems        map[int64]bool // item UIDs whose quality changed
+	armourWearNext   int            // QualityByDefense rotation (CUser +0x144c)
 }
 
 var (
@@ -572,6 +574,8 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 		s.autoAttack = false
 	case packet.ResurrectRequest:
 		s.handleResurrect(p)
+	case packet.ItemRepair:
+		s.handleItemRepair(p)
 	case packet.UseVehicle:
 		s.handleUseVehicle()
 	case packet.CharacterMobAutoAttack:
