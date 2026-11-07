@@ -10,10 +10,7 @@ import (
 	"github.com/Spelunkern/Rapture/internal/crypto"
 	"github.com/Spelunkern/Rapture/internal/db"
 	"github.com/Spelunkern/Rapture/internal/logx"
-	"github.com/Spelunkern/Rapture/internal/packet"
 )
-
-const chatCooldown = 500 * time.Millisecond
 
 // connWriter serializes every write to one client socket: the owning
 // session and broadcasts from other sessions share it.
@@ -432,35 +429,4 @@ func broadcast(players []*ConnectedPlayer, frame []byte, label string, log *logx
 			log.Printf("Rapture World failed to deliver %s to character_id=%d: %v", label, p.CharacterID, err)
 		}
 	}
-}
-
-// handlePublicChat delivers normal/map chat to the sender's map and world
-// chat to everyone. Admin channels are admin-only and relay as public chat.
-func (s *Session) handlePublicChat(op packet.Opcode, message string) {
-	adminChannel := op == packet.ChatNormalAdmin || op == packet.ChatWorldAdmin
-	if adminChannel && !s.isAdmin {
-		s.log.Printf("Rapture World rejected admin chat from non-admin account_id=%d", s.accountID)
-		s.send(buildChatError(1), "0x1106 chat error (not admin)")
-		return
-	}
-	if strings.TrimSpace(message) == "" || len(message) > maxChatMessageLen ||
-		(!s.lastChatAt.IsZero() && time.Since(s.lastChatAt) < chatCooldown) {
-		s.log.Printf("Rapture World rejected chat (empty, too long or cooldown)")
-		s.send(buildChatError(1), "0x1106 chat error")
-		return
-	}
-	s.lastChatAt = time.Now()
-	ch := s.char
-	var frame []byte
-	var recipients []*ConnectedPlayer
-	switch op {
-	case packet.ChatNormal, packet.ChatNormalAdmin:
-		frame, recipients = buildChatByID(packet.ChatNormal, ch.ID, message), PlayersOnMap(ch.MapID)
-	case packet.ChatWorld, packet.ChatWorldAdmin:
-		frame, recipients = buildChatByName(packet.ChatWorld, ch.Name, message), AllPlayers()
-	default:
-		frame, recipients = buildChatByName(packet.ChatMap, ch.Name, message), PlayersOnMap(ch.MapID)
-	}
-	broadcast(recipients, frame, "chat", s.logger)
-	s.log.Printf("Rapture World delivered chat opcode=0x%04X to %d recipient(s)", uint16(op), len(recipients))
 }

@@ -162,6 +162,9 @@ const (
 	GuildList             Opcode = 0x0D2F
 	GuildNew              Opcode = 0x0D30
 	ChatGuild             Opcode = 0x1104
+	ChatWhisper           Opcode = 0x1102
+	ChatShout             Opcode = 0x1107
+	ChatWorldShout        Opcode = 0x1108
 	SkillDetectInfo       Opcode = 0x0558 // attr:u32, level:u16, mode:u8
 	// charId:u32, 5-byte blob 04 46 AF 37 01 (verbatim), x,y,z:f32.
 	CharacterResurrect   Opcode = 0x0551

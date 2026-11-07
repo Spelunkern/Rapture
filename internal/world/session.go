@@ -73,7 +73,7 @@ type Session struct {
 	finishedQuests   []db.FinishedQuest
 	regenSitting     bool
 	lastCombatAt     time.Time
-	lastChatAt       time.Time
+	shoutReadyAt     time.Time // 0x1107 cooldown (CUser +0x5848)
 }
 
 var (
@@ -440,8 +440,11 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 			id, _ := packet.U32(p[2:])
 			s.selectCharacter(id)
 		}
-	case packet.ChatNormal, packet.ChatWorld, packet.ChatMap, packet.ChatNormalAdmin, packet.ChatWorldAdmin:
+	case packet.ChatNormal, packet.ChatWorld, packet.ChatMap, packet.ChatNormalAdmin, packet.ChatWorldAdmin,
+		packet.ChatShout, packet.ChatWorldShout:
 		s.handleChat(op, p)
+	case packet.ChatWhisper:
+		s.handleWhisper(p)
 	case packet.UseItem:
 		s.handleUseItem(p)
 	case packet.ChangeAppearance:
@@ -816,21 +819,6 @@ func (s *Session) handleMotion(p []byte) {
 		}
 	}
 	s.broadcastNear(buildCharacterMotion(s.char.ID, motion), "0x0506 character motion", true)
-}
-
-func (s *Session) handleChat(op packet.Opcode, p []byte) {
-	if s.char == nil {
-		return
-	}
-	msg, err := readChatMessage(p)
-	if err != nil {
-		return
-	}
-	if isTownCommand(msg) {
-		s.executeTown()
-		return
-	}
-	s.handlePublicChat(op, msg)
 }
 
 // handleLogout (0x0107) returns to character select on the same
