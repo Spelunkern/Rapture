@@ -69,7 +69,9 @@ type ConnectedPlayer struct {
 	tradeRefresh *tradeRefresh
 	damage       []pendingDamage
 	lifeSkill    *pendingLifeSkill
-	soulKill     bool
+
+	guild    playerGuildState // guarded by guildMu
+	soulKill bool
 
 	alive atomic.Bool
 
@@ -313,16 +315,18 @@ func (p *ConnectedPlayer) SitMotionPacket() []byte {
 
 // EnteredMapPacket introduces an already-present character to a viewer.
 func (p *ConnectedPlayer) EnteredMapPacket() []byte {
+	gid := guildIDFor(p.CharacterID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return buildCharacterEnteredMap(&p.character, p.IsAdmin, false)
+	return buildCharacterEnteredMapGuild(&p.character, p.IsAdmin, false, gid)
 }
 
 // ShapePacket never embeds sitting; sit is sent as a separate 0x0506.
 func (p *ConnectedPlayer) ShapePacket() []byte {
+	name := guildNameFor(p.CharacterID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return buildCharacterShape(&p.character, p.faction, p.items, 0)
+	return buildCharacterShapeGuild(&p.character, p.faction, p.items, 0, name)
 }
 
 func (p *ConnectedPlayer) MovePacket() []byte {

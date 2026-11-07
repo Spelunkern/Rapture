@@ -105,6 +105,9 @@ func setupWorld(t *testing.T) string {
 		if err := world.LoadGameConfig(logger); err != nil {
 			panic(err)
 		}
+		if err := world.LoadGuilds(logger); err != nil {
+			panic(err)
+		}
 		if err := world.LoadSvmaps(logger); err != nil {
 			panic(err)
 		}

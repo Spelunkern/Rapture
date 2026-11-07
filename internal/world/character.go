@@ -347,6 +347,10 @@ func charPos(ch *db.Character) (float32, float32, float32) {
 // the cumulative exp at the level's start, the total for the next level
 // and the current total; their order is not yet confirmed in game.
 func buildCharacterDetails(ch *db.Character, s *CharacterStats) []byte {
+	guildName := ""
+	if ch != nil {
+		guildName = guildNameFor(ch.ID)
+	}
 	w := packet.New(packet.CharacterDetails)
 	var statPoint, skillPoint uint16
 	var exp, money, k1, k2, k3, k4 uint32
@@ -378,7 +382,7 @@ func buildCharacterDetails(ch *db.Character, s *CharacterStats) []byte {
 	w.U32(k2)
 	w.U32(k3)
 	w.U32(k4)
-	w.FixedString("", 25) // guild name
+	w.FixedString(guildName, 25)
 	return w.MustFinish()
 }
 
@@ -428,6 +432,10 @@ func buildMaxEnergy(ch *db.Character, hitpointType uint8, value uint32) []byte {
 
 // buildCharacterEnteredMap: marker 0 already present, 1 own first load, 2 admin.
 func buildCharacterEnteredMap(ch *db.Character, isAdmin, firstLoad bool) []byte {
+	return buildCharacterEnteredMapGuild(ch, isAdmin, firstLoad, guildIDFor(charID(ch)))
+}
+
+func buildCharacterEnteredMapGuild(ch *db.Character, isAdmin, firstLoad bool, guildID uint32) []byte {
 	marker := uint8(0)
 	if isAdmin {
 		marker = 2
@@ -442,7 +450,7 @@ func buildCharacterEnteredMap(ch *db.Character, isAdmin, firstLoad bool) []byte 
 	w.F32(x)
 	w.F32(y)
 	w.F32(z)
-	w.U32(0) // guild id
+	w.U32(guildID)
 	w.U32(0) // vehicle id
 	return w.MustFinish()
 }
@@ -534,6 +542,10 @@ func buildChangeAppearance(characterID uint32, hair, face, height, sex uint8) []
 
 // buildCharacterShape (0x0303). The persistent motion is 1 only for sitting.
 func buildCharacterShape(ch *db.Character, faction uint8, items []db.Item, motion uint8) []byte {
+	return buildCharacterShapeGuild(ch, faction, items, motion, guildNameFor(charID(ch)))
+}
+
+func buildCharacterShapeGuild(ch *db.Character, faction uint8, items []db.Item, motion uint8, guildName string) []byte {
 	w := packet.New(packet.CharacterShape)
 	w.U32(charID(ch))
 	w.U8(0) // alive
@@ -562,7 +574,7 @@ func buildCharacterShape(ch *db.Character, faction uint8, items []db.Item, motio
 	} else {
 		w.Bytes(make([]byte, 6))
 	}
-	w.FixedString("", 25) // guild name
+	w.FixedString(guildName, 25)
 	return w.MustFinish()
 }
 

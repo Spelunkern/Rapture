@@ -153,6 +153,7 @@ func (s *Session) leaveWorld() {
 	s.persistSkillDelays()
 	s.saveQuests()
 	s.useNpc(0)
+	s.guildDisconnect()
 	if s.player != nil {
 		s.player.Unregister()
 		s.player = nil
@@ -241,6 +242,7 @@ func (s *Session) tick(idle bool) {
 	}
 	s.processBuffs()
 	s.tickSkillOnce()
+	s.takeGuildFee()
 	s.tickRebirth(time.Now())
 	if s.char == nil {
 		return
@@ -503,6 +505,16 @@ func (s *Session) dispatch(op packet.Opcode, p []byte) {
 				s.partyChat(msg)
 			}
 		}
+	case packet.ChatGuild:
+		if s.char != nil && s.player != nil && len(p) >= 3 && p[2] > 1 && p[2] <= 0x80 {
+			if msg, err := readChatMessage(p); err == nil {
+				s.guildChat(msg)
+			}
+		}
+	case packet.GuildCreate, packet.GuildCreateAgree, packet.GuildDisband, packet.GuildDisbandAgree,
+		packet.GuildInvite, packet.GuildInviteAnswer, packet.GuildApply, packet.GuildJoinResult,
+		packet.GuildLeave, packet.GuildExpel, packet.GuildStatus, packet.GuildRemark, packet.GuildEtin:
+		s.handleGuild(op, p)
 	case packet.Gatekeeper:
 		s.handleGatekeeper(p)
 	case packet.ExchangeRequest:
@@ -774,6 +786,7 @@ func (s *Session) handleMapLoaded() {
 	s.send(buildCharacterMove(ch, 0, 0), "0x0501 character move")
 	if s.player == nil {
 		s.player = RegisterPlayer(*ch, s.items, s.isAdmin, s.faction, s.out, s.logger)
+		s.guildConnect()
 	} else {
 		s.clearView(false)
 		s.player.SetMap(ch.MapID)

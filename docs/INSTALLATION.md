@@ -40,7 +40,10 @@ python3 tools/sqlserver.py setup   # optionally --backups /path/to/PSM_Data
 restores every `PS_*`/`OMG_*` backup (read-only mount, `DBCC CHECKDB` after
 each), creates the `rapture` SQL login with its password in
 `.local/runtime.env`, installs `master.dbo.fn_md5` (used by the original
-login procedure) and the monthly `PS_UserLog_YYYYMM` databases. Re-running it
+login procedure) and the monthly `PS_UserLog_YYYYMM` databases, and
+disables the three `PS_GameData.dbo.Guilds` triggers that copy guilds to
+`PS_UserData.dbo.CreatedGuilds` through the linked server `PS_USERDB01`
+(they need MSDTC; Rapture writes the copy itself). Re-running it
 never replaces an existing database or credential. The servers read
 `.local/runtime.env` automatically; `RAPTURE_DB_HOST`, `RAPTURE_DB_PORT`,
 `RAPTURE_DB_USER` and `RAPTURE_DB_PASSWORD` override it.

@@ -5,7 +5,8 @@ Actions:
   start     create/start the container (backups mounted read-only)
   restore   restore every PS_*/OMG_* backup that is not restored yet
   provision create the `rapture` runtime login and .local/runtime.env
-  prepare   install master.dbo.fn_md5 and this/next month's PS_UserLog databases
+  prepare   install master.dbo.fn_md5 and this/next month's PS_UserLog databases,
+            disable the linked-server Guilds triggers (Rapture mirrors them)
   setup     start + restore + provision + prepare
   query     run a T-SQL file:  query --database PS_GameData --file x.sql
 
@@ -177,6 +178,18 @@ def prepare():
         sql("\n".join(statements), database)
         print(f"{database}: login log tables ready")
     print("fn_md5 verified")
+    # Trig_Guilds_Insert/Update/Delete copy every Guilds change to
+    # PS_UserData.dbo.CreatedGuilds through the linked server PS_USERDB01,
+    # which needs MSDTC (unavailable, and loopback distributed transactions
+    # are unsupported), so every guild write would fail. They are disabled
+    # and Rapture writes the same copy itself (internal/db/guilds.go).
+    sql("""IF EXISTS (SELECT 1 FROM sys.triggers WHERE name = N'Trig_Guilds_Insert' AND is_disabled = 0)
+            DISABLE TRIGGER dbo.Trig_Guilds_Insert ON dbo.Guilds;
+        IF EXISTS (SELECT 1 FROM sys.triggers WHERE name = N'Trig_Guilds_Update' AND is_disabled = 0)
+            DISABLE TRIGGER dbo.Trig_Guilds_Update ON dbo.Guilds;
+        IF EXISTS (SELECT 1 FROM sys.triggers WHERE name = N'Trig_Guilds_Delete' AND is_disabled = 0)
+            DISABLE TRIGGER dbo.Trig_Guilds_Delete ON dbo.Guilds;""", "PS_GameData")
+    print("PS_GameData: linked-server guild triggers disabled (mirrored by Rapture)")
 
 
 def main():

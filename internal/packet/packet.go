@@ -134,7 +134,35 @@ const (
 	ShopSell                  Opcode = 0x0703
 	SkillUseNoTarget          Opcode = 0x0511
 	ResurrectRequest          Opcode = 0x0553 // 1-byte body
-	SkillDetectInfo           Opcode = 0x0558 // attr:u32, level:u16, mode:u8
+
+	// Guilds (CUser::PacketGuild and the CGuild senders).
+	GuildCreateFailed     Opcode = 0x0D01
+	GuildDisband          Opcode = 0x0D03
+	GuildDisbandAgree     Opcode = 0x0D04
+	GuildInvite           Opcode = 0x0D05
+	GuildInviteAnswer     Opcode = 0x0D06
+	GuildApply            Opcode = 0x0D07
+	GuildJoinResult       Opcode = 0x0D08
+	GuildLeave            Opcode = 0x0D09
+	GuildExpel            Opcode = 0x0D0A
+	GuildStatus           Opcode = 0x0D0C
+	GuildListBegin        Opcode = 0x0D0D
+	GuildListEnd          Opcode = 0x0D0E
+	GuildDisbanded        Opcode = 0x0D11
+	GuildOnlineList       Opcode = 0x0D12
+	GuildOfflineList      Opcode = 0x0D13
+	GuildMemberAdded      Opcode = 0x0D14
+	GuildApplicantList    Opcode = 0x0D16
+	GuildApplicant        Opcode = 0x0D17
+	GuildApplicantRemoved Opcode = 0x0D18
+	GuildRemark           Opcode = 0x0D20
+	GuildCreate           Opcode = 0x0D21
+	GuildCreateAgree      Opcode = 0x0D22
+	GuildEtin             Opcode = 0x0D23
+	GuildList             Opcode = 0x0D2F
+	GuildNew              Opcode = 0x0D30
+	ChatGuild             Opcode = 0x1104
+	SkillDetectInfo       Opcode = 0x0558 // attr:u32, level:u16, mode:u8
 	// charId:u32, 5-byte blob 04 46 AF 37 01 (verbatim), x,y,z:f32.
 	CharacterResurrect   Opcode = 0x0551
 	SkillUse             Opcode = 0x0517

@@ -518,6 +518,7 @@ func (s *Session) awardExp(gained uint32, modifiers bool) {
 		}
 		s.sendStatPackets()
 		s.partyLevel()
+		s.guildLevelChanged()
 	}
 }
 
