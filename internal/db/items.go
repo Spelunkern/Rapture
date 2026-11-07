@@ -198,3 +198,50 @@ func DeleteStoredItems(userUID uint32, uids ...int64) error {
 	return execProc(GameData, "dbo.usp_Save_User_StoredItem_Del_E", sql.Named("ServerID", config.ServerID),
 		sql.Named("UserUID", int32(userUID)), sql.Named("IDList", idList(uids)))
 }
+
+// GuildStoredItems runs usp_Read_Guild_StoredItems_Detail_R.
+func GuildStoredItems(guildID uint32) ([]Item, error) {
+	pool, err := Pool(GameData)
+	if err != nil {
+		return nil, err
+	}
+	c, cancel := ctx()
+	defer cancel()
+	rows, err := pool.QueryContext(c, "dbo.usp_Read_Guild_StoredItems_Detail_R", sql.Named("GuildID", int32(guildID)))
+	if err != nil {
+		return nil, fmt.Errorf("usp_Read_Guild_StoredItems_Detail_R: %w", err)
+	}
+	return scanItems(rows, true)
+}
+
+// AddGuildStoredItem runs usp_Save_Guild_StoredItem_Add_E.
+func AddGuildStoredItem(guildID uint32, it *Item) error {
+	if it.UID == 0 {
+		it.UID = NewItemUID()
+	}
+	return execProc(GameData, "dbo.usp_Save_Guild_StoredItem_Add_E", sql.Named("GuildID", int32(guildID)),
+		sql.Named("ItemUID", it.UID), sql.Named("Slot", it.Slot), sql.Named("ItemID", it.ItemID()),
+		sql.Named("Type", it.Type), sql.Named("TypeID", it.TypeID), sql.Named("Quality", int16(min(it.Quality, 32767))),
+		sql.Named("Gem1", it.Gems[0]), sql.Named("Gem2", it.Gems[1]), sql.Named("Gem3", it.Gems[2]),
+		sql.Named("Gem4", it.Gems[3]), sql.Named("Gem5", it.Gems[4]), sql.Named("Gem6", it.Gems[5]),
+		sql.Named("Craftname", it.CraftName), sql.Named("Count", it.Count), sql.Named("Maketime", makeTime(it)),
+		sql.Named("Maketype", makeType(it)))
+}
+
+// SaveGuildStoredItem runs usp_Save_Guild_StoredItem_Mod_E.
+func SaveGuildStoredItem(guildID uint32, it *Item) error {
+	return execProc(GameData, "dbo.usp_Save_Guild_StoredItem_Mod_E", sql.Named("GuildID", int32(guildID)),
+		sql.Named("ItemUID", it.UID), sql.Named("Slot", it.Slot), sql.Named("Quality", int16(min(it.Quality, 32767))),
+		sql.Named("Gem1", it.Gems[0]), sql.Named("Gem2", it.Gems[1]), sql.Named("Gem3", it.Gems[2]),
+		sql.Named("Gem4", it.Gems[3]), sql.Named("Gem5", it.Gems[4]), sql.Named("Gem6", it.Gems[5]),
+		sql.Named("Count", it.Count), sql.Named("Craftname", it.CraftName))
+}
+
+// DeleteGuildStoredItems runs usp_Save_Guild_StoredItem_Del_E.
+func DeleteGuildStoredItems(guildID uint32, uids ...int64) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	return execProc(GameData, "dbo.usp_Save_Guild_StoredItem_Del_E", sql.Named("GuildID", int32(guildID)),
+		sql.Named("IDList", idList(uids)))
+}

@@ -28,7 +28,7 @@ func TestGuildLifecycle(t *testing.T) {
 	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Definitions(); err != nil {
+	if _, err := db.ReloadDefsForTest(); err != nil { // unit tests may have replaced them
 		t.Fatal(err)
 	}
 	logger, err := logx.New("rapture_world_test")
@@ -68,11 +68,12 @@ func TestGuildLifecycle(t *testing.T) {
 	defer func() {
 		pool, _ := db.Pool(db.GameData)
 		if created != 0 {
-			pool.Exec(`DELETE FROM dbo.GuildChars WHERE GuildID = @p1; DELETE FROM dbo.GuildDetails WHERE GuildID = @p1;
+			pool.Exec(`DELETE FROM dbo.GuildStoredItems WHERE GuildID = @p1; DELETE FROM dbo.GuildChars WHERE GuildID = @p1; DELETE FROM dbo.GuildDetails WHERE GuildID = @p1;
 				DELETE FROM dbo.Guilds WHERE GuildID = @p1;
 				DELETE FROM PS_UserData.dbo.CreatedGuilds WHERE ServerID = 1 AND GuildID = @p1`, int32(created))
 		}
-		pool.Exec(`DELETE FROM dbo.GuildChars WHERE CharID BETWEEN 990100 AND 990199`)
+		pool.Exec(`DELETE FROM dbo.GuildChars WHERE CharID BETWEEN 990100 AND 990199;
+			DELETE FROM dbo.CharItems WHERE CharID BETWEEN 990100 AND 990199`)
 	}()
 	guildOf := func(s *Session) *guild {
 		guildMu.Lock()
@@ -109,6 +110,59 @@ func TestGuildLifecycle(t *testing.T) {
 	}
 	if m, _ := rows(g.ID); m != 7 {
 		t.Fatalf("GuildChars members %d, want 7", m)
+	}
+
+	// Guild bank (bag 0xFF): closed while unranked, rank 9 cannot deposit,
+	// the master deposits, moves and withdraws (5% of Sell x count).
+	var item *db.ItemDef
+	for _, d := range db.MustDefs().Items {
+		if d.Sell >= 100 && realType(d.Type) != 27 && d.ReqOg == 0 && d.Count == 1 {
+			item = d
+			break
+		}
+	}
+	if item == nil {
+		t.Fatal("no storable item definition")
+	}
+	give := func(s *Session) {
+		s.items = append(s.items, db.Item{UID: db.NewItemUID(), Bag: 1, Slot: 0, Type: item.Type, TypeID: item.TypeID, Quality: item.Quality, Count: 1})
+	}
+	bankRows := func() (n int) {
+		pool, _ := db.Pool(db.GameData)
+		pool.QueryRow(`SELECT COUNT(*) FROM dbo.GuildStoredItems WHERE GuildID = @p1 AND Del = 0`, int32(g.ID)).Scan(&n)
+		return
+	}
+	give(ss[0])
+	give(ss[5])
+	ss[0].handleGuildBankMove(1, 0, guildBankBag, 3)
+	if g.bank[3] != nil {
+		t.Fatal("unranked guild used the bank")
+	}
+	guildMu.Lock()
+	g.Rank = 5
+	guildMu.Unlock()
+	ss[5].handleGuildBankMove(1, 0, guildBankBag, 4)  // rank 9
+	ss[0].handleGuildBankMove(1, 0, guildBankBag, 45) // beyond the 40 permitted slots
+	if g.bank[4] != nil || g.bank[45] != nil {
+		t.Fatal("refused deposit stored")
+	}
+	ss[0].handleGuildBankMove(1, 0, guildBankBag, 3)
+	if g.bank[3] == nil || findItem(ss[0].items, 1, 0) >= 0 || bankRows() != 1 {
+		t.Fatalf("deposit failed: bank %v rows %d", g.bank[3], bankRows())
+	}
+	ss[0].handleGuildBankMove(guildBankBag, 3, guildBankBag, 7)
+	if g.bank[3] != nil || g.bank[7] == nil || g.bank[7].Slot != 7 {
+		t.Fatal("bank rearrange failed")
+	}
+	ss[5].handleGuildBankMove(guildBankBag, 7, 2, 0) // members cannot withdraw
+	if g.bank[7] == nil {
+		t.Fatal("rank 9 withdrew")
+	}
+	money := ss[0].char.Money
+	ss[0].handleGuildBankMove(guildBankBag, 7, 2, 5)
+	fee := uint32(float32(uint32(item.Sell)) * float32(0.05))
+	if g.bank[7] != nil || findItem(ss[0].items, 2, 5) < 0 || ss[0].char.Money != money-fee || bankRows() != 0 {
+		t.Fatalf("withdraw: bank %v money %d want %d rows %d", g.bank[7], ss[0].char.Money, money-fee, bankRows())
 	}
 
 	// Invitation by the master, accepted.

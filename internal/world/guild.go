@@ -61,6 +61,7 @@ type guild struct {
 	Etin       uint32
 	members    map[uint32]*guildMember
 	applicants map[uint32]*guildMember
+	bank       [guildBankSlots]*db.Item
 }
 
 // guildCreate is CGuildCreate: a creation (disband false) or disband vote.
@@ -130,6 +131,12 @@ func LoadGuilds(log *logx.Logger) error {
 			g.members[e.CharID] = e
 		}
 		guildOfChar[e.CharID] = g
+	}
+	loadGuildHouseIni()
+	for _, g := range guildsByID {
+		if err := loadGuildBank(g); err != nil {
+			log.Printf("Rapture World failed to load guild bank %d: %v", g.ID, err)
+		}
 	}
 	nextGuildID, guildsLoaded = next, true
 	log.Printf("Rapture World loaded guilds=%d members=%d next_id=%d", len(rows), len(members), next)
@@ -355,6 +362,7 @@ func (s *Session) guildConnect() {
 			p.guild.guild = g
 			g.send(guildStatus(guildStatusOnline, ch.ID), "0x0D0C guild member online", p)
 			lists = append(lists, g.memberListPackets()...)
+			lists = append(lists, g.bankListPackets()...)
 			if m.Rank <= guildRankAdmin {
 				lists = append(lists, g.applicantListPackets()...)
 			}
@@ -866,6 +874,9 @@ func (g *guild) joinUser(p *ConnectedPlayer, log *logx.Logger) {
 	for _, f := range g.memberListPackets() {
 		p.Send(f, "0x0D12 guild members")
 	}
+	for _, f := range g.bankListPackets() {
+		p.Send(f, "0x0D29 guild bank")
+	}
 }
 
 // buildGuildMemberAdded (0x0D14): online byte and the 29-byte member.
@@ -961,6 +972,9 @@ func (s *Session) guildAnswerApplicant(accept bool, charID uint32) {
 		p.Send(buildGuildJoined(1, g, a.Rank), "0x0D08 guild application accepted")
 		for _, f := range g.memberListPackets() {
 			p.Send(f, "0x0D12 guild members")
+		}
+		for _, f := range g.bankListPackets() {
+			p.Send(f, "0x0D29 guild bank")
 		}
 	}
 }

@@ -158,6 +158,10 @@ const (
 	GuildApplicant        Opcode = 0x0D17
 	GuildApplicantRemoved Opcode = 0x0D18
 	GuildRemark           Opcode = 0x0D20
+	GuildBankResult       Opcode = 0x0D28
+	GuildBankList         Opcode = 0x0D29
+	GuildBankPlaced       Opcode = 0x0D31
+	GuildBankTaken        Opcode = 0x0D32
 	GuildCreate           Opcode = 0x0D21
 	GuildCreateAgree      Opcode = 0x0D22
 	GuildEtin             Opcode = 0x0D23

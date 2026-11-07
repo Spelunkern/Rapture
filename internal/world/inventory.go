@@ -646,6 +646,10 @@ func (s *Session) handleItemBagToBag(p []byte) {
 		s.handleWarehouseMove(srcBag, srcSlot, destBag, destSlot)
 		return
 	}
+	if srcBag == guildBankBag || destBag == guildBankBag {
+		s.handleGuildBankMove(srcBag, srcSlot, destBag, destSlot)
+		return
+	}
 	// Anything entering an equipment slot must pass CUser::EnableEquipment;
 	// a refused move echoes the unchanged slots.
 	if !s.equipAllowed(srcBag, srcSlot, destBag, destSlot) {
