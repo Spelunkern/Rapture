@@ -134,6 +134,7 @@ const (
 	ShopSell                  Opcode = 0x0703
 	SkillUseNoTarget          Opcode = 0x0511
 	ResurrectRequest          Opcode = 0x0553 // 1-byte body
+	SkillDetectInfo           Opcode = 0x0558 // attr:u32, level:u16, mode:u8
 	// charId:u32, 5-byte blob 04 46 AF 37 01 (verbatim), x,y,z:f32.
 	CharacterResurrect   Opcode = 0x0551
 	SkillUse             Opcode = 0x0517

@@ -240,6 +240,7 @@ func (s *Session) tick(idle bool) {
 		}
 	}
 	s.processBuffs()
+	s.tickSkillOnce()
 	s.tickRebirth(time.Now())
 	if s.char == nil {
 		return

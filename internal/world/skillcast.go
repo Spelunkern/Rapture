@@ -11,6 +11,7 @@ const (
 	skillResultNormal      = 0
 	skillTargetEscapeRange = 100.0
 
+	targetTypeSelf              = 2
 	targetTypeEnemiesNearCaster = 6
 	targetTypeEnemiesNearTarget = 7
 
@@ -177,7 +178,17 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 		castTarget = ch.ID
 	}
 	var pos *[2]float32
-	if castTarget != ch.ID && def.TargetType != targetTypeEnemiesNearCaster {
+	if def.TypeEffect == typeEffectOnce {
+		p, ok := s.userSkillTarget(def, target)
+		if !ok {
+			return
+		}
+		if !s.inUserSkillRange(p, def) {
+			s.send(buildSkillUseResult(packet.SkillUseNoTarget, 5, ch.ID, 0, k.SkillID, k.Level, 0, 0, 0), "0x0511 skill out of range")
+			return
+		}
+		castTarget = p.CharacterID
+	} else if castTarget != ch.ID && def.TargetType != targetTypeEnemiesNearCaster {
 		mob, ok := MobByID(ch.MapID, target)
 		if !ok {
 			return
@@ -190,7 +201,7 @@ func (s *Session) handleUseSkill(op packet.Opcode, p []byte) {
 	w.U32(castTarget)
 	w.U16(k.SkillID)
 	w.U8(k.Level)
-	s.send(w.MustFinish(), "0x0510 skill cast started")
+	s.broadcastNear(w.MustFinish(), "0x0510 skill cast started", true)
 	s.cast = &pendingCast{target, number, op, time.Now().Add(castTime), pos}
 	s.log.Printf("Rapture World skill cast started skill_id=%d level=%d cast_time=%s", k.SkillID, k.Level, castTime)
 }
@@ -233,6 +244,8 @@ func (s *Session) resolveSkill(target uint32, number uint8, op packet.Opcode, ca
 		s.healSkill(k, def, op, stats)
 	case typeEffectAttack, typeEffectDebuff:
 		s.skillAttack(k, def, target, castPos, stats)
+	case typeEffectOnce:
+		s.skillOnce(k, def, target, stats)
 	default:
 		s.log.Printf("Rapture World rejected skill use: effect %d not usable skill_id=%d", def.TypeEffect, k.SkillID)
 	}

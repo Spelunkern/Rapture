@@ -68,6 +68,8 @@ type ConnectedPlayer struct {
 	teleport     *pendingTeleport
 	tradeRefresh *tradeRefresh
 	damage       []pendingDamage
+	lifeSkill    *pendingLifeSkill
+	soulKill     bool
 
 	alive atomic.Bool
 

@@ -3,6 +3,8 @@
 package world
 
 import (
+	"io"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -657,5 +659,81 @@ func TestRebirth(t *testing.T) {
 	s.handleResurrect([]byte{0x53, 0x05, reviveAtBind})
 	if s.char != nil {
 		t.Fatal("ultimate death without a rune kept the character")
+	}
+}
+
+// TestSkillOnce follows CUser::SkillOnce: the resurrection skill revives a
+// dead user at the caster with full pools and no exp loss (and refuses a
+// living one), detection works on enemies, and the return skill queues a
+// move to the caster's bind point.
+func TestSkillOnce(t *testing.T) {
+	if _, err := os.Stat("data/game"); err != nil {
+		os.Chdir("../..")
+	}
+	config.LoadRuntimeEnv()
+	if err := db.Open(db.UserData, db.GameData, db.GameDefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Definitions(); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := logx.New("rapture_world_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mapID = 60020
+	RegisterMapGrid(mapID, 2048, nil)
+	AddEntities(mapID, MapEntities{SpawnAreas: []MapSpawnArea{{Faction: 0, Boxes: []SpawnBox{{300, 10, 300, 310, 12, 310}}}}})
+	session := func(id uint32, faction uint8, x float32) *Session {
+		a, b := net.Pipe()
+		go io.Copy(io.Discard, b)
+		ch := &db.Character{ID: id, Level: 40, Mode: growNormal, Str: 50, Dex: 50, Rec: 50, Int: 50, Wis: 80, Luc: 50,
+			MapID: mapID, PosX: x, PosY: 11, PosZ: 500}
+		ch.MaxHP, ch.MaxMP, ch.MaxSP = basePools(ch)
+		ch.CurrentHP, ch.CurrentMP, ch.CurrentSP = ch.MaxHP, ch.MaxMP, ch.MaxSP
+		s := &Session{char: ch, log: logger.Tagged("unit"), logger: logger, faction: faction,
+			skillCooldowns: map[uint16]time.Time{}, out: &connWriter{conn: a}}
+		s.player = RegisterPlayer(*ch, nil, false, faction, s.out, logger)
+		t.Cleanup(s.player.Unregister)
+		return s
+	}
+	caster := session(900001, FactionLight, 500)
+	target := session(900002, FactionLight, 510)
+	enemy := session(900003, FactionDark, 505)
+	skill := func(id uint16) (db.CharacterSkill, *db.SkillDef) {
+		def := db.MustDefs().Skill(id, 1)
+		if def == nil {
+			t.Skipf("skill %d missing", id)
+		}
+		return db.CharacterSkill{SkillID: id, Level: 1, Number: 1}, def
+	}
+
+	rez, rezDef := skill(126)
+	caster.skillOnce(rez, rezDef, target.char.ID, caster.stats())
+	if target.player.TakeLifeSkill() != nil {
+		t.Fatal("resurrection queued on a living user")
+	}
+	target.char.CurrentHP = 0
+	target.dead = true
+	target.player.SetAlive(false)
+	target.startRebirthTimer()
+	exp := target.char.Exp
+	caster.skillCooldowns = map[uint16]time.Time{}
+	caster.skillOnce(rez, rezDef, target.char.ID, caster.stats())
+	target.tickSkillOnce()
+	if target.dead || !target.player.IsAlive() || target.char.PosX != 500 || target.char.Exp != exp ||
+		target.stats().CurrentHP != target.stats().MaxHP {
+		t.Fatalf("life skill: dead %v pos %v exp %d hp %d/%d", target.dead, target.char.PosX, target.char.Exp,
+			target.stats().CurrentHP, target.stats().MaxHP)
+	}
+
+	det, detDef := skill(100)
+	caster.skillOnce(det, detDef, enemy.char.ID, caster.stats())
+
+	ret, retDef := skill(192)
+	caster.skillOnce(ret, retDef, caster.char.ID, caster.stats())
+	tp := caster.player.TakeTeleport()
+	if tp == nil || tp.X < 300 || tp.X >= 310 || tp.Z < 300 || tp.Z >= 310 {
+		t.Fatalf("return skill teleport %+v", tp)
 	}
 }

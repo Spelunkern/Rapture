@@ -227,17 +227,24 @@ func rebirthPosition(mapID uint16, faction uint8) (MapPos, bool) {
 // random point of the nearest svmap rebirth group of this map, else the
 // current position (zeroed if outside the map).
 func bindPosition(mapID uint16, faction uint8, x, y, z float32) (uint16, float32, float32, float32) {
+	m, x, y, z, _ := bindPositionFound(mapID, faction, x, y, z)
+	return m, x, y, z
+}
+
+// bindPositionFound is bindPosition with GetBindPos's result: false when
+// neither a Map.ini point nor a rebirth group applies.
+func bindPositionFound(mapID uint16, faction uint8, x, y, z float32) (uint16, float32, float32, float32, bool) {
 	if p, ok := rebirthPosition(mapID, faction); ok {
 		if size, ok := mapSize(p.MapID); ok && p.X >= 0 && p.X < size && p.Z >= 0 && p.Z < size {
-			return p.MapID, p.X, p.Y + 0.9, p.Z
+			return p.MapID, p.X, p.Y + 0.9, p.Z, true
 		}
 	}
 	if area, ok := FindNearestSpawnArea(mapID, faction, x, z); ok {
 		x, y, z := area.RandomPoint()
-		return mapID, x, y, z
+		return mapID, x, y, z, true
 	}
 	if size, ok := mapSize(mapID); ok && (x < 0 || x >= size || z < 0 || z >= size) {
 		x, z = 0, 0
 	}
-	return mapID, x, y, z
+	return mapID, x, y, z, false
 }
